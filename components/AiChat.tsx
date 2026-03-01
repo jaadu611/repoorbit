@@ -389,10 +389,10 @@ const AiChat = ({ repoData }: AiChatProps) => {
     if (selectionType === "file" && fileCtx) {
       return (
         <span
-          className="flex items-center gap-1 text-[11px] font-mono text-slate-400 truncate max-w-[140px] border-2 border-gray-600 py-1 px-2 rounded-2xl"
+          className="flex items-center gap-1 text-[10px] font-mono text-slate-400 truncate max-w-[130px] border border-gray-700 py-0.5 px-2 rounded-full"
           title={selectionPath}
         >
-          <FileCode size={13} className="shrink-0 text-blue-400" />
+          <FileCode size={11} className="shrink-0 text-blue-400" />
           {selectionName}
         </span>
       );
@@ -400,10 +400,10 @@ const AiChat = ({ repoData }: AiChatProps) => {
     if (selectionType === "folder" && folderCtx) {
       return (
         <span
-          className="flex items-center gap-1 text-[11px] font-mono text-slate-400 truncate max-w-[140px] border-2 border-gray-600 py-1 px-2 rounded-2xl"
+          className="flex items-center gap-1 text-[10px] font-mono text-slate-400 truncate max-w-[130px] border border-gray-700 py-0.5 px-2 rounded-full"
           title={selectionPath}
         >
-          <Folder size={13} className="shrink-0 text-yellow-400" />
+          <Folder size={11} className="shrink-0 text-yellow-400" />
           {selectionName}
         </span>
       );
@@ -413,47 +413,38 @@ const AiChat = ({ repoData }: AiChatProps) => {
       const full = repoCtx?.meta.fullName ?? repoData.metadata.fullName;
       return (
         <span
-          className="flex items-center gap-1 text-[11px] font-mono text-slate-400 truncate max-w-[140px] border-2 border-gray-600 py-1 px-2 rounded-2xl"
+          className="flex items-center gap-1 text-[10px] font-mono text-slate-400 truncate max-w-[130px] border border-gray-700 py-0.5 px-2 rounded-full"
           title={full}
         >
-          <Github size={13} className="shrink-0 text-purple-400" />
+          <Github size={11} className="shrink-0 text-purple-400" />
           {name}
         </span>
       );
     }
     return (
-      <span className="text-[11px] font-mono text-slate-600">no context</span>
+      <span className="text-[10px] font-mono text-slate-600">no context</span>
     );
   };
 
   return (
-    <div className="w-80 shrink-0 flex flex-col bg-gray-900 border-2 border-gray-600 rounded-2xl overflow-hidden h-full shadow-2xl">
+    <div className="w-72 shrink-0 flex flex-col bg-gray-900 border border-gray-700 rounded-xl overflow-hidden h-full shadow-2xl">
       {/* header */}
-      <div className="px-4 py-3 border-b-2 border-gray-600 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <Cpu size={14} className="text-blue-500" />
-          <span className="text-[10px] font-mono font-bold text-gray-300 uppercase tracking-wider pt-1">
+      <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between bg-gray-950/50">
+        <div className="flex items-center gap-1.5">
+          <Cpu size={12} className="text-blue-500" />
+          <span className="text-[9px] font-mono font-bold text-gray-400 uppercase tracking-widest pt-0.5">
             AI Agent
           </span>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5">
           <ContextBadge />
-          {messages.length > 0 && !isLoading && (
-            <button
-              onClick={handleClear}
-              title="Clear chat"
-              className="text-gray-600 hover:text-red-400 transition-colors"
-            >
-              <Trash2 size={13} />
-            </button>
-          )}
         </div>
       </div>
 
       {/* messages */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+      <div className="flex-1 overflow-y-auto p-3 space-y-3">
         {messages.length === 0 && (
-          <p className="text-[11px] font-mono text-slate-600 text-center mt-8">
+          <p className="text-[10px] font-mono text-slate-600 text-center mt-6 leading-relaxed">
             Click a file, folder, or repo node,
             <br />
             then ask anything about it.
@@ -465,14 +456,14 @@ const AiChat = ({ repoData }: AiChatProps) => {
             className={`flex flex-col ${msg.role === "user" ? "items-end" : "items-start"}`}
           >
             <div
-              className={`max-w-[95%] p-3 rounded-xl text-[11px] font-mono leading-relaxed overflow-auto ${
+              className={`max-w-[92%] p-2.5 rounded-lg text-[10px] font-mono leading-normal overflow-auto ${
                 msg.role === "user"
-                  ? "bg-blue-600/20 border border-blue-500/30 text-blue-50"
-                  : "bg-slate-900 border border-slate-800 text-slate-300"
+                  ? "bg-blue-600/10 border border-blue-500/20 text-blue-100"
+                  : "bg-slate-900/50 border border-slate-800 text-slate-300"
               }`}
             >
               {msg.content === "" && isLoading ? (
-                <Loader2 size={12} className="animate-spin" />
+                <Loader2 size={11} className="animate-spin" />
               ) : (
                 msg.content
               )}
@@ -483,9 +474,19 @@ const AiChat = ({ repoData }: AiChatProps) => {
 
       <form
         onSubmit={handleSend}
-        className="p-3 bg-gray-900 border-t-2 border-gray-600"
+        className="p-2.5 bg-gray-950 border-t border-gray-700 flex items-center gap-2"
       >
-        <div className="relative">
+        {messages.length > 0 && !isLoading && (
+          <button
+            type="button"
+            onClick={handleClear}
+            title="Clear chat"
+            className="shrink-0 w-8 h-8 flex items-center justify-center text-gray-600 hover:text-red-400 border border-gray-800 rounded-lg hover:bg-red-400/5 transition-all"
+          >
+            <Trash2 size={14} />
+          </button>
+        )}
+        <div className="relative flex-1">
           <input
             value={input}
             onChange={(e) => setInput(e.target.value)}
@@ -497,24 +498,24 @@ const AiChat = ({ repoData }: AiChatProps) => {
                   ? `Ask about /${selectionName}`
                   : `Ask about ${repoCtx?.meta.name ?? repoData.metadata.name}`
             }
-            className="w-full bg-gray-900 border-2 border-gray-600 text-[11px] font-mono text-slate-300 px-4 py-2 rounded-xl outline-none focus:border-blue-500/50 disabled:opacity-50"
+            className="w-full bg-gray-950 border border-gray-700 text-[10px] font-mono text-slate-300 pl-3 pr-8 py-2 rounded-lg outline-none focus:border-blue-500/40 transition-all disabled:opacity-50"
           />
           {isLoading ? (
             <button
               type="button"
               onClick={handleStop}
               title="Stop generation"
-              className="absolute right-3 top-[11px] text-red-400 hover:text-red-300 transition-colors"
+              className="absolute right-2.5 top-[8px] text-red-400 hover:text-red-300 transition-colors"
             >
-              <Square size={14} className="fill-current" />
+              <Square size={12} className="fill-current" />
             </button>
           ) : (
             <button
               type="submit"
               disabled={!input.trim()}
-              className="absolute right-3 top-[11px] text-gray-200 hover:text-blue-400 disabled:opacity-30 transition-colors"
+              className="absolute right-2.5 top-[8px] text-gray-500 hover:text-blue-400 disabled:opacity-30 transition-colors"
             >
-              <Send size={14} />
+              <Send size={12} />
             </button>
           )}
         </div>

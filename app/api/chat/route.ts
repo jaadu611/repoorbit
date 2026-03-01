@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-const OLLAMA_URL = "http://127.0.0.1:11434/api/generate";
+const OLLAMA_URL = "https://jaadu-repo-orbit.loca.lt/api/generate";
 
 // works good kinda slow (4th)
 // const OLLAMA_MODEL = "qwen2.5-coder:7b";
@@ -40,7 +40,10 @@ export async function POST(req: Request) {
     try {
       ollamaResponse = await fetch(OLLAMA_URL, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "bypass-tunnel-reminder": "true",
+        },
         signal: abortController.signal,
         body: JSON.stringify({
           model: OLLAMA_MODEL,

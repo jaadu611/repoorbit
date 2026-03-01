@@ -92,7 +92,7 @@ export const getRepoData = async (owner: string, repo: string) => {
   const repoData = await repoRes.json();
   const defaultBranch: string = repoData.default_branch;
 
-  // get some data here
+  // get all the data
   const [
     treeRes,
     readmeRes,
@@ -151,7 +151,7 @@ export const getRepoData = async (owner: string, repo: string) => {
     );
   }
 
-  // get some more data here
+  // clean the data here
   const [
     treeData,
     commitsData,
@@ -323,10 +323,6 @@ export const getRepoData = async (owner: string, repo: string) => {
       entryPoints,
     },
   };
-
-  // We don't update the client store from the server fetch directly anymore
-  // to prevent shared state issues and hydration mismatches.
-  // useSelectionStore.getState().setRepoContext(repoContext);
 
   return {
     tree: rawTree,

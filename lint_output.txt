@@ -1,0 +1,61 @@
+
+> repoorbit@0.1.0 lint
+> eslint
+
+
+/home/jaadu/random-projects/repoorbit/app/api/chat/route.ts
+  121:23  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  140:19  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+/home/jaadu/random-projects/repoorbit/app/page.tsx
+    5:3   warning  'icons' is defined but never used                                                                                                                                                                                                                                                        @typescript-eslint/no-unused-vars
+    9:3   warning  'Network' is defined but never used                                                                                                                                                                                                                                                      @typescript-eslint/no-unused-vars
+   10:3   warning  'TreePine' is defined but never used                                                                                                                                                                                                                                                     @typescript-eslint/no-unused-vars
+   40:57  error    `'` can be escaped with `&apos;`, `&lsquo;`, `&#39;`, `&rsquo;`                                                                                                                                                                                                                          react/no-unescaped-entities
+   80:17  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+  118:19  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+
+/home/jaadu/random-projects/repoorbit/app/workspace/page.tsx
+  7:9  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+/home/jaadu/random-projects/repoorbit/components/AiChat.tsx
+   56:9   warning  'totleFolders' is assigned a value but never used  @typescript-eslint/no-unused-vars
+   57:9   warning  'totleFiles' is assigned a value but never used    @typescript-eslint/no-unused-vars
+  372:19  error    Unexpected any. Specify a different type           @typescript-eslint/no-explicit-any
+
+/home/jaadu/random-projects/repoorbit/components/TreeView.tsx
+   190:27  error    Unexpected any. Specify a different type                                                                                                                                                                                                                                                 @typescript-eslint/no-explicit-any
+   205:33  error    Unexpected any. Specify a different type                                                                                                                                                                                                                                                 @typescript-eslint/no-explicit-any
+   250:9   error    Unexpected any. Specify a different type                                                                                                                                                                                                                                                 @typescript-eslint/no-explicit-any
+   357:15  error    Unexpected any. Specify a different type                                                                                                                                                                                                                                                 @typescript-eslint/no-explicit-any
+   381:6   warning  React Hook useEffect has a missing dependency: 'topPx'. Either include it or remove the dependency array                                                                                                                                                                                 react-hooks/exhaustive-deps
+  1070:33  error    Unexpected any. Specify a different type                                                                                                                                                                                                                                                 @typescript-eslint/no-explicit-any
+  1073:30  error    Unexpected any. Specify a different type                                                                                                                                                                                                                                                 @typescript-eslint/no-explicit-any
+  1077:51  error    Unexpected any. Specify a different type                                                                                                                                                                                                                                                 @typescript-eslint/no-explicit-any
+  1184:30  error    Unexpected any. Specify a different type                                                                                                                                                                                                                                                 @typescript-eslint/no-explicit-any
+  1194:47  error    Unexpected any. Specify a different type                                                                                                                                                                                                                                                 @typescript-eslint/no-explicit-any
+  1356:23  error    Unexpected any. Specify a different type                                                                                                                                                                                                                                                 @typescript-eslint/no-explicit-any
+  1403:15  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+  1539:19  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+  1630:23  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+  2050:21  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+  2335:31  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+  2457:27  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+
+/home/jaadu/random-projects/repoorbit/lib/github.ts
+    1:10  warning  'useSelectionStore' is defined but never used  @typescript-eslint/no-unused-vars
+   17:29  error    Unexpected any. Specify a different type       @typescript-eslint/no-explicit-any
+  174:18  error    Unexpected any. Specify a different type       @typescript-eslint/no-explicit-any
+  175:36  error    Unexpected any. Specify a different type       @typescript-eslint/no-explicit-any
+  177:53  error    Unexpected any. Specify a different type       @typescript-eslint/no-explicit-any
+  281:34  error    Unexpected any. Specify a different type       @typescript-eslint/no-explicit-any
+  303:30  error    Unexpected any. Specify a different type       @typescript-eslint/no-explicit-any
+
+/home/jaadu/random-projects/repoorbit/modes/TreeMapper.ts
+  30:10  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  35:14  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  37:13  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+  93:56  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+✖ 40 problems (25 errors, 15 warnings)
+
