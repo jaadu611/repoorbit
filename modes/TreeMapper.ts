@@ -14,17 +14,20 @@ export type FileNode = {
   lastModified?: string;
   details?: {
     name: string;
+    fullName: string;
     owner: string;
     avatar: string;
-    description: string;
-    createdAt: string;
-    language: string;
     stars: number;
     forks: number;
-    visibility: string;
-    url: string;
+    openIssues: number;
     size: number;
+    pushedAt: string;
+    language: string;
+    license: string;
+    defaultBranch: string;
+    visibility: string;
   };
+  tree?: any;
   children?: FileNode[];
 };
 

@@ -11,7 +11,7 @@ const Navbar = () => {
   const [isOpen, setIsOpen] = useState(false);
 
   return (
-    <nav className="sticky top-0 z-50 bg-gray-900 border-b border-gray-800">
+    <nav className="sticky top-0 z-50 bg-gray-900 border-b-2 border-gray-600">
       <div className="relative flex items-center justify-between px-8 py-4 z-50 bg-gray-900">
         <div className="flex items-center gap-2">
           <div className="h-8 w-8 rounded-full bg-blue-500" />

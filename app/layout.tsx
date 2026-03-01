@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
-import Navbar from "@/components/navbar";
 import "./globals.css";
+import Navbar from "@/components/Navbar";
 
 export const metadata: Metadata = {
   title: "RepoOrbit | Visual Repository Intelligence",

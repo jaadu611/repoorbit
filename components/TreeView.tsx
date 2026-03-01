@@ -1,7 +1,6 @@
 /**
- * almost completely ai made file
- * idk whats happening here but probably shouldnt touch
- * it takes in data from props and convert it into the heat map
+ * almost completely ai made file sorry for who ever is seeing this file
+ * idk whats happening here but probably shouldnt touch it
  */
 
 "use client";
@@ -27,11 +26,43 @@ import {
   Code2,
   GripHorizontal,
   ChevronLeft,
+  ChevronDown,
   Calendar,
   FolderTree,
+  Users,
+  Zap,
+  FileText,
+  Terminal,
+  Eye,
+  Cpu,
+  BarChart2,
+  Box,
 } from "lucide-react";
 import { FileNode } from "@/modes/TreeMapper";
-import { EXT_GROUPS, ICON_SVGS } from "@/constants/treeView.constants";
+import { EXT_GROUPS, hasData, ICON_SVGS } from "@/constants/treeView.constants";
+import { useSelectionStore } from "@/lib/store";
+import { RepoTreeEntry } from "@/lib/types";
+
+// ─── Repo tree helpers ────────────────────────────────────────────────────────
+
+/** Recursively flattens a TreeNode tree into a list of RepoTreeEntry */
+function flattenTree(nodes: TreeNode[], depth = 1): RepoTreeEntry[] {
+  const result: RepoTreeEntry[] = [];
+  for (const n of nodes) {
+    result.push({
+      path: n.fileDetails?.path ?? n.id,
+      name: n.name,
+      type: n.type === "folder" ? "folder" : "file",
+      ext: n.ext,
+      size: n.size,
+      depth,
+    });
+    if (n.originalChildren.length > 0) {
+      result.push(...flattenTree(n.originalChildren, depth + 1));
+    }
+  }
+  return result;
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -46,39 +77,52 @@ interface TreeNode {
     fullName: string;
     owner: string;
     avatar: string;
-    description: string;
-    url: string;
-    homepage: string;
     stars: number;
     forks: number;
-    watchers: number;
-    subscribers: number;
     openIssues: number;
     size: number;
-    createdAt: string;
-    updatedAt: string;
     pushedAt: string;
     language: string;
-    topics: string[];
     license: string;
     defaultBranch: string;
-    hasWiki: boolean;
-    hasPages: boolean;
-    hasIssues: boolean;
-    hasProjects: boolean;
-    hasDiscussions: boolean;
     visibility: string;
   };
   fileDetails?: {
     depth: number;
     path: string;
     isLarge: boolean;
-    percentOfTotal: string;
     branchWeight: number;
   };
   originalChildren: TreeNode[];
   children?: TreeNode[] | null;
 }
+
+interface AnimatingNode {
+  id: string;
+  cx: number;
+  cy: number;
+  tx: number;
+  ty: number;
+  opacity: number;
+  scale: number;
+  born: number;
+  closing: boolean;
+}
+
+interface AnimatingLink {
+  childId: string;
+  progress: number;
+  born: number;
+  closing: boolean;
+}
+
+const ANIM_DURATION = 320;
+const LINK_DURATION = 260;
+const ANIM_EASING = (t: number) => 1 - Math.pow(1 - t, 3);
+const LINK_EASING = (t: number) =>
+  t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function fileColor(ext: string) {
   for (const g of EXT_GROUPS) if (g.exts.includes(ext)) return g;
@@ -102,77 +146,46 @@ function iconKey(d: TreeNode): string {
   if (d.type === "root") return "root";
   if (d.type === "folder")
     return d.children && d.children.length > 0 ? "folderOpen" : "folder";
-
-  const e = d.ext?.toLowerCase();
+  const e = d.ext?.toLowerCase() ?? "";
   const n = d.name.toLowerCase();
-
-  if (["ts", "tsx", "cts", "mts"].includes(e)) return "ts";
-  if (["js", "jsx", "mjs", "cjs"].includes(e)) return "js";
-  if (["py", "pyw", "pyc", "ipynb", "pyd"].includes(e)) return "py";
-  if (["go"].includes(e)) return "go";
-  if (["rs", "rlib"].includes(e)) return "rs";
-  if (["java", "jar", "class", "jsp"].includes(e)) return "java";
-  if (["cpp", "cc", "cxx", "h", "hpp", "hh", "c"].includes(e)) return "cpp";
-  if (["rb", "erb"].includes(e)) return "rb";
-  if (["php", "phtml", "php4", "php5"].includes(e)) return "php";
-  if (["cs", "cshtml"].includes(e)) return "csharp";
-  if (["kt", "kts"].includes(e)) return "kotlin";
-  if (["swift"].includes(e)) return "swift";
-
+  if (n === "dockerfile" || n.startsWith("dockerfile.")) return "docker";
   if (
-    [
-      "json",
-      "yaml",
-      "yml",
-      "toml",
-      "env",
-      "ini",
-      "lock",
-      "xml",
-      "csv",
-      "tsv",
-    ].includes(e)
+    (e === "yaml" || e === "yml") &&
+    (n.includes("k8s") || n.includes("kube"))
   )
-    return "json";
-  if (["tf", "tfvars", "hcl", "tfstate"].includes(e)) return "tf";
-  if (["sql", "psql", "mysql", "sqlite", "db"].includes(e)) return "sql";
-  if (["dockerfile", "containerfile"].includes(e) || n.includes("dockerfile"))
-    return "docker";
-  if (["yaml", "yml"].includes(e) && (n.includes("k8s") || n.includes("kube")))
     return "k8s";
-
-  if (["css", "scss", "sass", "less", "styl"].includes(e)) return "css";
-  if (["html", "htm", "xhtml", "aspx"].includes(e)) return "html";
-  if (["vue"].includes(e)) return "vue";
-  if (["svelte"].includes(e)) return "svelte";
-
-  if (["md", "mdx", "txt", "rst", "pdf", "doc", "docx"].includes(e))
-    return "md";
-
-  if (
-    [
-      "png",
-      "jpg",
-      "jpeg",
-      "gif",
-      "svg",
-      "webp",
-      "ico",
-      "avif",
-      "bmp",
-      "tiff",
-    ].includes(e)
-  )
-    return "img";
-
-  if (["sh", "bash", "zsh", "fish", "bat", "ps1", "cmd", "awk"].includes(e))
-    return "sh";
-  if (["wasm"].includes(e)) return "wasm";
-
+  for (const g of EXT_GROUPS) {
+    if (g.exts.includes(e)) return g.svgKey;
+  }
   return "other";
 }
 
-// ─── Build tree ───────────────────────────────────────────────────────────────
+function computeMatchSet(
+  hierarchy: d3.HierarchyNode<TreeNode>,
+  filter: string,
+): Set<string> {
+  if (!filter.trim()) return new Set();
+  const q = filter.trim().toLowerCase().replace(/^\./, "");
+  const matched = new Set<string>();
+  hierarchy.each((node) => {
+    if (node.data.type === "root") matched.add(node.data.id);
+  });
+  hierarchy.each((node) => {
+    const d = node.data;
+    const nameMatch = d.name.toLowerCase().includes(q);
+    const extMatch = d.ext?.toLowerCase().includes(q);
+    const pathMatch = (d.fileDetails?.path ?? "").toLowerCase().includes(q);
+    if (nameMatch || extMatch || pathMatch) {
+      matched.add(d.id);
+      let anc = node.parent;
+      while (anc) {
+        matched.add(anc.data.id);
+        anc = anc.parent;
+      }
+    }
+  });
+  return matched;
+}
 
 function buildTree(nodes: any[], repoTotalSize = 0, depth = 1): TreeNode[] {
   return nodes.map((n) => {
@@ -224,7 +237,68 @@ function collectExts(rootNode: FileNode): Set<string> {
 
 const NODE_SEP = 48;
 const LEVEL_SEP = 140;
-const MIN_PANE_PX = 120; // minimum px for each pane
+const MIN_PANE_PX = 120;
+
+// ─── UI helpers ───────────────────────────────────────────────────────────────
+
+function StatPill({
+  icon: Icon,
+  label,
+  value,
+  accent = "#64748b",
+}: {
+  icon: any;
+  label: string;
+  value: React.ReactNode;
+  accent?: string;
+}) {
+  return (
+    <div
+      className="flex flex-col gap-1 rounded-xl px-3 py-2.5 border"
+      style={{
+        background: hexToRgba(accent, 0.06),
+        borderColor: hexToRgba(accent, 0.18),
+      }}
+    >
+      <div className="flex items-center gap-1.5">
+        <Icon size={10} style={{ color: accent }} />
+        <span
+          className="text-[9px] font-bold uppercase tracking-wider"
+          style={{ color: hexToRgba(accent, 0.65) }}
+        >
+          {label}
+        </span>
+      </div>
+      <div
+        className="text-[13px] font-mono font-semibold truncate"
+        style={{ color: accent }}
+      >
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function Badge({
+  children,
+  color = "#64748b",
+}: {
+  children: React.ReactNode;
+  color?: string;
+}) {
+  return (
+    <span
+      className="text-[10px] font-mono px-1.5 py-0.5 rounded-md border"
+      style={{
+        color,
+        background: hexToRgba(color, 0.1),
+        borderColor: hexToRgba(color, 0.25),
+      }}
+    >
+      {children}
+    </span>
+  );
+}
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
@@ -237,16 +311,40 @@ export default function TreeView({
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const treeContainerRef = useRef<HTMLDivElement>(null);
-  const rootRef = useRef<HTMLDivElement>(null); // the outer wrapper — used to measure total height
+  const rootRef = useRef<HTMLDivElement>(null);
   const transformRef = useRef({ x: 0, y: 60, k: 1 });
   const rootNodeRef = useRef<TreeNode | null>(null);
   const drawRef = useRef<() => void>(() => {});
   const rawCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const tintCacheRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
 
+  const animatingNodesRef = useRef<Map<string, AnimatingNode>>(new Map());
+  const animatingLinksRef = useRef<Map<string, AnimatingLink>>(new Map());
+  const rafRef = useRef<number | null>(null);
+  const isAnimatingRef = useRef(false);
+
+  const layoutCacheRef = useRef<d3.HierarchyPointNode<TreeNode> | null>(null);
+  const filteredLayoutCacheRef = useRef<d3.HierarchyPointNode<TreeNode> | null>(
+    null,
+  );
+  const matchSetCacheRef = useRef<Set<string>>(new Set());
+  const lastFilterRef = useRef<string>("");
+
+  const setSelection = useSelectionStore((state) => state.setSelection);
+  const setFolderContext = useSelectionStore((state) => state.setFolderContext);
+  const setFileContext = useSelectionStore((state) => state.setFileContext);
+
+  // ── Rich context slices from Zustand ─────────────────────────────────────
+  const storeFileContext = useSelectionStore((s) => s.selection.fileContext);
+  const storeFolderContext = useSelectionStore(
+    (s) => s.selection.folderContext,
+  );
+  const storeRepoContext = useSelectionStore((s) => s.selection.repoContext);
+
   const [iconsReady, setIconsReady] = useState(false);
   const [, forceRender] = useState(0);
   const [legendOpen, setLegendOpen] = useState(false);
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [tooltip, setTooltip] = useState<{
     x: number;
     y: number;
@@ -255,11 +353,11 @@ export default function TreeView({
   const [activeFile, setActiveFile] = useState<{
     node: TreeNode;
     content: string;
+    imageDataUrl?: string;
     history?: any;
   } | null>(null);
 
-  // ── Splitter: topPx is the pixel height of the tree pane ──
-  const [topPx, setTopPx] = useState<number | null>(null); // null = use default split
+  const [topPx, setTopPx] = useState<number | null>(null);
   const isDragging = useRef(false);
   const dragStartY = useRef(0);
   const dragStartTop = useRef(0);
@@ -276,15 +374,12 @@ export default function TreeView({
     );
   }, [data]);
 
-  // When inspector opens, default to 50/50 split
   useEffect(() => {
-    if (activeFile && topPx === null && rootRef.current) {
+    if (activeFile && topPx === null && rootRef.current)
       setTopPx(rootRef.current.clientHeight / 2);
-    }
     if (!activeFile) setTopPx(null);
   }, [activeFile]);
 
-  // ── Drag handlers ────────────────────────────────────────────────────────
   const onDragStart = useCallback(
     (e: React.MouseEvent) => {
       e.preventDefault();
@@ -321,7 +416,6 @@ export default function TreeView({
     };
   }, []);
 
-  // ── Load icons ────────────────────────────────────────────────────────────
   useEffect(() => {
     const SIZE = 512;
     const raw = rawCacheRef.current;
@@ -341,7 +435,6 @@ export default function TreeView({
     });
   }, []);
 
-  // ── Tint cache ────────────────────────────────────────────────────────────
   const getTinted = useCallback(
     (key: string, color: string): HTMLCanvasElement | null => {
       const cacheKey = `${key}|${color}`;
@@ -366,7 +459,6 @@ export default function TreeView({
     [],
   );
 
-  // ── Build tree ────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!data) return;
     const children = data.children ? buildTree(data.children) : [];
@@ -379,77 +471,247 @@ export default function TreeView({
       originalChildren: children,
       children,
     } as unknown as TreeNode;
+    layoutCacheRef.current = null;
+    filteredLayoutCacheRef.current = null;
+    matchSetCacheRef.current = new Set();
+    lastFilterRef.current = "";
     forceRender((n) => n + 1);
   }, [data]);
 
-  // ── Layout ────────────────────────────────────────────────────────────────
-  const computeLayout = useCallback(() => {
-    const root = rootNodeRef.current;
-    if (!root) return null;
-    const h = d3.hierarchy<TreeNode>(root, (d) => d.children ?? null);
-    d3
-      .tree<TreeNode>()
-      .nodeSize([NODE_SEP, LEVEL_SEP])
-      .separation(() => 1.5)(h);
-    return h;
+  const computeLayout = useCallback(
+    (matchSet?: Set<string>) => {
+      const root = rootNodeRef.current;
+      if (!root) return null;
+      if (!matchSet && layoutCacheRef.current) return layoutCacheRef.current;
+      if (
+        matchSet &&
+        filteredLayoutCacheRef.current &&
+        lastFilterRef.current === filter
+      )
+        return filteredLayoutCacheRef.current;
+      const h = d3.hierarchy<TreeNode>(root, (d) => {
+        const kids = d.children ?? null;
+        if (!kids || !matchSet) return kids;
+        const filtered = kids.filter((c) => matchSet.has(c.id));
+        return filtered.length > 0 ? filtered : null;
+      });
+      const hp = d3
+        .tree<TreeNode>()
+        .nodeSize([NODE_SEP, LEVEL_SEP])
+        .separation(() => 1.5)(h);
+      if (!matchSet) layoutCacheRef.current = hp;
+      else {
+        filteredLayoutCacheRef.current = hp;
+        lastFilterRef.current = filter;
+      }
+      return hp;
+    },
+    [filter],
+  );
+
+  const stopAnim = useCallback(() => {
+    if (rafRef.current !== null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    isAnimatingRef.current = false;
   }, []);
+
+  const startAnimLoop = useCallback(() => {
+    if (isAnimatingRef.current) return;
+    isAnimatingRef.current = true;
+    const tick = () => {
+      const now = performance.now();
+      let stillGoing = false;
+      for (const [id, anim] of animatingNodesRef.current) {
+        const elapsed = now - anim.born;
+        const t = Math.min(1, elapsed / ANIM_DURATION);
+        const e = anim.closing ? 1 - ANIM_EASING(t) : ANIM_EASING(t);
+        anim.opacity = e;
+        anim.scale = 0.2 + e * 0.8;
+        anim.cx = anim.tx;
+        anim.cy = anim.ty;
+        if (t >= 1) {
+          if (anim.closing) {
+            anim.opacity = 0;
+            anim.scale = 0.2;
+          } else {
+            animatingNodesRef.current.delete(id);
+          }
+        } else {
+          stillGoing = true;
+        }
+      }
+      for (const [id, link] of animatingLinksRef.current) {
+        const elapsed = now - link.born;
+        const t = Math.min(1, elapsed / LINK_DURATION);
+        link.progress = link.closing ? 1 - LINK_EASING(t) : LINK_EASING(t);
+        if (t >= 1) {
+          if (link.closing) {
+            link.progress = 0;
+          } else {
+            animatingLinksRef.current.delete(id);
+          }
+        } else {
+          stillGoing = true;
+        }
+      }
+      drawRef.current();
+      if (stillGoing) {
+        rafRef.current = requestAnimationFrame(tick);
+      } else {
+        stopAnim();
+      }
+    };
+    rafRef.current = requestAnimationFrame(tick);
+  }, [stopAnim]);
 
   // ── Draw ──────────────────────────────────────────────────────────────────
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    if (canvas.width < 10 || canvas.height < 10) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     const dpr = window.devicePixelRatio || 1;
     const { x, y, k } = transformRef.current;
     ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr);
     ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = "high";
-    const hierarchy = computeLayout();
+    ctx.imageSmoothingQuality = "medium";
+
+    const isFiltering = filter.trim().length > 0;
+    let matchSet: Set<string>;
+    if (isFiltering) {
+      if (lastFilterRef.current !== filter) {
+        const fullH = computeLayout();
+        if (fullH) matchSetCacheRef.current = computeMatchSet(fullH, filter);
+        lastFilterRef.current = filter;
+      }
+      matchSet = matchSetCacheRef.current;
+    } else {
+      matchSet = new Set<string>();
+    }
+
+    const hierarchy = isFiltering ? computeLayout(matchSet) : computeLayout();
     if (!hierarchy) return;
+
     ctx.save();
     ctx.translate(x, y);
     ctx.scale(k, k);
 
+    const cW = canvas.width / dpr;
+    const cH = canvas.height / dpr;
+    const vxMin = -x / k - 150,
+      vxMax = (cW - x) / k + 150;
+    const vyMin = -y / k - 150,
+      vyMax = (cH - y) / k + 150;
+
+    // ── Links ──
     for (const link of hierarchy.links()) {
       const sx = Math.round(link.source.x ?? 0),
         sy = Math.round(link.source.y ?? 0);
       const tx = Math.round(link.target.x ?? 0),
         ty = Math.round(link.target.y ?? 0);
+      const midY = Math.round(sy + (ty - sy) * 0.5);
+      const isMatch = !isFiltering || matchSet.has(link.target.data.id);
+      const linkAnim = animatingLinksRef.current.get(link.target.data.id);
+
+      ctx.save();
       ctx.beginPath();
       ctx.moveTo(sx, sy);
-      const midY = Math.round(sy + (ty - sy) * 0.5);
       ctx.bezierCurveTo(sx, midY, tx, midY, tx, ty);
       ctx.strokeStyle =
-        link.target.data.type === "folder" ? "#4b6080" : "#374f68";
-      ctx.lineWidth = link.target.data.type === "folder" ? 1.2 : 0.8;
-      ctx.lineCap = "butt";
+        link.target.data.type === "folder"
+          ? "rgba(148,163,184,0.18)"
+          : "rgba(100,116,139,0.12)";
+      ctx.lineWidth = link.target.data.type === "folder" ? 1.0 : 0.7;
+      ctx.globalAlpha = isFiltering ? (isMatch ? 1 : 0) : 1;
+      ctx.lineCap = "round";
+
+      if (linkAnim && linkAnim.progress < 1) {
+        let len = 0,
+          px = sx,
+          py = sy;
+        const N = 20;
+        for (let i = 1; i <= N; i++) {
+          const tt = i / N,
+            it = 1 - tt;
+          const nx =
+            it * it * it * sx +
+            3 * it * it * tt * sx +
+            3 * it * tt * tt * tx +
+            tt * tt * tt * tx;
+          const ny =
+            it * it * it * sy +
+            3 * it * it * tt * midY +
+            3 * it * tt * tt * midY +
+            tt * tt * tt * ty;
+          len += Math.hypot(nx - px, ny - py);
+          px = nx;
+          py = ny;
+        }
+        ctx.setLineDash([len]);
+        ctx.lineDashOffset = len - len * linkAnim.progress;
+      } else {
+        ctx.setLineDash([]);
+        ctx.lineDashOffset = 0;
+      }
       ctx.stroke();
+      ctx.restore();
     }
 
+    // ── Nodes ──
     for (const node of hierarchy.descendants()) {
-      const nx = node.x ?? 0,
-        ny = node.y ?? 0;
       const d = node.data;
+      const anim = animatingNodesRef.current.get(d.id);
+      const isMatch = !isFiltering || matchSet.has(d.id);
+      const dimAlpha = isFiltering && !isMatch ? 0 : 1;
+      const rawX = node.x ?? 0,
+        rawY = node.y ?? 0;
+      if (
+        !anim &&
+        (rawX < vxMin || rawX > vxMax || rawY < vyMin || rawY > vyMax)
+      )
+        continue;
+
+      let nx = rawX,
+        ny = rawY,
+        nodeOpacity = dimAlpha,
+        nodeScale = 1;
+      if (anim) {
+        nodeOpacity = Math.min(dimAlpha, anim.opacity);
+        nodeScale = anim.scale;
+        ny = anim.cy;
+      }
+
       const r = nodeRadius(d);
       const key = iconKey(d);
 
+      ctx.save();
+      ctx.globalAlpha = nodeOpacity;
+      if (nodeScale < 1) {
+        ctx.translate(nx, ny);
+        ctx.scale(nodeScale, nodeScale);
+        ctx.translate(-nx, -ny);
+      }
+
       if (d.type === "root") {
-        const grad = ctx.createRadialGradient(nx, ny, r - 2, nx, ny, r + 12);
-        grad.addColorStop(0, hexToRgba("#60a5fa", 0.25));
-        grad.addColorStop(1, hexToRgba("#60a5fa", 0));
+        const grd = ctx.createRadialGradient(nx, ny, 0, nx, ny, r * 2.5);
+        grd.addColorStop(0, "rgba(96,165,250,0.07)");
+        grd.addColorStop(1, "rgba(96,165,250,0)");
         ctx.beginPath();
-        ctx.arc(nx, ny, r + 12, 0, Math.PI * 2);
-        ctx.fillStyle = grad;
+        ctx.arc(nx, ny, r * 2.5, 0, Math.PI * 2);
+        ctx.fillStyle = grd;
         ctx.fill();
+
         ctx.beginPath();
         ctx.arc(nx, ny, r, 0, Math.PI * 2);
-        ctx.fillStyle = "#0c1628";
+        ctx.fillStyle = "rgba(12,18,36,0.92)";
         ctx.fill();
-        ctx.strokeStyle = "#60a5fa";
+        ctx.strokeStyle = "rgba(147,197,253,0.55)";
         ctx.lineWidth = 1.5;
         ctx.stroke();
-        const tinted = getTinted(key, "#60a5fa");
+        const tinted = getTinted(key, "#93c5fd");
         if (tinted)
           ctx.drawImage(tinted, nx - r * 0.6, ny - r * 0.6, r * 1.2, r * 1.2);
         ctx.fillStyle = "#bfdbfe";
@@ -457,39 +719,50 @@ export default function TreeView({
         ctx.textAlign = "center";
         ctx.textBaseline = "top";
         ctx.fillText(
-          d.name.length > 18 ? d.name.slice(0, 17) + "…" : d.name,
+          d.name.length > 18 ? d.name.slice(0, 17) + "\u2026" : d.name,
           nx,
           ny + r + 5,
         );
       } else if (d.type === "folder") {
         const isCollapsed = d.originalChildren.length > 0 && !d.children;
-        const accent = isCollapsed ? "#cbd5e1" : "#94a3b8";
+        const accent = isCollapsed ? "#e2e8f0" : "#94a3b8";
         ctx.beginPath();
         ctx.arc(nx, ny, r, 0, Math.PI * 2);
-        ctx.fillStyle = isCollapsed ? "#1a2640" : "#111827";
+        ctx.fillStyle = isCollapsed
+          ? "rgba(28,38,56,0.88)"
+          : "rgba(15,22,36,0.78)";
         ctx.fill();
-        ctx.strokeStyle = accent;
-        ctx.lineWidth = isCollapsed ? 1.5 : 1.0;
+        ctx.strokeStyle = isCollapsed
+          ? "rgba(226,232,240,0.4)"
+          : "rgba(148,163,184,0.2)";
+        ctx.lineWidth = isCollapsed ? 1.5 : 0.9;
         ctx.stroke();
         ctx.beginPath();
-        ctx.arc(nx, ny, r * 0.72, 0, Math.PI * 2);
-        ctx.fillStyle = hexToRgba(accent, 0.12);
+        ctx.arc(nx, ny, r * 0.7, 0, Math.PI * 2);
+        ctx.fillStyle = hexToRgba(accent, 0.07);
         ctx.fill();
         const tinted = getTinted(key, accent);
         if (tinted)
-          ctx.drawImage(tinted, nx - r * 0.6, ny - r * 0.6, r * 1.2, r * 1.2);
+          ctx.drawImage(
+            tinted,
+            nx - r * 0.58,
+            ny - r * 0.58,
+            r * 1.16,
+            r * 1.16,
+          );
         ctx.fillStyle = isCollapsed ? "#e2e8f0" : "#94a3b8";
         ctx.font = `${isCollapsed ? "bold " : ""}8px monospace`;
         ctx.textAlign = "center";
         ctx.textBaseline = "top";
-        const folderLabel =
-          d.name.length > 12 ? d.name.slice(0, 11) + "…" : d.name;
-
-        ctx.fillText(folderLabel, nx, ny + r + 4);
+        ctx.fillText(
+          d.name.length > 12 ? d.name.slice(0, 11) + "\u2026" : d.name,
+          nx,
+          ny + r + 4,
+        );
         if (isCollapsed && d.originalChildren.length > 0) {
-          const label = `+${d.originalChildren.length}`;
-          const bw = label.length * 6 + 10;
-          ctx.fillStyle = "rgba(203,213,225,0.12)";
+          const label = `+${d.originalChildren.length}`,
+            bw = label.length * 6 + 10;
+          ctx.fillStyle = "rgba(203,213,225,0.08)";
           ctx.beginPath();
           ctx.roundRect(nx - bw / 2, ny + r + 17, bw, 12, 3);
           ctx.fill();
@@ -505,42 +778,43 @@ export default function TreeView({
         const radius = isLargeZoom ? r * 1.8 : r;
         ctx.beginPath();
         ctx.arc(nx, ny, radius, 0, Math.PI * 2);
-        ctx.fillStyle = "#0d1521";
+        ctx.fillStyle = "rgba(12,18,32,0.82)";
         ctx.fill();
-        ctx.strokeStyle = hexToRgba(color, 0.7);
-        ctx.lineWidth = 0.9;
+        ctx.strokeStyle = hexToRgba(color, 0.5);
+        ctx.lineWidth = 0.8;
         ctx.stroke();
         if (isLargeZoom) {
           ctx.beginPath();
-          ctx.arc(nx, ny, radius * 0.75, 0, Math.PI * 2);
-          ctx.fillStyle = hexToRgba(color, 0.18);
+          ctx.arc(nx, ny, radius * 0.72, 0, Math.PI * 2);
+          ctx.fillStyle = hexToRgba(color, 0.1);
           ctx.fill();
           const tinted = getTinted(key, color);
           if (tinted) {
-            const is = radius * 1.15;
+            const is = radius * 1.1;
             ctx.drawImage(tinted, nx - is / 2, ny - is / 2, is, is);
           }
         } else {
           ctx.beginPath();
-          ctx.arc(nx, ny, radius * 0.6, 0, Math.PI * 2);
-          ctx.fillStyle = color;
+          ctx.arc(nx, ny, radius * 0.55, 0, Math.PI * 2);
+          ctx.fillStyle = hexToRgba(color, 0.82);
           ctx.fill();
         }
         if (k > 0.9) {
-          ctx.fillStyle = hexToRgba(color, 0.9);
+          ctx.fillStyle = hexToRgba(color, 0.82);
           ctx.font = "7px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
           ctx.fillText(
-            d.name.length > 16 ? d.name.slice(0, 15) + "…" : d.name,
+            d.name.length > 16 ? d.name.slice(0, 15) + "\u2026" : d.name,
             nx,
             ny + radius + 4,
           );
         }
       }
+      ctx.restore();
     }
     ctx.restore();
-  }, [computeLayout, getTinted]);
+  }, [computeLayout, getTinted, filter]);
 
   useEffect(() => {
     drawRef.current = draw;
@@ -549,14 +823,22 @@ export default function TreeView({
     draw();
   }, [iconsReady, draw]);
 
-  // ── Canvas init ───────────────────────────────────────────────────────────
+  useEffect(() => {
+    let id: ReturnType<typeof setTimeout>;
+    const tick = () => {
+      drawRef.current();
+      id = setTimeout(tick, 50);
+    };
+    id = setTimeout(tick, 50);
+    return () => clearTimeout(id);
+  }, []);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     const container = treeContainerRef.current;
     if (!canvas || !container) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-
     const updateSize = () => {
       const dpr = window.devicePixelRatio || 1;
       const W = container.clientWidth,
@@ -571,9 +853,7 @@ export default function TreeView({
     const ro = new ResizeObserver(updateSize);
     ro.observe(container);
     updateSize();
-
     transformRef.current = { x: container.clientWidth / 2, y: 60, k: 1 };
-
     const zoom = d3
       .zoom<HTMLCanvasElement, unknown>()
       .scaleExtent([0.05, 10])
@@ -588,7 +868,6 @@ export default function TreeView({
       .filter(
         (event) => (!event.ctrlKey || event.type === "wheel") && !event.button,
       );
-
     const sel = d3.select(canvas);
     sel.call(zoom);
     sel.on("wheel.zoom", null);
@@ -614,7 +893,6 @@ export default function TreeView({
       },
       { passive: false },
     );
-
     sel.call(
       zoom.transform,
       d3.zoomIdentity.translate(container.clientWidth / 2, 60),
@@ -622,62 +900,164 @@ export default function TreeView({
     return () => ro.disconnect();
   }, []);
 
-  // ── Hit test ──────────────────────────────────────────────────────────────
   const hitTest = useCallback(
     (ex: number, ey: number): TreeNode | null => {
-      const h = computeLayout();
+      const isFiltering = filter.trim().length > 0;
+      const matchSet = isFiltering
+        ? matchSetCacheRef.current
+        : new Set<string>();
+      const h = isFiltering ? computeLayout(matchSet) : computeLayout();
       if (!h) return null;
       const { x, y, k } = transformRef.current;
       const mx = (ex - x) / k,
         my = (ey - y) / k;
       for (const node of h.descendants()) {
         const d = node.data;
+        if (isFiltering && !matchSet.has(d.id)) continue;
         const threshold = d.type === "root" ? 28 : nodeRadius(d) + 8;
         if (Math.hypot((node.x ?? 0) - mx, (node.y ?? 0) - my) < threshold)
           return d;
       }
       return null;
     },
-    [computeLayout],
+    [computeLayout, filter],
+  );
+
+  const toggleFolder = useCallback(
+    (hit: TreeNode) => {
+      const wasOpen = !!hit.children;
+      const currentH = computeLayout();
+      if (!currentH) return;
+      const folderH = currentH.descendants().find((n) => n.data.id === hit.id);
+      const parentX = folderH?.x ?? 0,
+        parentY = folderH?.y ?? 0;
+
+      if (!wasOpen && hit.originalChildren.length > 0) {
+        hit.children = hit.originalChildren;
+        layoutCacheRef.current = null;
+        filteredLayoutCacheRef.current = null;
+        const newH = computeLayout();
+        if (!newH) return;
+        const now = performance.now();
+        newH.descendants().forEach((n) => {
+          if (n.data.id === hit.id) return;
+          if (!folderH || n.depth <= folderH.depth) return;
+          let anc = n.parent,
+            isChild = false;
+          while (anc) {
+            if (anc.data.id === hit.id) {
+              isChild = true;
+              break;
+            }
+            anc = anc.parent;
+          }
+          if (!isChild) return;
+          const d = n.data;
+          animatingNodesRef.current.set(d.id, {
+            id: d.id,
+            cx: parentX,
+            cy: parentY,
+            tx: n.x ?? 0,
+            ty: n.y ?? 0,
+            opacity: 0,
+            scale: 0,
+            born: now,
+            closing: false,
+          });
+          animatingLinksRef.current.set(d.id, {
+            childId: d.id,
+            progress: 0,
+            born: now,
+            closing: false,
+          });
+        });
+        startAnimLoop();
+      } else if (wasOpen) {
+        const now = performance.now();
+        currentH.descendants().forEach((n) => {
+          if (n.data.id === hit.id) return;
+          let anc = n.parent,
+            isChild = false;
+          while (anc) {
+            if (anc.data.id === hit.id) {
+              isChild = true;
+              break;
+            }
+            anc = anc.parent;
+          }
+          if (!isChild) return;
+          const d = n.data;
+          const existingNode = animatingNodesRef.current.get(d.id);
+          const existingLink = animatingLinksRef.current.get(d.id);
+          const nodeProg = existingNode ? existingNode.opacity : 1;
+          const linkProg = existingLink ? existingLink.progress : 1;
+          animatingNodesRef.current.set(d.id, {
+            id: d.id,
+            cx: n.x ?? 0,
+            cy: n.y ?? 0,
+            tx: n.x ?? 0,
+            ty: n.y ?? 0,
+            opacity: nodeProg,
+            scale: 0.2 + nodeProg * 0.8,
+            born: now - ANIM_DURATION * (1 - nodeProg),
+            closing: true,
+          });
+          animatingLinksRef.current.set(d.id, {
+            childId: d.id,
+            progress: linkProg,
+            born: now - LINK_DURATION * (1 - linkProg),
+            closing: true,
+          });
+        });
+        const descendantIds = new Set<string>();
+        currentH.descendants().forEach((n) => {
+          if (n.data.id === hit.id) return;
+          let anc = n.parent;
+          while (anc) {
+            if (anc.data.id === hit.id) {
+              descendantIds.add(n.data.id);
+              break;
+            }
+            anc = anc.parent;
+          }
+        });
+        startAnimLoop();
+        setTimeout(() => {
+          for (const id of descendantIds) {
+            animatingNodesRef.current.delete(id);
+            animatingLinksRef.current.delete(id);
+          }
+          hit.children = null;
+          layoutCacheRef.current = null;
+          filteredLayoutCacheRef.current = null;
+          forceRender((n) => n + 1);
+        }, ANIM_DURATION);
+      }
+      drawRef.current();
+      forceRender((n) => n + 1);
+    },
+    [computeLayout, startAnimLoop],
   );
 
   const onClick = useCallback(
     async (e: React.MouseEvent<HTMLCanvasElement>) => {
       const rect = canvasRef.current!.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const y = e.clientY - rect.top;
-
-      // Use your hitTest logic here to find the 'hit'
-      const hit = hitTest(x, y);
-
+      const hit = hitTest(e.clientX - rect.left, e.clientY - rect.top);
       if (!hit) return;
+      const owner = data.details?.owner;
+      const repo = data.details?.name;
+      if (!owner || !repo) return;
+      const token = process.env.NEXT_PUBLIC_GITHUB_TOKEN;
+      const headers = {
+        Accept: "application/vnd.github.v3+json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      };
 
       if (hit.type === "folder") {
-        hit.children = hit.children ? null : hit.originalChildren;
-        drawRef.current();
-        forceRender((n) => n + 1);
-      } else if (hit.type === "file") {
-        const owner = data.details?.owner;
-        const repo = data.details?.name;
-
-        if (!owner || !repo) {
-          console.error("Repository details missing from data prop");
-          return;
-        }
-
-        // Important: Use the NEXT_PUBLIC token for client-side fetching
-        const token = process.env.NEXT_PUBLIC_GITHUB_TOKEN;
-
-        const headers = {
-          Accept: "application/vnd.github.v3+json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        };
-
+        toggleFolder(hit);
         try {
-          // ENCODE the path to handle spaces like "Museum of Candies"
           const encodedPath = encodeURIComponent(hit.id);
-
-          const [contentRes, historyRes] = await Promise.all([
+          const [contentsRes, commitsRes] = await Promise.all([
             fetch(
               `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`,
               { headers },
@@ -687,42 +1067,312 @@ export default function TreeView({
               { headers },
             ),
           ]);
-
-          if (!contentRes.ok) {
-            const errorData = await contentRes.json();
-            throw new Error(
-              errorData.message || `Status: ${contentRes.status}`,
-            );
+          const folderContents: any[] = contentsRes.ok
+            ? await contentsRes.json()
+            : [];
+          const commitsData: any[] = commitsRes.ok
+            ? await commitsRes.json()
+            : [];
+          const lastCommit = commitsData[0] ?? null;
+          const children = folderContents.map((c: any) => ({
+            name: c.name,
+            path: c.path,
+            type: c.type,
+            size: c.size,
+            sha: c.sha,
+            htmlUrl: c.html_url,
+            gitUrl: c.git_url,
+            downloadUrl: c.download_url ?? null,
+            ext: c.name.includes(".")
+              ? (c.name.split(".").pop()?.toLowerCase() ?? "")
+              : "",
+          }));
+          const subtreeFlat = flattenTree(
+            hit.originalChildren,
+            hit.fileDetails?.depth ?? 1,
+          );
+          const subtreeFiles = subtreeFlat.filter((e) => e.type === "file");
+          const subtreeFolders = subtreeFlat.filter((e) => e.type === "folder");
+          const extFreq: Record<string, number> = {};
+          for (const e of subtreeFiles) {
+            if (e.ext) extFreq[e.ext] = (extFreq[e.ext] ?? 0) + 1;
           }
-
-          const contentData = await contentRes.json();
-          const historyData = await historyRes.json();
-
-          // Handle binary files (like images) or empty files
+          const dominantExt =
+            Object.entries(extFreq).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+          const childNames = children.map((c) => c.name.toLowerCase());
+          const hasIndex = childNames.some((n) =>
+            /^index\.|^main\.|^app\./.test(n),
+          );
+          const hasConfig = childNames.some(
+            (n) => n.includes("config") || n.endsWith(".json"),
+          );
+          const hasReadme = childNames.some((n) => n === "readme.md");
+          const hasTests = childNames.some((n) =>
+            /test|spec|__tests__/.test(n),
+          );
+          const hasStyles = childNames.some((n) =>
+            /\.css$|\.scss$|\.sass$/.test(n),
+          );
+          const hasDotfiles = childNames.some((n) => n.startsWith("."));
+          const folderContext = {
+            id: hit.id,
+            name: hit.name,
+            path: hit.fileDetails?.path ?? hit.id,
+            depth: hit.fileDetails?.depth ?? 0,
+            size: hit.size,
+            branchWeight: hit.fileDetails?.branchWeight ?? 0,
+            isLarge: hit.fileDetails?.isLarge ?? false,
+            children,
+            lastCommit: lastCommit
+              ? {
+                  sha: lastCommit.sha,
+                  message: lastCommit.commit.message,
+                  author: lastCommit.commit.author.name,
+                  authorEmail: lastCommit.commit.author.email,
+                  date: lastCommit.commit.author.date,
+                  htmlUrl: lastCommit.html_url,
+                  avatarUrl: lastCommit.author?.avatar_url ?? null,
+                  authorProfileUrl: lastCommit.author?.html_url ?? null,
+                  shortSha: lastCommit.sha.slice(0, 7),
+                }
+              : null,
+            subtree: subtreeFlat,
+            stats: {
+              totalFiles: subtreeFiles.length,
+              totalFolders: subtreeFolders.length,
+              totalSize: subtreeFiles.reduce((acc, e) => acc + e.size, 0),
+              maxDepth: subtreeFlat.reduce(
+                (acc, e) => Math.max(acc, e.depth),
+                0,
+              ),
+              extFrequency: extFreq,
+              dominantExt,
+            },
+            flags: {
+              hasIndex,
+              hasConfig,
+              hasReadme,
+              hasTests,
+              hasStyles,
+              hasDotfiles,
+              isEntryPoint: hasIndex,
+              isConfigFolder: hasConfig && !hasIndex,
+              isTestFolder: hasTests && subtreeFiles.length > 0,
+            },
+          };
+          setFolderContext(folderContext);
+          setSelection("folder", hit.name, hit.id, folderContext);
+        } catch {
+          setSelection("folder", hit.name, hit.id, null);
+        }
+      } else if (hit.type === "file") {
+        try {
+          const encodedPath = encodeURIComponent(hit.id);
+          const [contentRes, historyRes] = await Promise.allSettled([
+            fetch(
+              `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`,
+              { headers },
+            ),
+            fetch(
+              `https://api.github.com/repos/${owner}/${repo}/commits?path=${encodedPath}&per_page=100`,
+              { headers },
+            ),
+          ]);
+          if (contentRes.status === "rejected" || !contentRes.value.ok)
+            throw new Error("Failed to fetch file content");
+          const contentData = await contentRes.value.json();
+          const historyData: any[] =
+            historyRes.status === "fulfilled" && historyRes.value.ok
+              ? await historyRes.value.json()
+              : [];
           let rawContent = "";
-          if (contentData.encoding === "base64") {
+          if (contentData.encoding === "base64")
             rawContent = atob(contentData.content.replace(/\n/g, ""));
-          } else {
-            rawContent =
-              "// Non-text or large file detected. Cannot preview raw content.";
+          const lines = rawContent.split("\n");
+          const lineCount = lines.length,
+            charCount = rawContent.length;
+          const commits = historyData.map((c: any) => ({
+            sha: c.sha,
+            shortSha: c.sha.slice(0, 8),
+            message: c.commit.message,
+            author: c.commit.author.name,
+            authorEmail: c.commit.author.email,
+            date: c.commit.author.date,
+            htmlUrl: c.html_url,
+            avatarUrl: c.author?.avatar_url ?? null,
+            profileUrl: c.author?.html_url ?? null,
+            committer: c.commit.committer.name,
+            committerEmail: c.commit.committer.email,
+            verified: c.commit.verification?.verified ?? false,
+          }));
+          const contribMap = new Map<
+            string,
+            {
+              name: string;
+              email: string;
+              avatarUrl: string | null;
+              profileUrl: string | null;
+              commits: number;
+              firstCommit: string;
+              lastCommit: string;
+            }
+          >();
+          for (const c of historyData) {
+            const key = c.commit.author.email;
+            if (!contribMap.has(key))
+              contribMap.set(key, {
+                name: c.commit.author.name,
+                email: key,
+                avatarUrl: c.author?.avatar_url ?? null,
+                profileUrl: c.author?.html_url ?? null,
+                commits: 0,
+                firstCommit: c.commit.author.date,
+                lastCommit: c.commit.author.date,
+              });
+            const entry = contribMap.get(key)!;
+            entry.commits++;
+            if (c.commit.author.date < entry.firstCommit)
+              entry.firstCommit = c.commit.author.date;
+            if (c.commit.author.date > entry.lastCommit)
+              entry.lastCommit = c.commit.author.date;
           }
-
+          const contributors = Array.from(contribMap.values()).sort(
+            (a, b) => b.commits - a.commits,
+          );
+          const topContributor = contributors[0] ?? null;
+          const emptyLines = lines.filter((l) => l.trim() === "").length;
+          const commentLines = lines.filter((l) =>
+            /^\s*(\/\/|#|\/\*|\*|<!--)/.test(l),
+          ).length;
+          const codeLines = lineCount - emptyLines - commentLines;
+          const importLines = rawContent.match(/^import .+/gm) ?? [];
+          const exportSymbols =
+            rawContent.match(
+              /export\s+(default\s+)?(const|function|class|type|interface|enum)\s+(\w+)/g,
+            ) ?? [];
+          const todoComments =
+            rawContent.match(/\/\/\s*(TODO|FIXME|HACK|NOTE|XXX):?.+/gi) ?? [];
+          const consoleLogs =
+            rawContent.match(/console\.(log|warn|error|info|debug)\(/g) ?? [];
+          const branchKeywords = (
+            rawContent.match(/\bif\b|\belse\b|\bswitch\b|\bcase\b|\b\?\s/g) ??
+            []
+          ).length;
+          const loopKeywords = (
+            rawContent.match(
+              /\bfor\b|\bwhile\b|\bdo\b|\b\.map\b|\b\.filter\b|\b\.reduce\b/g,
+            ) ?? []
+          ).length;
+          const asyncKeywords = (
+            rawContent.match(/\basync\b|\bawait\b|\b\.then\b|\b\.catch\b/g) ??
+            []
+          ).length;
+          const functionCount = (
+            rawContent.match(/\bfunction\b|\b=>\s*[{(]/g) ?? []
+          ).length;
+          const classCount = (rawContent.match(/\bclass\s+\w+/g) ?? []).length;
+          const isReact = /import\s+.*React|from\s+['"]react['"]/.test(
+            rawContent,
+          );
+          const isTypeScript = hit.ext === "ts" || hit.ext === "tsx";
+          const isTest =
+            /\.(test|spec)\.[a-z]+$/.test(hit.name) ||
+            /describe\(|it\(|test\(/.test(rawContent);
+          const isConfig = /config|\.env|rc\b/.test(hit.name.toLowerCase());
+          const hasJsx = /<[A-Z][A-Za-z]*[\s/>]|<\/[A-Z]/.test(rawContent);
+          const logicType = isTest
+            ? "Test / Spec"
+            : isConfig
+              ? "Config / Env"
+              : isReact && hasJsx
+                ? "UI Component (JSX)"
+                : isReact
+                  ? "React Hook / Utility"
+                  : "Logic / Utility / Backend";
+          const fileContext = {
+            id: hit.id,
+            name: hit.name,
+            path: hit.fileDetails?.path ?? hit.id,
+            ext: hit.ext,
+            depth: hit.fileDetails?.depth ?? 0,
+            isLarge: hit.fileDetails?.isLarge ?? false,
+            github: {
+              sha: contentData.sha,
+              size: contentData.size,
+              encoding: contentData.encoding,
+              htmlUrl: contentData.html_url,
+              gitUrl: contentData.git_url,
+              downloadUrl: contentData.download_url ?? null,
+              type: contentData.type,
+            },
+            content: rawContent,
+            metrics: {
+              lineCount,
+              charCount,
+              codeLines,
+              commentLines,
+              emptyLines,
+              byteSize: contentData.size,
+            },
+            analysis: {
+              imports: importLines.map((l) =>
+                l.replace(/^import\s+/, "").trim(),
+              ),
+              exports: exportSymbols.map((e) =>
+                e.replace(/^export\s+(default\s+)?/, "").trim(),
+              ),
+              todoComments,
+              consoleLogs: consoleLogs.length,
+              functionCount,
+              classCount,
+              complexity: {
+                score: branchKeywords + loopKeywords,
+                branches: branchKeywords,
+                loops: loopKeywords,
+                asyncOps: asyncKeywords,
+              },
+              logicType,
+              isReact,
+              isTypeScript,
+              isTest,
+              isConfig,
+              hasJsx,
+            },
+            commits,
+            contributors,
+            topContributor,
+            firstCommit:
+              commits.length > 0 ? commits[commits.length - 1] : null,
+            latestCommit: commits.length > 0 ? commits[0] : null,
+          };
+          setFileContext(fileContext);
+          setSelection("file", hit.name, hit.id, fileContext);
           setActiveFile({
             node: hit,
             content: rawContent,
+            imageDataUrl: undefined,
             history: historyData[0] || null,
           });
         } catch (err: any) {
-          console.error("GitHub API Error:", err.message);
-          setActiveFile({
-            node: hit,
-            content: `⚠️ API Error: ${err.message}\n\nPossible causes:\n1. Rate limit exceeded (check token).\n2. File is too large for the 'contents' API.\n3. Path contains special characters not encoded.`,
-            history: null,
-          });
+          console.error("File selection error:", err.message);
+        }
+      } else if (hit.type === "root") {
+        const existing = useSelectionStore.getState().selection.repoContext;
+        if (existing) {
+          useSelectionStore.getState().setRepoContext(existing);
+        } else {
+          setSelection("repo", data.details?.name ?? "Root", "/", null);
         }
       }
     },
-    [hitTest, data],
+    [
+      hitTest,
+      toggleFolder,
+      data,
+      setSelection,
+      setFolderContext,
+      setFileContext,
+    ],
   );
 
   const onMouseMove = useCallback(
@@ -736,97 +1386,544 @@ export default function TreeView({
       );
       if (canvasRef.current)
         canvasRef.current.style.cursor =
-          hit?.type === "folder" || hit?.type === "file"
+          hit?.type === "folder" || hit?.type === "file" || hit?.type === "root"
             ? "pointer"
             : "default";
     },
     [hitTest],
   );
 
+  const renderTooltipContent = (node: TreeNode) => {
+    if (node.type === "root") {
+      const rc = storeRepoContext;
+      return (
+        <div className="min-w-[300px] max-w-[340px]">
+          <div className="flex items-center gap-3 mb-4">
+            {(rc?.meta.avatar || node.details?.avatar) && (
+              <img
+                src={rc?.meta.avatar ?? node.details?.avatar}
+                className="w-10 h-10 rounded-xl border border-gray-600 shrink-0"
+                alt="avatar"
+              />
+            )}
+            <div className="min-w-0">
+              <div className="text-[14px] text-gray-100 font-bold truncate">
+                {rc?.meta.fullName ?? node.name}
+              </div>
+              <div className="text-[11px] text-blue-500 truncate">
+                {rc?.github?.description ??
+                  `@${node.details?.owner} \u00b7 ${node.details?.visibility}`}
+              </div>
+            </div>
+          </div>
+          <div className="grid grid-cols-4 gap-1.5 mb-3">
+            {[
+              {
+                label: "Stars",
+                value: `\u2605 ${(rc?.meta.stars ?? node.details?.stars ?? 0).toLocaleString()}`,
+                color: "#fbbf24",
+              },
+              {
+                label: "Forks",
+                value: (
+                  rc?.meta.forks ??
+                  node.details?.forks ??
+                  0
+                ).toLocaleString(),
+                color: "#60a5fa",
+              },
+              {
+                label: "Issues",
+                value: rc?.meta.openIssues ?? node.details?.openIssues ?? 0,
+                color: "#f87171",
+              },
+              {
+                label: "Watchers",
+                value: rc?.github?.watchers ?? "\u2014",
+                color: "#34d399",
+              },
+            ].map((s) => (
+              <div
+                key={s.label}
+                className="bg-gray-800 rounded-lg p-2 text-center border border-gray-600"
+              >
+                <div
+                  className="font-bold text-[12px]"
+                  style={{ color: s.color }}
+                >
+                  {s.value}
+                </div>
+                <div className="text-[9px] text-gray-500 uppercase tracking-tight mt-0.5">
+                  {s.label}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="space-y-1.5 border-t border-gray-600 pt-3">
+            {[
+              {
+                k: "Language",
+                v: rc?.meta.language || node.details?.language || "Mixed",
+                c: "#fb923c",
+              },
+              {
+                k: "Architecture",
+                v: rc?.stack.architecture ?? "\u2014",
+                c: "#a78bfa",
+              },
+              {
+                k: "Files",
+                v: rc
+                  ? `${rc.stats.totalFiles} files, ${rc.stats.totalFolders} folders`
+                  : "\u2014",
+                c: "#94a3b8",
+              },
+              {
+                k: "Root items",
+                v: rc ? `${rc.stats.rootItemCount}` : "\u2014",
+                c: "#34d399",
+              },
+              {
+                k: "Default branch",
+                v:
+                  rc?.meta.defaultBranch ??
+                  node.details?.defaultBranch ??
+                  "\u2014",
+                c: "#67e8f9",
+              },
+              {
+                k: "Last push",
+                v:
+                  (rc?.meta.pushedAt ?? node.details?.pushedAt)
+                    ? new Date(
+                        rc?.meta.pushedAt ?? node.details?.pushedAt ?? "",
+                      ).toLocaleDateString()
+                    : "\u2014",
+                c: "#94a3b8",
+              },
+              {
+                k: "License",
+                v: rc?.meta.license || node.details?.license || "none",
+                c: "#86efac",
+              },
+            ].map((r) => (
+              <div key={r.k} className="flex justify-between text-[11px]">
+                <span className="text-gray-400">{r.k}</span>
+                <span
+                  className="font-medium truncate ml-3 max-w-[160px] text-right"
+                  style={{ color: r.c }}
+                >
+                  {r.v}
+                </span>
+              </div>
+            ))}
+          </div>
+          {rc?.stack && (
+            <div className="flex flex-wrap gap-1 mt-3 pt-3 border-t border-gray-600">
+              {hasData
+                .filter(({ key }) => rc.stack[key as keyof typeof rc.stack])
+                .map(({ label, color }) => (
+                  <Badge key={label} color={color}>
+                    {label}
+                  </Badge>
+                ))}
+            </div>
+          )}
+          {rc?.latestCommit && (
+            <div className="mt-3 pt-3 border-t border-gray-600">
+              <div className="text-[9px] text-gray-500 uppercase tracking-wider mb-1.5">
+                Latest Commit
+              </div>
+              <div className="flex items-center gap-2">
+                {rc.latestCommit.avatarUrl && (
+                  <img
+                    src={rc.latestCommit.avatarUrl}
+                    className="w-5 h-5 rounded-full border border-gray-600"
+                    alt=""
+                  />
+                )}
+                <span className="text-[10px] font-mono text-gray-300 truncate">
+                  {rc.latestCommit.message.split("\n")[0].slice(0, 50)}
+                </span>
+                <span className="text-[9px] font-mono text-gray-500 shrink-0">
+                  {rc.latestCommit.shortSha}
+                </span>
+              </div>
+            </div>
+          )}
+          {rc?.github?.topics && rc.github.topics.length > 0 && (
+            <div className="flex flex-wrap gap-1 mt-3">
+              {rc.github.topics.slice(0, 6).map((t: string) => (
+                <Badge key={t} color="#818cf8">
+                  {t}
+                </Badge>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    if (node.type === "folder") {
+      const fc = storeFolderContext?.id === node.id ? storeFolderContext : null;
+      return (
+        <div className="min-w-[240px] max-w-[300px] space-y-3">
+          <div>
+            <div className="text-[13px] text-gray-100 font-bold">
+              {node.name}/
+            </div>
+            <div className="text-[10px] text-blue-500/70 truncate font-mono">
+              {node.fileDetails?.path}
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-1.5">
+            {[
+              {
+                label: "Children",
+                value: node.originalChildren.length,
+                color: "#60a5fa",
+              },
+              {
+                label: "Depth",
+                value: `L${node.fileDetails?.depth}`,
+                color: "#94a3b8",
+              },
+              {
+                label: "Size",
+                value:
+                  node.size > 1048576
+                    ? `${(node.size / 1048576).toFixed(2)} MB`
+                    : `${(node.size / 1024).toFixed(1)} KB`,
+                color: "#fb923c",
+              },
+              {
+                label: "Subtree",
+                value: fc
+                  ? `${fc.stats.totalFiles}f ${fc.stats.totalFolders}d`
+                  : `${node.fileDetails?.branchWeight ?? "\u2014"}`,
+                color: "#34d399",
+              },
+            ].map((s) => (
+              <div
+                key={s.label}
+                className="bg-gray-800 rounded-lg px-2.5 py-2 border border-gray-700"
+              >
+                <div className="text-[9px] text-gray-500 uppercase tracking-tight mb-0.5">
+                  {s.label}
+                </div>
+                <div
+                  className="text-[12px] font-mono font-bold"
+                  style={{ color: s.color }}
+                >
+                  {s.value}
+                </div>
+              </div>
+            ))}
+          </div>
+          {fc && (
+            <>
+              <div className="flex flex-wrap gap-1">
+                {fc.flags.isEntryPoint && (
+                  <Badge color="#34d399">Entry Point</Badge>
+                )}
+                {fc.flags.isConfigFolder && (
+                  <Badge color="#fbbf24">Config</Badge>
+                )}
+                {fc.flags.isTestFolder && <Badge color="#f472b6">Tests</Badge>}
+                {fc.flags.hasReadme && <Badge color="#94a3b8">README</Badge>}
+                {fc.flags.hasStyles && <Badge color="#38bdf8">Styles</Badge>}
+                {fc.flags.hasDotfiles && (
+                  <Badge color="#a78bfa">Dotfiles</Badge>
+                )}
+              </div>
+              {fc.stats.dominantExt && (
+                <div className="text-[11px] text-gray-300">
+                  Dominant:{" "}
+                  <span className="font-mono text-orange-400">
+                    .{fc.stats.dominantExt}
+                  </span>
+                </div>
+              )}
+              {fc.lastCommit && (
+                <div className="border-t border-gray-600 pt-2.5">
+                  <div className="text-[9px] text-gray-500 uppercase tracking-wider mb-1">
+                    Last Commit
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {fc.lastCommit.avatarUrl && (
+                      <img
+                        src={fc.lastCommit.avatarUrl}
+                        className="w-5 h-5 rounded-full border border-gray-600"
+                        alt=""
+                      />
+                    )}
+                    <div className="min-w-0">
+                      <div className="text-[10px] text-gray-300 truncate">
+                        {fc.lastCommit.message.split("\n")[0].slice(0, 45)}
+                      </div>
+                      <div className="text-[9px] text-gray-500 font-mono">
+                        {fc.lastCommit.author} \u00b7 {fc.lastCommit.shortSha}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      );
+    }
+
+    const fctx = storeFileContext?.id === node.id ? storeFileContext : null;
+    const { color } = fileColor(node.ext);
+    return (
+      <div className="min-w-[240px] max-w-[300px] space-y-3">
+        <div className="flex items-center gap-2">
+          <div
+            className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0"
+            style={{
+              background: hexToRgba(color, 0.15),
+              border: `1px solid ${hexToRgba(color, 0.3)}`,
+            }}
+          >
+            <FileCode2 size={13} style={{ color }} />
+          </div>
+          <div className="min-w-0">
+            <div className="text-[13px] text-gray-100 font-bold truncate">
+              {node.name}
+            </div>
+            <div
+              className="text-[10px] font-mono truncate"
+              style={{ color: hexToRgba(color, 0.7) }}
+            >
+              .{node.ext}
+            </div>
+          </div>
+        </div>
+        <div className="grid grid-cols-2 gap-1.5">
+          <div className="bg-gray-800 rounded-lg px-2.5 py-2 border border-gray-700">
+            <div className="text-[9px] text-gray-500 uppercase tracking-tight mb-0.5">
+              Size
+            </div>
+            <div
+              className="text-[12px] font-mono font-bold"
+              style={{
+                color: node.fileDetails?.isLarge ? "#fb923c" : "#94a3b8",
+              }}
+            >
+              {node.size > 1048576
+                ? `${(node.size / 1048576).toFixed(2)} MB`
+                : `${(node.size / 1024).toFixed(2)} KB`}
+            </div>
+          </div>
+          <div className="bg-gray-800 rounded-lg px-2.5 py-2 border border-gray-700">
+            <div className="text-[9px] text-gray-500 uppercase tracking-tight mb-0.5">
+              Depth
+            </div>
+            <div className="text-[12px] font-mono font-bold text-gray-300">
+              L{node.fileDetails?.depth}
+            </div>
+          </div>
+        </div>
+        {fctx && (
+          <>
+            <div className="grid grid-cols-3 gap-1">
+              {[
+                { v: fctx.metrics.lineCount, l: "Lines", c: "#94a3b8" },
+                { v: fctx.analysis.functionCount, l: "Funcs", c: "#818cf8" },
+                {
+                  v: fctx.analysis.complexity.score,
+                  l: "Complexity",
+                  c:
+                    fctx.analysis.complexity.score > 20
+                      ? "#f87171"
+                      : fctx.analysis.complexity.score > 10
+                        ? "#fbbf24"
+                        : "#34d399",
+                },
+              ].map((s) => (
+                <div
+                  key={s.l}
+                  className="bg-gray-800 rounded-lg px-2 py-1.5 border border-gray-700 text-center"
+                >
+                  <div
+                    className="text-[11px] font-mono font-bold"
+                    style={{ color: s.c }}
+                  >
+                    {s.v}
+                  </div>
+                  <div className="text-[8px] text-gray-500 uppercase mt-0.5">
+                    {s.l}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="flex flex-wrap gap-1">
+              {fctx.analysis.isReact && <Badge color="#61dafb">React</Badge>}
+              {fctx.analysis.isTypeScript && (
+                <Badge color="#3b82f6">TypeScript</Badge>
+              )}
+              {fctx.analysis.hasJsx && <Badge color="#f472b6">JSX</Badge>}
+              {fctx.analysis.isTest && <Badge color="#34d399">Test</Badge>}
+              {fctx.analysis.isConfig && <Badge color="#fbbf24">Config</Badge>}
+            </div>
+            <div
+              className="text-[10px] font-mono truncate"
+              style={{ color: hexToRgba(color, 0.7) }}
+            >
+              {fctx.analysis.logicType}
+            </div>
+            {fctx.latestCommit && (
+              <div className="border-t border-gray-600 pt-2">
+                <div className="text-[9px] text-gray-500 uppercase tracking-wider mb-1">
+                  Last Commit
+                </div>
+                <div className="text-[10px] text-gray-300 truncate">
+                  {fctx.latestCommit.message.split("\n")[0].slice(0, 45)}
+                </div>
+                <div className="text-[9px] text-gray-500 font-mono mt-0.5">
+                  {fctx.latestCommit.author} \u00b7 {fctx.latestCommit.shortSha}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    );
+  };
+
   const sidebarWidth = legendOpen ? 280 : 48;
   const fc = activeFile ? fileColor(activeFile.node.ext) : null;
 
-  // Compute pixel heights for the two panes
-  const treeH = activeFile && topPx !== null ? topPx : undefined;
-  const inspH =
-    activeFile && topPx !== null && rootRef.current
-      ? rootRef.current.clientHeight - topPx - 6 // 6 = divider height
-      : undefined;
-
   return (
-    // KEY: outer div is position:relative with overflow:hidden.
-    // The parent (workspace page) gives this component h-full, so it fills the slot exactly.
-    // We do NOT use flex-col + percentages here — we use absolute positioning for each pane
-    // so they can never push each other out of the container.
     <div
       ref={rootRef}
-      className="relative w-full h-full bg-[#080d16] overflow-hidden"
+      className="relative w-full h-full overflow-hidden bg-gray-900"
     >
       <div
         ref={treeContainerRef}
         className="absolute left-0 right-0 top-0 overflow-hidden"
         style={{ bottom: activeFile ? `calc(100% - ${topPx ?? 0}px)` : 0 }}
       >
-        <div
-          className="absolute right-0 top-0 bottom-0 z-10 flex flex-col border-l border-slate-700/50 bg-[#080d16]/95 backdrop-blur-sm transition-all duration-200 overflow-hidden"
-          style={{ width: sidebarWidth }}
-        >
+        {/* Sidebar legend */}
+        <div className="absolute right-0 border-l-2 border-gray-600 top-0 bg-gray-900 bottom-0 z-10 flex flex-col transition-all duration-200 overflow-hidden">
           <div
-            className={`shrink-0 p-2 border-b border-slate-700/50 flex items-center ${legendOpen ? "justify-between" : "justify-center"}`}
+            className={`shrink-0 p-2 flex border-b-2 border-gray-600 items-center ${legendOpen ? "justify-between" : "justify-center"}`}
           >
             {legendOpen && (
               <div className="flex items-center gap-2 pl-1">
-                <GitBranch size={12} className="text-slate-400" />
-                <span className="text-[11px] font-mono uppercase tracking-[0.15em] text-slate-400 whitespace-nowrap">
+                <GitBranch size={11} className="text-slate-600" />
+                <span className="text-[10px] font-mono font-bold text-slate-600 uppercase tracking-widest pt-1">
                   File Types
                 </span>
               </div>
             )}
             <button
               onClick={() => setLegendOpen((v) => !v)}
-              className="w-7 h-7 flex items-center justify-center rounded-md hover:bg-white/10 transition-colors text-slate-400 hover:text-slate-200"
+              className="w-7 h-7 cursor-pointer flex items-center justify-center rounded-lg transition-colors text-slate-600 hover:text-slate-300 hover:bg-white/5"
             >
               <ChevronLeft
-                size={14}
-                className={`transition-transform duration-200 ${legendOpen ? "rotate-180" : ""}`}
+                size={13}
+                className={`transition-transform text-gray-400 duration-200 ${legendOpen ? "rotate-180" : ""}`}
               />
             </button>
           </div>
-
           {legendOpen && (
             <div className="flex-1 overflow-y-auto px-2 py-2 flex flex-col gap-0.5">
-              {presentGroups.map(({ label, color, exts, icon: Icon }) => (
-                <div
-                  key={label}
-                  className="flex items-center gap-3 px-2 py-2 rounded-lg hover:bg-white/6 transition-colors"
-                >
+              {presentGroups.map(({ label, color, exts, icon: Icon }) => {
+                const isExpanded = expandedGroups.has(label);
+                const toggleExpand = () =>
+                  setExpandedGroups((prev) => {
+                    const next = new Set(prev);
+                    next.has(label) ? next.delete(label) : next.add(label);
+                    return next;
+                  });
+                return (
                   <div
-                    className="shrink-0 w-8 h-8 rounded-full flex items-center justify-center"
-                    style={{ background: color + "28" }}
+                    key={label}
+                    className="flex flex-col rounded-lg overflow-hidden"
                   >
-                    <Icon size={15} style={{ color }} />
-                  </div>
-                  <div className="flex-1 min-w-0">
                     <div
-                      className="text-[13px] font-semibold leading-tight"
-                      style={{ color }}
+                      className="flex items-center gap-2.5 px-2 py-1.5 hover:bg-white/4 transition-colors cursor-pointer"
+                      onClick={toggleExpand}
                     >
-                      {label}
+                      <div
+                        className="shrink-0 w-6 h-6 rounded-full flex items-center justify-center"
+                        style={{ background: hexToRgba(color, 0.18) }}
+                      >
+                        <Icon size={12} style={{ color }} />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div
+                          className="text-[12px] font-semibold leading-tight"
+                          style={{ color }}
+                        >
+                          {label}
+                        </div>
+                        {/* preview text fades out when expanding */}
+                        <div
+                          className="text-[10px] leading-tight truncate mt-0.5 font-mono transition-all duration-200 overflow-hidden"
+                          style={{
+                            color: hexToRgba(color, 0.7),
+                            maxHeight: isExpanded ? "0px" : "20px",
+                            opacity: isExpanded ? 0 : 1,
+                          }}
+                        >
+                          {exts.length > 0
+                            ? exts
+                                .slice(0, 5)
+                                .map((e) => `.${e}`)
+                                .join(" ") + (exts.length > 5 ? " \u2026" : "")
+                            : "others"}
+                        </div>
+                      </div>
+                      <ChevronDown
+                        size={11}
+                        className="shrink-0 transition-transform duration-200"
+                        style={{
+                          color: hexToRgba(color, 0.6),
+                          transform: isExpanded
+                            ? "rotate(180deg)"
+                            : "rotate(0deg)",
+                        }}
+                      />
                     </div>
+                    {/* pill tray animates open/closed via max-height */}
                     <div
-                      className="text-[10px] leading-tight truncate mt-0.5 font-mono"
-                      style={{ color: color + "aa" }}
+                      className="flex flex-wrap gap-1 px-3 overflow-hidden transition-all duration-200"
+                      style={{
+                        background: hexToRgba(color, 0.05),
+                        maxHeight: isExpanded ? "200px" : "0px",
+                        paddingTop: isExpanded ? "4px" : "0px",
+                        paddingBottom: isExpanded ? "8px" : "0px",
+                        opacity: isExpanded ? 1 : 0,
+                      }}
                     >
-                      {exts.length > 0
-                        ? exts
-                            .slice(0, 5)
-                            .map((e) => `.${e}`)
-                            .join(" ") + (exts.length > 5 ? " …" : "")
-                        : "others"}
+                      {exts.length > 0 ? (
+                        exts.map((e) => (
+                          <span
+                            key={e}
+                            className="text-[10px] font-mono px-1.5 py-0.5 rounded"
+                            style={{
+                              color: hexToRgba(color, 0.9),
+                              background: hexToRgba(color, 0.12),
+                            }}
+                          >
+                            .{e}
+                          </span>
+                        ))
+                      ) : (
+                        <span
+                          className="text-[10px] font-mono italic"
+                          style={{ color: hexToRgba(color, 0.5) }}
+                        >
+                          all other extensions
+                        </span>
+                      )}
                     </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
@@ -844,375 +1941,690 @@ export default function TreeView({
           }}
         />
 
-        {/* Tooltip */}
+        {/* Rich tooltip */}
         {tooltip && (
           <div
-            className="absolute z-20 pointer-events-none px-4 py-3 rounded-xl font-mono shadow-2xl border backdrop-blur-md"
+            className="absolute z-20 pointer-events-none px-4 py-3.5 rounded-2xl font-mono shadow-2xl"
             style={{
               left: tooltip.x + 20,
               top: Math.min(
                 tooltip.y - 10,
-                (treeContainerRef.current?.clientHeight ?? 400) - 280,
+                (treeContainerRef.current?.clientHeight ?? 400) - 340,
               ),
-              background: "rgba(10, 18, 32, 0.97)",
-              borderColor:
-                tooltip.node.type === "root"
-                  ? "#60a5fa"
-                  : "rgba(100, 116, 139, 0.55)",
+              background: "#111827",
+              border: "2px solid #4b5563",
+              borderRadius: "16px",
+              boxShadow: "0 24px 64px rgba(0,0,0,0.6)",
             }}
           >
-            {tooltip.node.type === "root" ? (
-              <div className="min-w-[280px]">
-                <div className="flex items-center gap-3 mb-4">
-                  {tooltip.node.details?.avatar && (
-                    <img
-                      src={tooltip.node.details.avatar}
-                      className="w-10 h-10 rounded-xl border border-white/15"
-                      alt="avatar"
-                    />
-                  )}
-                  <div>
-                    <div className="text-[15px] text-white font-bold">
-                      {tooltip.node.name}
-                    </div>
-                    <div className="text-[11px] text-blue-400">
-                      @{tooltip.node.details?.owner} ·{" "}
-                      {tooltip.node.details?.visibility}
-                    </div>
-                  </div>
-                </div>
-                <div className="grid grid-cols-3 gap-2 mb-3">
-                  {[
-                    {
-                      label: "Stars",
-                      value: `★ ${tooltip.node.details?.stars?.toLocaleString()}`,
-                      color: "text-yellow-400",
-                    },
-                    {
-                      label: "Forks",
-                      value: tooltip.node.details?.forks?.toLocaleString(),
-                      color: "text-blue-400",
-                    },
-                    {
-                      label: "Issues",
-                      value: tooltip.node.details?.openIssues,
-                      color: "text-red-400",
-                    },
-                  ].map((s) => (
-                    <div
-                      key={s.label}
-                      className="bg-white/5 rounded-lg p-2 text-center border border-white/5"
-                    >
-                      <div className={`${s.color} text-[12px] font-bold`}>
-                        {s.value}
-                      </div>
-                      <div className="text-[9px] text-slate-500 uppercase tracking-tight mt-0.5">
-                        {s.label}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-                <div className="space-y-1.5 border-t border-slate-800 pt-3">
-                  {[
-                    {
-                      k: "Language",
-                      v: tooltip.node.details?.language || "Mixed",
-                      c: "text-orange-400",
-                    },
-                    {
-                      k: "Size",
-                      v: `${Math.round((tooltip.node.details?.size ?? 0) / 1024)} MB`,
-                      c: "text-slate-300",
-                    },
-                    {
-                      k: "Last Push",
-                      v: tooltip.node.details?.pushedAt
-                        ? new Date(
-                            tooltip.node.details.pushedAt,
-                          ).toLocaleDateString()
-                        : "—",
-                      c: "text-slate-300",
-                    },
-                  ].map((r) => (
-                    <div key={r.k} className="flex justify-between text-[11px]">
-                      <span className="text-slate-500">{r.k}</span>
-                      <span className={`${r.c} font-medium`}>{r.v}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ) : (
-              <div className="min-w-[220px] space-y-2.5">
-                <div>
-                  <div className="text-[13px] text-white font-bold">
-                    {tooltip.node.name}
-                  </div>
-                  <div className="text-[10px] text-blue-400 opacity-80 truncate max-w-[240px]">
-                    {tooltip.node.fileDetails?.path}
-                  </div>
-                </div>
-                <div className="grid grid-cols-2 gap-x-6 gap-y-2 border-t border-slate-700 pt-2.5">
-                  <div>
-                    <div className="text-[9px] text-slate-500 uppercase mb-0.5">
-                      Size
-                    </div>
-                    <div className="text-[12px] text-slate-200 font-bold">
-                      {tooltip.node.size > 1024 * 1024
-                        ? `${(tooltip.node.size / (1024 * 1024)).toFixed(2)} MB`
-                        : `${(tooltip.node.size / 1024).toFixed(2)} KB`}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="text-[9px] text-slate-500 uppercase mb-0.5">
-                      Depth
-                    </div>
-                    <div className="text-[12px] text-slate-200 font-bold">
-                      Level {tooltip.node.fileDetails?.depth}
-                    </div>
-                  </div>
-                  {tooltip.node.type === "folder" && (
-                    <div>
-                      <div className="text-[9px] text-slate-500 uppercase mb-0.5">
-                        Children
-                      </div>
-                      <div className="text-[12px] text-blue-300 font-bold">
-                        {tooltip.node.originalChildren.length}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
+            {renderTooltipContent(tooltip.node)}
           </div>
         )}
       </div>
 
-      {/* ══ DRAG DIVIDER ══ */}
+      {/* Drag divider */}
       {activeFile && topPx !== null && (
         <div
           className="absolute left-0 right-0 z-30 flex items-center justify-center group"
           style={{ top: topPx, height: 6, cursor: "row-resize" }}
           onMouseDown={onDragStart}
         >
-          {/* visible bar */}
-          <div className="absolute inset-0 bg-slate-700/60 group-hover:bg-blue-500/50 transition-colors" />
-          {/* grip dots */}
-          <div className="relative z-10 flex items-center gap-1 px-3 py-0.5 bg-slate-800 border border-slate-600 group-hover:border-blue-500/60 rounded-full transition-colors pointer-events-none">
+          <div
+            className="absolute inset-0 transition-colors"
+            style={{ background: "rgba(30,41,59,0.5)" }}
+          />
+          <div
+            className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity"
+            style={{ background: "rgba(59,130,246,0.3)" }}
+          />
+          <div
+            className="relative z-10 flex items-center gap-1 px-3 py-0.5 rounded-full pointer-events-none"
+            style={{
+              background: "rgba(10,16,28,0.9)",
+              border: "1px solid rgba(30,41,59,0.8)",
+            }}
+          >
             <GripHorizontal
-              size={12}
-              className="text-slate-500 group-hover:text-blue-400 transition-colors"
+              size={10}
+              className="text-slate-600 group-hover:text-blue-400 transition-colors"
             />
           </div>
         </div>
       )}
 
-      {/* ══ INSPECTOR PANE ══ */}
+      {/* Inspector pane */}
       {activeFile && topPx !== null && (
         <div
-          className="absolute left-0 right-0 bottom-0 flex flex-col bg-[#080d16] overflow-hidden"
-          style={{ top: topPx + 6 }}
+          className="absolute left-0 right-0 bottom-0 flex flex-col overflow-hidden"
+          style={{
+            top: topPx + 6,
+            background: "linear-gradient(180deg, #060b14 0%, #060810 100%)",
+          }}
         >
           {/* Header */}
           <div
-            className="shrink-0 flex items-center gap-3 px-4 py-2.5 border-b border-slate-800"
-            style={{ background: fc ? hexToRgba(fc.color, 0.07) : "#0d1521" }}
+            className="shrink-0 flex items-center gap-3 px-4 py-2.5"
+            style={{
+              background: fc ? hexToRgba(fc.color, 0.04) : "rgba(10,15,26,0.9)",
+              borderBottom: `1px solid ${fc ? hexToRgba(fc.color, 0.1) : "rgba(20,30,50,0.8)"}`,
+            }}
           >
             <div
-              className="shrink-0 w-8 h-8 rounded-lg flex items-center justify-center"
+              className="shrink-0 w-8 h-8 rounded-xl flex items-center justify-center"
               style={{
-                background: fc ? hexToRgba(fc.color, 0.18) : "#1e293b",
-                border: `1px solid ${fc?.color ?? "#475569"}35`,
+                background: fc
+                  ? hexToRgba(fc.color, 0.1)
+                  : "rgba(20,30,50,0.6)",
+                border: `1px solid ${fc ? hexToRgba(fc.color, 0.18) : "rgba(30,45,70,0.5)"}`,
               }}
             >
-              {fc && <fc.icon size={15} style={{ color: fc.color }} />}
+              {fc && <fc.icon size={14} style={{ color: fc.color }} />}
             </div>
             <div className="flex-1 min-w-0">
               <div className="text-[14px] font-bold text-white font-mono truncate leading-tight">
                 {activeFile.node.name}
               </div>
-              <div className="text-[10px] text-slate-500 font-mono truncate">
+              <div className="text-[10px] text-slate-600 font-mono truncate">
                 {activeFile.node.fileDetails?.path}
               </div>
             </div>
-            <div className="hidden sm:flex items-center gap-2 shrink-0">
-              <span className="text-[11px] font-mono text-slate-400 bg-slate-800 px-2.5 py-1 rounded-md border border-slate-700">
-                {activeFile.content.split("\n").length} lines
-              </span>
-              <span className="text-[11px] font-mono text-slate-400 bg-slate-800 px-2.5 py-1 rounded-md border border-slate-700">
+            <div className="hidden sm:flex items-center gap-1.5 shrink-0">
+              {storeFileContext && (
+                <>
+                  <span
+                    className="text-[10px] font-mono px-2 py-0.5 rounded-md border"
+                    style={{
+                      color: "#64748b",
+                      background: "rgba(100,116,139,0.06)",
+                      borderColor: "rgba(100,116,139,0.14)",
+                    }}
+                  >
+                    {storeFileContext.metrics.lineCount}L
+                  </span>
+                  <span
+                    className="text-[10px] font-mono px-2 py-0.5 rounded-md border"
+                    style={{
+                      color: "#818cf8",
+                      background: "rgba(129,140,248,0.06)",
+                      borderColor: "rgba(129,140,248,0.14)",
+                    }}
+                  >
+                    {storeFileContext.analysis.functionCount}\u0192
+                  </span>
+                  {storeFileContext.analysis.isTypeScript && (
+                    <span
+                      className="text-[10px] font-mono px-2 py-0.5 rounded-md border"
+                      style={{
+                        color: "#3b82f6",
+                        background: "rgba(59,130,246,0.06)",
+                        borderColor: "rgba(59,130,246,0.14)",
+                      }}
+                    >
+                      TS
+                    </span>
+                  )}
+                  {storeFileContext.analysis.isReact && (
+                    <span
+                      className="text-[10px] font-mono px-2 py-0.5 rounded-md border"
+                      style={{
+                        color: "#61dafb",
+                        background: "rgba(97,218,251,0.06)",
+                        borderColor: "rgba(97,218,251,0.14)",
+                      }}
+                    >
+                      React
+                    </span>
+                  )}
+                </>
+              )}
+              <span
+                className="text-[10px] font-mono px-2 py-0.5 rounded-md border"
+                style={{
+                  color: "#475569",
+                  background: "rgba(71,85,105,0.06)",
+                  borderColor: "rgba(71,85,105,0.12)",
+                }}
+              >
                 {(activeFile.node.size / 1024).toFixed(1)} KB
               </span>
             </div>
             <button
               onClick={() => setActiveFile(null)}
-              className="shrink-0 w-7 h-7 flex items-center justify-center rounded-lg text-slate-500 hover:text-white hover:bg-red-500/15 border border-slate-700 hover:border-red-500/40 transition-all"
+              className="shrink-0 w-7 h-7 flex items-center justify-center rounded-lg transition-all"
+              style={{
+                color: "#475569",
+                border: "1px solid rgba(30,41,59,0.7)",
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.color = "#f87171";
+                e.currentTarget.style.background = "rgba(239,68,68,0.07)";
+                e.currentTarget.style.borderColor = "rgba(239,68,68,0.2)";
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.color = "#475569";
+                e.currentTarget.style.background = "transparent";
+                e.currentTarget.style.borderColor = "rgba(30,41,59,0.7)";
+              }}
             >
-              <X size={14} />
+              <X size={13} />
             </button>
           </div>
 
-          {/* Body: source + details */}
+          {/* Body */}
           <div className="flex flex-1 min-h-0">
             {/* Source */}
             <div
-              className="flex flex-col border-r border-slate-800 overflow-hidden"
-              style={{ width: "60%" }}
+              className="flex flex-col border-r overflow-hidden"
+              style={{ width: "58%", borderColor: "rgba(20,30,50,0.7)" }}
             >
-              <div className="shrink-0 flex items-center gap-2 px-4 py-2 border-b border-slate-800/70 bg-slate-950/60">
-                <Code2 size={12} className="text-slate-500" />
-                <span className="text-[11px] font-mono font-bold text-slate-500 uppercase tracking-wider">
-                  Source
+              <div
+                className="shrink-0 flex items-center gap-2 px-4 py-2"
+                style={{
+                  borderBottom: "1px solid rgba(20,30,50,0.5)",
+                  background: "rgba(4,7,14,0.6)",
+                }}
+              >
+                <Code2 size={11} className="text-slate-700" />
+                <span className="text-[10px] font-mono font-bold text-slate-700 uppercase tracking-widest">
+                  {activeFile.imageDataUrl ? "Preview" : "Source"}
                 </span>
+                {storeFileContext && (
+                  <span className="ml-auto text-[10px] font-mono text-slate-700">
+                    {storeFileContext.metrics.codeLines}c \u00b7{" "}
+                    {storeFileContext.metrics.commentLines}// \u00b7{" "}
+                    {storeFileContext.metrics.emptyLines}\u00d8
+                  </span>
+                )}
               </div>
-              <div className="flex-1 overflow-auto bg-[#040710]">
-                {/* REPLACE THE OLD <pre> WITH THIS */}
-                <SyntaxHighlighter
-                  language={activeFile.node.ext || "javascript"}
-                  style={vscDarkPlus}
-                  customStyle={{
-                    margin: 0,
-                    padding: "20px",
-                    fontSize: "13px",
-                    background: "transparent",
-                    lineHeight: "1.6",
-                  }}
-                  showLineNumbers={true}
-                  lineNumberStyle={{
-                    minWidth: "3em",
-                    paddingRight: "1em",
-                    color: "#3b4252",
-                    textAlign: "right",
-                    userSelect: "none",
-                  }}
-                >
-                  {activeFile.content}
-                </SyntaxHighlighter>
+              <div
+                className="flex-1 overflow-auto"
+                style={{ background: "#030609" }}
+              >
+                {activeFile.imageDataUrl ? (
+                  <div className="flex items-center justify-center w-full h-full min-h-[200px] p-6">
+                    <img
+                      src={activeFile.imageDataUrl}
+                      alt={activeFile.node.name}
+                      className="max-w-full max-h-full object-contain rounded-xl shadow-2xl"
+                    />
+                  </div>
+                ) : (
+                  <SyntaxHighlighter
+                    language={activeFile.node.ext || "javascript"}
+                    style={vscDarkPlus}
+                    customStyle={{
+                      margin: 0,
+                      padding: "20px",
+                      fontSize: "13px",
+                      background: "transparent",
+                      lineHeight: "1.65",
+                    }}
+                    showLineNumbers={true}
+                    lineNumberStyle={{
+                      minWidth: "3em",
+                      paddingRight: "1em",
+                      color: "#1a2537",
+                      textAlign: "right",
+                      userSelect: "none",
+                    }}
+                  >
+                    {activeFile.content}
+                  </SyntaxHighlighter>
+                )}
               </div>
             </div>
 
             {/* Details */}
             <div
-              className="flex flex-col overflow-auto bg-[#05080f]"
-              style={{ width: "40%" }}
+              className="flex flex-col overflow-auto"
+              style={{ width: "42%", background: "#040810" }}
             >
-              {activeFile.history && (
-                <div className="shrink-0 p-4 border-b border-slate-800">
-                  <div className="flex items-center gap-2 mb-2.5">
-                    <GitCommit size={12} className="text-slate-500" />
-                    <span className="text-[11px] font-mono font-bold text-slate-400 uppercase tracking-wider">
-                      Last Commit
-                    </span>
-                  </div>
-                  <div className="flex items-start gap-3 bg-slate-900/60 rounded-xl p-3.5 border border-slate-800">
-                    {activeFile.history.author?.avatar_url && (
-                      <img
-                        src={activeFile.history.author.avatar_url}
-                        className="w-9 h-9 rounded-lg border border-slate-700 shrink-0 mt-0.5"
-                        alt="author"
+              {storeFileContext ? (
+                <div className="p-4 space-y-5">
+                  {/* Metrics */}
+                  <div>
+                    <div className="flex items-center gap-2 mb-2.5">
+                      <BarChart2 size={11} className="text-slate-700" />
+                      <span className="text-[10px] font-mono font-bold text-slate-700 uppercase tracking-widest">
+                        Metrics
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-1.5">
+                      <StatPill
+                        icon={FileText}
+                        label="Lines"
+                        value={storeFileContext.metrics.lineCount.toLocaleString()}
+                        accent="#94a3b8"
                       />
-                    )}
-                    <div className="min-w-0 space-y-1">
-                      <div className="relative group cursor-help">
-                        <p className="text-[13px] text-slate-100 font-medium leading-snug line-clamp-2 cursor-default">
-                          {activeFile.history.commit.message}
-                        </p>
-
-                        {/* tooltip */}
-                        <div className="absolute z-50 cursor-default top-full left-0 mt-2 hidden group-hover:block p-2 bg-slate-900 border border-slate-700 rounded-lg shadow-xl text-[12px] text-slate-200 leading-normal animate-in fade-in zoom-in-95 duration-200">
-                          {activeFile.history.commit.message}
-                        </div>
-                      </div>
-                      <div className="flex items-center flex-wrap gap-x-2 gap-y-0.5">
-                        <span className="text-[12px] text-blue-400 font-semibold">
-                          {activeFile.history.commit.author.name}
-                        </span>
-                        <span className="text-slate-600 text-[11px]">·</span>
-                        <span className="text-[10px] text-slate-500 font-mono bg-slate-800/60 px-1.5 py-0.5 rounded">
-                          {activeFile.history.sha?.slice(0, 8)}
-                        </span>
-                      </div>
+                      <StatPill
+                        icon={Code2}
+                        label="Code"
+                        value={storeFileContext.metrics.codeLines.toLocaleString()}
+                        accent="#60a5fa"
+                      />
+                      <StatPill
+                        icon={Hash}
+                        label="Blank"
+                        value={storeFileContext.metrics.emptyLines}
+                        accent="#475569"
+                      />
+                      <StatPill
+                        icon={Cpu}
+                        label="Functions"
+                        value={storeFileContext.analysis.functionCount}
+                        accent="#818cf8"
+                      />
+                      <StatPill
+                        icon={Box}
+                        label="Classes"
+                        value={storeFileContext.analysis.classCount}
+                        accent="#a78bfa"
+                      />
+                      <StatPill
+                        icon={Zap}
+                        label="Complexity"
+                        value={storeFileContext.analysis.complexity.score}
+                        accent={
+                          storeFileContext.analysis.complexity.score > 20
+                            ? "#f87171"
+                            : storeFileContext.analysis.complexity.score > 10
+                              ? "#fbbf24"
+                              : "#34d399"
+                        }
+                      />
                     </div>
                   </div>
-                </div>
-              )}
 
-              <div className="p-4 space-y-3">
-                <div className="flex items-center gap-2">
-                  <Layers size={12} className="text-slate-500" />
-                  <span className="text-[11px] font-mono font-bold text-slate-400 uppercase tracking-wider">
-                    File Info
-                  </span>
+                  {/* Analysis */}
+                  <div>
+                    <div className="flex items-center gap-2 mb-2.5">
+                      <Terminal size={11} className="text-slate-700" />
+                      <span className="text-[10px] font-mono font-bold text-slate-700 uppercase tracking-widest">
+                        Analysis
+                      </span>
+                    </div>
+                    <div className="space-y-1.5 text-[11px]">
+                      {[
+                        {
+                          k: "Type",
+                          v: storeFileContext.analysis.logicType,
+                          c: "#94a3b8",
+                        },
+                        {
+                          k: "Branches",
+                          v: storeFileContext.analysis.complexity.branches,
+                          c: "#fbbf24",
+                        },
+                        {
+                          k: "Loops",
+                          v: storeFileContext.analysis.complexity.loops,
+                          c: "#fb923c",
+                        },
+                        {
+                          k: "Async ops",
+                          v: storeFileContext.analysis.complexity.asyncOps,
+                          c: "#67e8f9",
+                        },
+                        {
+                          k: "console.log",
+                          v: storeFileContext.analysis.consoleLogs,
+                          c:
+                            storeFileContext.analysis.consoleLogs > 0
+                              ? "#fbbf24"
+                              : "#334155",
+                        },
+                        {
+                          k: "Imports",
+                          v: storeFileContext.analysis.imports.length,
+                          c: "#94a3b8",
+                        },
+                        {
+                          k: "Exports",
+                          v: storeFileContext.analysis.exports.length,
+                          c: "#94a3b8",
+                        },
+                      ].map((r) => (
+                        <div key={r.k} className="flex justify-between">
+                          <span className="text-slate-600">{r.k}</span>
+                          <span className="font-mono" style={{ color: r.c }}>
+                            {r.v}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="flex flex-wrap gap-1 mt-2.5">
+                      {storeFileContext.analysis.isReact && (
+                        <Badge color="#61dafb">React</Badge>
+                      )}
+                      {storeFileContext.analysis.isTypeScript && (
+                        <Badge color="#3b82f6">TypeScript</Badge>
+                      )}
+                      {storeFileContext.analysis.hasJsx && (
+                        <Badge color="#f472b6">JSX</Badge>
+                      )}
+                      {storeFileContext.analysis.isTest && (
+                        <Badge color="#34d399">Test</Badge>
+                      )}
+                      {storeFileContext.analysis.isConfig && (
+                        <Badge color="#fbbf24">Config</Badge>
+                      )}
+                    </div>
+                    {storeFileContext.analysis.todoComments.length > 0 && (
+                      <div
+                        className="mt-2.5 p-2.5 rounded-lg border"
+                        style={{
+                          background: "rgba(251,191,36,0.03)",
+                          borderColor: "rgba(251,191,36,0.1)",
+                        }}
+                      >
+                        <div className="text-[9px] text-yellow-700 uppercase tracking-wider mb-1.5">
+                          {storeFileContext.analysis.todoComments.length} TODO
+                          {storeFileContext.analysis.todoComments.length > 1
+                            ? "s"
+                            : ""}
+                        </div>
+                        {storeFileContext.analysis.todoComments
+                          .slice(0, 3)
+                          .map((t, i) => (
+                            <div
+                              key={i}
+                              className="text-[10px] text-yellow-500/60 font-mono truncate"
+                            >
+                              {t.trim()}
+                            </div>
+                          ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* File info */}
+                  <div>
+                    <div className="flex items-center gap-2 mb-2.5">
+                      <Layers size={11} className="text-slate-700" />
+                      <span className="text-[10px] font-mono font-bold text-slate-700 uppercase tracking-widest">
+                        File Info
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <StatPill
+                        icon={HardDrive}
+                        label="Size"
+                        value={`${(storeFileContext.github.size / 1024).toFixed(2)} KB`}
+                        accent={
+                          storeFileContext.isLarge ? "#fb923c" : "#60a5fa"
+                        }
+                      />
+                      <StatPill
+                        icon={Hash}
+                        label="Depth"
+                        value={`L${storeFileContext.depth}`}
+                        accent="#64748b"
+                      />
+                      <StatPill
+                        icon={FileCode2}
+                        label="Ext"
+                        value={
+                          storeFileContext.ext
+                            ? `.${storeFileContext.ext}`
+                            : "none"
+                        }
+                        accent={fc?.color ?? "#94a3b8"}
+                      />
+                      <StatPill
+                        icon={Calendar}
+                        label="Modified"
+                        value={
+                          storeFileContext.latestCommit
+                            ? new Date(
+                                storeFileContext.latestCommit.date,
+                              ).toLocaleDateString()
+                            : "\u2014"
+                        }
+                        accent="#c084fc"
+                      />
+                    </div>
+                    <div className="mt-1.5">
+                      <StatPill
+                        icon={FolderTree}
+                        label="Path"
+                        value={storeFileContext.path}
+                        accent="#475569"
+                      />
+                    </div>
+                    {storeFileContext.isLarge && (
+                      <div
+                        className="mt-1.5 flex items-center gap-2 px-3 py-2 rounded-lg border"
+                        style={{
+                          background: "rgba(251,146,60,0.04)",
+                          borderColor: "rgba(251,146,60,0.16)",
+                        }}
+                      >
+                        <div className="w-1.5 h-1.5 rounded-full bg-orange-400/70 animate-pulse" />
+                        <span className="text-[10px] text-orange-400/70">
+                          Large file \u2014 exceeds 500 KB
+                        </span>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Contributors */}
+                  {storeFileContext.contributors.length > 0 && (
+                    <div>
+                      <div className="flex items-center gap-2 mb-2.5">
+                        <Users size={11} className="text-slate-700" />
+                        <span className="text-[10px] font-mono font-bold text-slate-700 uppercase tracking-widest">
+                          Contributors ({storeFileContext.contributors.length})
+                        </span>
+                      </div>
+                      <div className="space-y-1.5">
+                        {storeFileContext.contributors.slice(0, 4).map((c) => (
+                          <div
+                            key={c.email}
+                            className="flex items-center gap-2.5 px-2.5 py-2 rounded-lg"
+                            style={{
+                              background: "rgba(255,255,255,0.025)",
+                              border: "1px solid rgba(255,255,255,0.04)",
+                            }}
+                          >
+                            {c.avatarUrl ? (
+                              <img
+                                src={c.avatarUrl}
+                                className="w-6 h-6 rounded-full border border-white/10 shrink-0"
+                                alt=""
+                              />
+                            ) : (
+                              <div className="w-6 h-6 rounded-full bg-slate-900 border border-slate-800 shrink-0 flex items-center justify-center">
+                                <span className="text-[9px] text-slate-600">
+                                  {c.name[0]}
+                                </span>
+                              </div>
+                            )}
+                            <div className="flex-1 min-w-0">
+                              <div className="text-[11px] text-slate-300 font-medium truncate">
+                                {c.name}
+                              </div>
+                              <div className="text-[9px] text-slate-600 font-mono">
+                                {c.firstCommit.slice(0, 10)} \u2192{" "}
+                                {c.lastCommit.slice(0, 10)}
+                              </div>
+                            </div>
+                            <div className="text-[11px] font-mono font-bold text-slate-500 shrink-0">
+                              {c.commits}c
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Commit history */}
+                  {storeFileContext.commits.length > 0 && (
+                    <div>
+                      <div className="flex items-center gap-2 mb-2.5">
+                        <GitCommit size={11} className="text-slate-700" />
+                        <span className="text-[10px] font-mono font-bold text-slate-700 uppercase tracking-widest">
+                          History ({storeFileContext.commits.length})
+                        </span>
+                      </div>
+                      <div className="space-y-1">
+                        {storeFileContext.commits.slice(0, 5).map((c) => (
+                          <a
+                            key={c.sha}
+                            href={c.htmlUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="flex items-start gap-2 px-2.5 py-2 rounded-lg transition-colors group"
+                            style={{
+                              border: "1px solid rgba(255,255,255,0.03)",
+                            }}
+                            onMouseEnter={(e) => {
+                              e.currentTarget.style.background =
+                                "rgba(255,255,255,0.035)";
+                            }}
+                            onMouseLeave={(e) => {
+                              e.currentTarget.style.background = "transparent";
+                            }}
+                          >
+                            <span className="text-[9px] font-mono text-slate-700 mt-0.5 shrink-0 group-hover:text-blue-500 transition-colors">
+                              {c.shortSha}
+                            </span>
+                            <div className="flex-1 min-w-0">
+                              <div className="text-[10px] text-slate-400 truncate">
+                                {c.message.split("\n")[0]}
+                              </div>
+                              <div className="text-[9px] text-slate-700 mt-0.5">
+                                {c.author} \u00b7{" "}
+                                {new Date(c.date).toLocaleDateString()}
+                                {c.verified ? " \u2713" : ""}
+                              </div>
+                            </div>
+                          </a>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* GitHub link */}
+                  <a
+                    href={storeFileContext.github.htmlUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-2 px-3 py-2 rounded-xl text-[11px] font-mono transition-all"
+                    style={{
+                      color: "#475569",
+                      background: "rgba(255,255,255,0.02)",
+                      border: "1px solid rgba(255,255,255,0.05)",
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.color = "#60a5fa";
+                      e.currentTarget.style.borderColor =
+                        "rgba(96,165,250,0.18)";
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.color = "#475569";
+                      e.currentTarget.style.borderColor =
+                        "rgba(255,255,255,0.05)";
+                    }}
+                  >
+                    <Eye size={11} />
+                    View on GitHub
+                  </a>
                 </div>
-                <div className="grid grid-cols-2 gap-2">
-                  {[
-                    {
-                      icon: HardDrive,
-                      label: "Size",
-                      value: `${(activeFile.node.size / 1024).toFixed(2)} KB`,
-                      accent: activeFile.node.fileDetails?.isLarge
-                        ? "#fb923c"
-                        : "#60a5fa",
-                    },
-                    {
-                      icon: Hash,
-                      label: "Depth",
-                      value: `Level ${activeFile.node.fileDetails?.depth}`,
-                      accent: "#94a3b8",
-                    },
-                    {
-                      icon: FileCode2,
-                      label: "Extension",
-                      value: activeFile.node.ext
-                        ? `.${activeFile.node.ext}`
-                        : "none",
-                      accent: fc?.color ?? "#94a3b8",
-                    },
-                    {
-                      icon: Calendar,
-                      label: "Modified",
-                      value: activeFile.history?.commit?.author?.date
-                        ? new Date(
-                            activeFile.history.commit.author.date,
-                          ).toLocaleDateString()
-                        : "Unknown",
-                      accent: "#c084fc",
-                    },
-                    {
-                      icon: FolderTree,
-                      label: "Path",
-                      value: activeFile.node.fileDetails?.path,
-                      accent: "#94a3b8",
-                      isFullWidth: true,
-                    },
-                  ].map((m) => (
-                    <div
-                      key={m.label}
-                      className={`${m.isFullWidth ? "col-span-2" : "col-span-1"} bg-slate-900/70 border border-slate-700 rounded-xl p-3`}
-                    >
-                      <div className="flex items-center gap-1.5 mb-1.5">
-                        <m.icon size={10} style={{ color: m.accent }} />
-                        <span className="text-[9px] text-slate-500 font-bold uppercase tracking-wider">
-                          {m.label}
+              ) : (
+                /* Fallback when store not yet populated */
+                <div className="p-4 space-y-3">
+                  {activeFile.history && (
+                    <div className="pb-4 border-b border-slate-900/60">
+                      <div className="flex items-center gap-2 mb-2.5">
+                        <GitCommit size={11} className="text-slate-700" />
+                        <span className="text-[10px] font-mono font-bold text-slate-700 uppercase tracking-widest">
+                          Last Commit
                         </span>
                       </div>
                       <div
-                        className="text-[13px] font-mono font-semibold truncate"
-                        style={{ color: m.accent }}
-                        title={m.value}
+                        className="flex items-start gap-3 rounded-xl p-3 border"
+                        style={{
+                          background: "rgba(255,255,255,0.025)",
+                          borderColor: "rgba(255,255,255,0.05)",
+                        }}
                       >
-                        {m.value}
+                        {activeFile.history.author?.avatar_url && (
+                          <img
+                            src={activeFile.history.author.avatar_url}
+                            className="w-8 h-8 rounded-lg border border-slate-800 shrink-0"
+                            alt="author"
+                          />
+                        )}
+                        <div className="min-w-0 space-y-1">
+                          <p className="text-[12px] text-slate-300 font-medium leading-snug line-clamp-2">
+                            {activeFile.history.commit.message}
+                          </p>
+                          <div className="flex items-center gap-2">
+                            <span className="text-[11px] text-blue-500">
+                              {activeFile.history.commit.author.name}
+                            </span>
+                            <span className="text-[10px] text-slate-700 font-mono">
+                              {activeFile.history.sha?.slice(0, 8)}
+                            </span>
+                          </div>
+                        </div>
                       </div>
                     </div>
-                  ))}
-                  {activeFile.node.fileDetails?.isLarge && (
-                    <div className="col-span-2 flex items-center gap-2.5 px-3 py-2.5 bg-orange-500/8 border border-orange-500/30 rounded-xl">
-                      <div className="w-2 h-2 rounded-full bg-orange-400 shrink-0 animate-pulse" />
-                      <span className="text-[11px] text-orange-300 font-medium">
-                        Large file — exceeds 500 KB
-                      </span>
-                    </div>
                   )}
+                  <div className="flex items-center gap-2 mb-2">
+                    <Layers size={11} className="text-slate-700" />
+                    <span className="text-[10px] font-mono font-bold text-slate-700 uppercase tracking-widest">
+                      File Info
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <StatPill
+                      icon={HardDrive}
+                      label="Size"
+                      value={`${(activeFile.node.size / 1024).toFixed(2)} KB`}
+                      accent={
+                        activeFile.node.fileDetails?.isLarge
+                          ? "#fb923c"
+                          : "#60a5fa"
+                      }
+                    />
+                    <StatPill
+                      icon={Hash}
+                      label="Depth"
+                      value={`L${activeFile.node.fileDetails?.depth}`}
+                      accent="#64748b"
+                    />
+                    <StatPill
+                      icon={FileCode2}
+                      label="Ext"
+                      value={
+                        activeFile.node.ext ? `.${activeFile.node.ext}` : "none"
+                      }
+                      accent={fc?.color ?? "#94a3b8"}
+                    />
+                    <StatPill
+                      icon={Calendar}
+                      label="Modified"
+                      value={
+                        activeFile.history?.commit?.author?.date
+                          ? new Date(
+                              activeFile.history.commit.author.date,
+                            ).toLocaleDateString()
+                          : "\u2014"
+                      }
+                      accent="#c084fc"
+                    />
+                  </div>
+                  <div className="mt-1">
+                    <StatPill
+                      icon={FolderTree}
+                      label="Path"
+                      value={activeFile.node.fileDetails?.path ?? ""}
+                      accent="#475569"
+                    />
+                  </div>
                 </div>
-              </div>
+              )}
             </div>
           </div>
         </div>

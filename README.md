@@ -7,7 +7,6 @@ RepoOrbit is an open-source, physics-based repository explorer that transforms f
 ## 🚀 Key Features
 
 - **Chrono-Tree:** A temporal visualization showing the growth of folders and files over time.
-- **Complexity Orbit:** A physics-driven graph where files are "planets" sized by Lines of Code (LOC).
 - **Trace Mode:** A dependency mapper that visualizes imports and exports with directed arrows.
 
 ## 🛠️ Tech Stack
