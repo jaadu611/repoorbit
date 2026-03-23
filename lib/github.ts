@@ -1,17 +1,48 @@
-import { useSelectionStore } from "@/lib/store";
-import { RepoContext, RepoTreeEntry } from "./types";
+import { RepoContext, RepoTreeEntry, CommitDetail } from "./types";
 
-const token = process.env.GITHUB_TOKEN;
+function getHeaders() {
+  let token = process.env.GITHUB_TOKEN || process.env.NEXT_PUBLIC_GITHUB_TOKEN;
 
-const baseHeaders = {
-  Accept: "application/vnd.github+json",
-  ...(token ? { Authorization: `Bearer ${token}` } : {}),
-};
+  const headers: Record<string, string> = {
+    Accept: "application/vnd.github+json",
+    "User-Agent": "RepoOrbit",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
 
-// helpers
+  if (token) {
+    token = token.trim();
+    if (token !== "" && token !== "undefined" && token !== "null") {
+      const cleanToken = token.replace(/^["']|["']$/g, "");
+      headers["Authorization"] = `Bearer ${cleanToken}`;
+    }
+  }
 
-function safeJson(res: Response) {
-  return res.ok ? res.json() : Promise.resolve(null);
+  return headers;
+}
+
+const withCache = { next: { revalidate: 3600 } } as const;
+const noCache = { cache: "no-store" } as const;
+
+function safeJson(res: Response | null) {
+  return res?.ok ? res.json() : Promise.resolve(null);
+}
+
+export function parseRepoInput(input: string): { owner: string; repo: string } {
+  const cleaned = input
+    .trim()
+    .replace(/\/$/, "")
+    .replace(/\.git$/, "");
+
+  const urlMatch = cleaned.match(/github\.com\/([^/]+)\/([^/]+)/);
+  if (urlMatch) return { owner: urlMatch[1].trim(), repo: urlMatch[2].trim() };
+
+  const parts = cleaned
+    .split("/")
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (parts.length >= 2) return { owner: parts[0], repo: parts[1] };
+
+  throw new Error(`Invalid repo input: "${input}"`);
 }
 
 function buildExtFreq(tree: any[]): Record<string, number> {
@@ -30,69 +61,125 @@ function buildStackFlags(paths: string[]) {
   const s = paths.map((p) => p.toLowerCase());
   const has = (test: (p: string) => boolean) => s.some(test);
 
-  const hasLockfile = has(
-    (p) =>
-      p === "package-lock.json" || p === "yarn.lock" || p === "pnpm-lock.yaml",
-  );
-  const hasDocker = has(
-    (p) =>
-      p.includes("dockerfile") ||
-      p === "docker-compose.yml" ||
-      p === "docker-compose.yaml",
-  );
-  const hasTailwind = has((p) => p.includes("tailwind.config"));
-  const hasNextjs = has((p) => p.includes("next.config"));
-  const hasVite = has((p) => p.includes("vite.config"));
-  const hasWebpack = has((p) => p.includes("webpack.config"));
-  const hasPrisma = has((p) => p.endsWith("schema.prisma"));
-  const hasEnvFile = has(
-    (p) => p === ".env" || p === ".env.example" || p === ".env.local",
-  );
-  const hasGitActions = has((p) => p.startsWith(".github/workflows"));
-  const hasTests = has((p) => /test|spec|__tests__|jest|vitest/.test(p));
-  const hasReadme = has((p) => p === "readme.md");
-
   return {
-    hasLockfile,
-    hasDocker,
-    hasTailwind,
-    hasNextjs,
-    hasVite,
-    hasWebpack,
-    hasPrisma,
-    hasEnvFile,
-    hasGitActions,
-    hasTests,
-    hasReadme,
-    architecture: hasNextjs
+    hasLockfile: has(
+      (p) =>
+        p === "package-lock.json" ||
+        p === "yarn.lock" ||
+        p === "pnpm-lock.yaml",
+    ),
+    hasDocker: has(
+      (p) =>
+        p.includes("dockerfile") ||
+        p === "docker-compose.yml" ||
+        p === "docker-compose.yaml",
+    ),
+    hasTailwind: has((p) => p.includes("tailwind.config")),
+    hasNextjs: has((p) => p.includes("next.config")),
+    hasVite: has((p) => p.includes("vite.config")),
+    hasWebpack: has((p) => p.includes("webpack.config")),
+    hasPrisma: has((p) => p.endsWith("schema.prisma")),
+    hasEnvFile: has(
+      (p) => p === ".env" || p === ".env.example" || p === ".env.local",
+    ),
+    hasGitActions: has((p) => p.startsWith(".github/workflows")),
+    hasTests: has((p) => /test|spec|__tests__|jest|vitest/.test(p)),
+    hasReadme: has((p) => p === "readme.md"),
+    architecture: has((p) => p.includes("next.config"))
       ? "Next.js"
-      : hasVite
+      : has((p) => p.includes("vite.config"))
         ? "Vite"
-        : hasLockfile
+        : has((p) => p === "package-lock.json" || p === "yarn.lock")
           ? "Node.js"
           : "General",
   };
 }
 
-// main function
+async function fetchCommitsForAuthor(
+  owner: string,
+  repo: string,
+  login: string,
+): Promise<CommitDetail[]> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/commits?author=${login}&per_page=15&page=1`;
+
+  try {
+    const res = await fetch(url, { headers: getHeaders(), ...withCache });
+    if (!res.ok) return [];
+
+    const data = await res.json().catch(() => null);
+    if (!Array.isArray(data)) return [];
+
+    return data.map((c: any) => ({
+      sha: c.sha,
+      shortSha: c.sha.slice(0, 7),
+      message: c.commit?.message ?? "",
+      author: c.commit?.author?.name ?? login,
+      authorEmail: c.commit?.author?.email ?? "",
+      date: c.commit?.author?.date ?? "",
+      htmlUrl: c.html_url ?? "",
+      avatarUrl: c.author?.avatar_url ?? null,
+      profileUrl: c.author?.html_url ?? null,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchCommitsForPath(
+  owner: string,
+  repo: string,
+  path: string,
+): Promise<CommitDetail[]> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/commits?path=${encodeURIComponent(path)}&per_page=15`;
+
+  try {
+    const res = await fetch(url, { headers: getHeaders(), ...withCache });
+    if (!res.ok) return [];
+
+    const data = await res.json().catch(() => null);
+    if (!Array.isArray(data)) return [];
+
+    return data.map((c: any) => ({
+      sha: c.sha,
+      shortSha: c.sha.slice(0, 7),
+      message: c.commit?.message ?? "",
+      author: c.commit?.author?.name ?? c.author?.login ?? "Unknown",
+      authorEmail: c.commit?.author?.email ?? "",
+      date: c.commit?.author?.date ?? "",
+      htmlUrl: c.html_url ?? "",
+      avatarUrl: c.author?.avatar_url ?? null,
+      profileUrl: c.author?.html_url ?? null,
+    }));
+  } catch {
+    return [];
+  }
+}
 
 export const getRepoData = async (owner: string, repo: string) => {
-  const cache = { next: { revalidate: 3600 } } as const;
+  const url = `https://api.github.com/repos/${owner}/${repo}`;
+  const headers = getHeaders();
 
-  // ── 1. Repo info first — we need default_branch before the tree fetch ──
-  const repoRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
-    headers: baseHeaders,
-    ...cache,
-  });
+  const repoRes = await fetch(url, { headers, ...withCache });
 
   if (!repoRes.ok) {
-    throw new Error(`GitHub API Error: repo info failed (${repoRes.status})`);
+    const errorBody = await repoRes.json().catch(() => ({}));
+    console.error(`Repo fetch failed for ${owner}/${repo}:`, {
+      status: repoRes.status,
+      errorBody,
+      url,
+    });
+    const reason =
+      repoRes.status === 403
+        ? "Rate limited — add a GITHUB_TOKEN to your .env"
+        : repoRes.status === 404
+          ? "Repo not found — check the owner/repo name"
+          : `GitHub API error (${repoRes.status})`;
+    throw new Error(reason);
   }
 
   const repoData = await repoRes.json();
   const defaultBranch: string = repoData.default_branch;
 
-  // get all the data
   const [
     treeRes,
     readmeRes,
@@ -101,57 +188,64 @@ export const getRepoData = async (owner: string, repo: string) => {
     languagesRes,
     releasesRes,
     branchesRes,
+    issuesRes,
+    pullsRes,
   ] = await Promise.allSettled([
     fetch(
       `https://api.github.com/repos/${owner}/${repo}/git/trees/${defaultBranch}?recursive=1`,
-      { headers: baseHeaders, ...cache },
+      { headers: getHeaders(), ...noCache },
     ),
     fetch(`https://api.github.com/repos/${owner}/${repo}/readme`, {
-      headers: { ...baseHeaders, Accept: "application/vnd.github.raw" },
-      ...cache,
+      headers: { ...getHeaders(), Accept: "application/vnd.github.raw" },
+      ...withCache,
     }),
-    fetch(`https://api.github.com/repos/${owner}/${repo}/commits?per_page=1`, {
-      headers: baseHeaders,
-      ...cache,
+    fetch(`https://api.github.com/repos/${owner}/${repo}/commits?per_page=30`, {
+      headers: getHeaders(),
+      ...withCache,
     }),
     fetch(
-      `https://api.github.com/repos/${owner}/${repo}/contributors?per_page=10`,
-      { headers: baseHeaders, ...cache },
+      `https://api.github.com/repos/${owner}/${repo}/contributors?per_page=20`,
+      { headers: getHeaders(), ...withCache },
     ),
     fetch(`https://api.github.com/repos/${owner}/${repo}/languages`, {
-      headers: baseHeaders,
-      ...cache,
+      headers: getHeaders(),
+      ...withCache,
     }),
-    fetch(`https://api.github.com/repos/${owner}/${repo}/releases?per_page=1`, {
-      headers: baseHeaders,
-      ...cache,
+    fetch(`https://api.github.com/repos/${owner}/${repo}/releases?per_page=5`, {
+      headers: getHeaders(),
+      ...withCache,
     }),
     fetch(
-      `https://api.github.com/repos/${owner}/${repo}/branches?per_page=20`,
-      { headers: baseHeaders, ...cache },
+      `https://api.github.com/repos/${owner}/${repo}/branches?per_page=30`,
+      { headers: getHeaders(), ...withCache },
+    ),
+    // Exclude PRs from issues — GitHub returns both from /issues by default
+    fetch(
+      `https://api.github.com/repos/${owner}/${repo}/issues?state=open&per_page=30&pulls=false`,
+      { headers: getHeaders(), ...withCache },
+    ),
+    fetch(
+      `https://api.github.com/repos/${owner}/${repo}/pulls?state=all&per_page=30`,
+      { headers: getHeaders(), ...withCache },
     ),
   ]);
 
   const treeValue = treeRes.status === "fulfilled" ? treeRes.value : null;
   const readmeValue = readmeRes.status === "fulfilled" ? readmeRes.value : null;
-  const commitsValue =
-    commitsRes.status === "fulfilled" ? commitsRes.value : null;
-  const contributorsValue =
-    contributorsRes.status === "fulfilled" ? contributorsRes.value : null;
-  const languagesValue =
-    languagesRes.status === "fulfilled" ? languagesRes.value : null;
-  const releasesValue =
-    releasesRes.status === "fulfilled" ? releasesRes.value : null;
-  const branchesValue =
-    branchesRes.status === "fulfilled" ? branchesRes.value : null;
 
   if (!treeValue?.ok) {
-    throw new Error(
-      `GitHub API Error: tree fetch failed (${treeValue?.status ?? "network error"})`,
-    );
+    const status = treeValue?.status;
+    const errorBody = await treeValue?.json().catch(() => ({}));
+    console.error("Tree fetch failed:", { status, errorBody });
+    const reason =
+      status === 403
+        ? `GitHub API error: ${errorBody.message || "Rate limited or tree too large"} — add a GITHUB_TOKEN to your .env`
+        : status === 404
+          ? "Repo tree not found"
+          : `Tree fetch failed (${status ?? "network error"})`;
+    throw new Error(reason);
   }
 
-  // clean the data here
   const [
     treeData,
     commitsData,
@@ -159,18 +253,47 @@ export const getRepoData = async (owner: string, repo: string) => {
     languagesData,
     releasesData,
     branchesData,
+    issuesData,
+    pullsData,
   ] = await Promise.all([
     treeValue.json(),
-    safeJson(commitsValue!),
-    safeJson(contributorsValue!),
-    safeJson(languagesValue!),
-    safeJson(releasesValue!),
-    safeJson(branchesValue!),
+    safeJson(commitsRes.status === "fulfilled" ? commitsRes.value : null),
+    safeJson(
+      contributorsRes.status === "fulfilled" ? contributorsRes.value : null,
+    ),
+    safeJson(languagesRes.status === "fulfilled" ? languagesRes.value : null),
+    safeJson(releasesRes.status === "fulfilled" ? releasesRes.value : null),
+    safeJson(branchesRes.status === "fulfilled" ? branchesRes.value : null),
+    safeJson(issuesRes.status === "fulfilled" ? issuesRes.value : null),
+    safeJson(pullsRes.status === "fulfilled" ? pullsRes.value : null),
   ]);
 
   const readmeText: string = readmeValue?.ok
     ? await readmeValue.text()
-    : "No README available for this repository.";
+    : "No README available.";
+
+  // ── Full commit history per contributor ────────────────────────────────────
+  const contributorLogins: string[] = Array.isArray(contributorsData)
+    ? contributorsData.map((c: any) => c.login as string)
+    : [];
+
+  const commitsByAuthorEntries = await Promise.all(
+    contributorLogins.map(async (login) => {
+      const commits = await fetchCommitsForAuthor(owner, repo, login);
+      return [login, commits] as [string, CommitDetail[]];
+    }),
+  );
+
+  const commitsByAuthor: Record<string, CommitDetail[]> = Object.fromEntries(
+    commitsByAuthorEntries,
+  );
+
+  const totalCommitsFetched = Object.values(commitsByAuthor).reduce(
+    (sum, commits) => sum + commits.length,
+    0,
+  );
+
+  // ── Build tree ─────────────────────────────────────────────────────────────
   const rawTree: any[] = treeData.tree ?? [];
   const allPaths = rawTree.map((n: any) => n.path as string);
 
@@ -179,29 +302,22 @@ export const getRepoData = async (owner: string, repo: string) => {
     const ext = namePart.includes(".")
       ? namePart.split(".").pop()!.toLowerCase()
       : "";
-    const depth = n.path.split("/").length;
     return {
       path: n.path,
       name: namePart,
       type: n.type === "tree" ? "folder" : "file",
       ext,
       size: n.size ?? 0,
-      depth,
+      depth: n.path.split("/").length,
+      sha: n.sha,
     };
   });
 
   const allFiles = flatTree.filter((e) => e.type === "file");
   const allFolders = flatTree.filter((e) => e.type === "folder");
   const rootItems = flatTree.filter((e) => e.depth === 1);
-
   const extFreq = buildExtFreq(rawTree);
-  const dominantExt =
-    Object.entries(extFreq).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
   const stack = buildStackFlags(allPaths);
-
-  const entryPoints = rootItems
-    .filter((e) => /^(index|main|app|page)\./i.test(e.name))
-    .map((e) => e.name);
 
   const langMap: Record<string, number> = languagesData ?? {};
   const langTotal = Object.values(langMap).reduce(
@@ -217,11 +333,48 @@ export const getRepoData = async (owner: string, repo: string) => {
     .sort((a, b) => b.bytes - a.bytes);
 
   const latestCommitRaw = Array.isArray(commitsData) ? commitsData[0] : null;
-  const latestRelease = Array.isArray(releasesData)
-    ? (releasesData[0] ?? null)
-    : null;
+  const releases = Array.isArray(releasesData) ? releasesData : [];
 
-  // the final context
+  // ── Shape issues (filter out any PRs GitHub sneaks in) ─────────────────────
+  const issues = Array.isArray(issuesData)
+    ? issuesData
+        .filter((i: any) => !i.pull_request)
+        .map((i: any) => ({
+          number: i.number,
+          title: i.title,
+          state: i.state as "open" | "closed",
+          author: i.user?.login ?? null,
+          createdAt: i.created_at,
+          updatedAt: i.updated_at,
+          closedAt: i.closed_at ?? null,
+          labels: (i.labels ?? []).map((l: any) => l.name as string),
+          comments: i.comments,
+          htmlUrl: i.html_url,
+          body: i.body ? (i.body as string).slice(0, 500) : null,
+        }))
+    : [];
+
+  // ── Shape pull requests ────────────────────────────────────────────────────
+  const pulls = Array.isArray(pullsData)
+    ? pullsData.map((p: any) => ({
+        number: p.number,
+        title: p.title,
+        state: p.state as "open" | "closed",
+        merged: p.merged_at !== null,
+        author: p.user?.login ?? null,
+        createdAt: p.created_at,
+        updatedAt: p.updated_at,
+        mergedAt: p.merged_at ?? null,
+        closedAt: p.closed_at ?? null,
+        baseBranch: p.base?.ref ?? null,
+        headBranch: p.head?.ref ?? null,
+        labels: (p.labels ?? []).map((l: any) => l.name as string),
+        comments: p.comments,
+        htmlUrl: p.html_url,
+        body: p.body ? (p.body as string).slice(0, 500) : null,
+      }))
+    : [];
+
   const repoContext: RepoContext = {
     meta: {
       name: repoData.name,
@@ -247,20 +400,7 @@ export const getRepoData = async (owner: string, repo: string) => {
       createdAt: repoData.created_at,
       updatedAt: repoData.updated_at,
       pushedAt: repoData.pushed_at,
-      watchers: repoData.watchers_count,
-      networkCount: repoData.network_count ?? 0,
-      subscribersCount: repoData.subscribers_count ?? 0,
-      hasWiki: repoData.has_wiki,
-      hasPages: repoData.has_pages,
-      hasDiscussions: repoData.has_discussions ?? false,
-      archived: repoData.archived,
-      disabled: repoData.disabled,
-      fork: repoData.fork,
       htmlUrl: repoData.html_url,
-      cloneUrl: repoData.clone_url,
-      sshUrl: repoData.ssh_url,
-      ownerType: repoData.owner?.type ?? null,
-      ownerProfileUrl: repoData.owner?.html_url ?? null,
     },
 
     latestCommit: latestCommitRaw
@@ -277,6 +417,20 @@ export const getRepoData = async (owner: string, repo: string) => {
         }
       : null,
 
+    recentCommits: Array.isArray(commitsData)
+      ? commitsData.map((c: any) => ({
+          sha: c.sha,
+          shortSha: c.sha.slice(0, 7),
+          message: c.commit.message,
+          author: c.commit.author.name,
+          date: c.commit.author.date,
+          htmlUrl: c.html_url,
+        }))
+      : [],
+
+    commitsByAuthor,
+    totalCommitsFetched,
+
     contributors: Array.isArray(contributorsData)
       ? contributorsData.map((c: any) => ({
           login: c.login,
@@ -288,14 +442,23 @@ export const getRepoData = async (owner: string, repo: string) => {
 
     languages,
 
-    latestRelease: latestRelease
+    releases: releases.map((r: any) => ({
+      tagName: r.tag_name,
+      name: r.name,
+      publishedAt: r.published_at,
+      htmlUrl: r.html_url,
+      prerelease: r.prerelease,
+      draft: r.draft,
+    })),
+
+    latestRelease: releases[0]
       ? {
-          tagName: latestRelease.tag_name,
-          name: latestRelease.name,
-          publishedAt: latestRelease.published_at,
-          htmlUrl: latestRelease.html_url,
-          prerelease: latestRelease.prerelease,
-          draft: latestRelease.draft,
+          tagName: releases[0].tag_name,
+          name: releases[0].name,
+          publishedAt: releases[0].published_at,
+          htmlUrl: releases[0].html_url,
+          prerelease: releases[0].prerelease,
+          draft: releases[0].draft,
         }
       : null,
 
@@ -306,6 +469,9 @@ export const getRepoData = async (owner: string, repo: string) => {
         }))
       : [],
 
+    issues,
+    pulls,
+
     tree: flatTree,
 
     stats: {
@@ -315,12 +481,15 @@ export const getRepoData = async (owner: string, repo: string) => {
       maxDepth: flatTree.reduce((acc, e) => Math.max(acc, e.depth), 0),
       rootItemCount: rootItems.length,
       extFrequency: extFreq,
-      dominantExt,
+      dominantExt:
+        Object.entries(extFreq).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null,
     },
 
     stack: {
       ...stack,
-      entryPoints,
+      entryPoints: rootItems
+        .filter((e) => /^(index|main|app|page)\./i.test(e.name))
+        .map((e) => e.name),
     },
   };
 
@@ -329,5 +498,7 @@ export const getRepoData = async (owner: string, repo: string) => {
     readme: readmeText,
     metadata: repoContext.meta,
     repoContext,
+    filesMetadata: [],
+    importGraph: {},
   };
 };

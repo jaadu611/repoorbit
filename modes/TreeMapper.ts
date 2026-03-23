@@ -1,40 +1,10 @@
-/*
- * this file is made by ai too
- * it basically gets the repo data from the github all the files folders whatever
- * and converts into nodes so TreeView.tsx can use it
- */
 
-export type FileNode = {
-  path: string;
-  name: string;
-  type: "file" | "folder" | "root";
-  size: number;
-  author?: string;
-  createdAt?: string;
-  lastModified?: string;
-  details?: {
-    name: string;
-    fullName: string;
-    owner: string;
-    avatar: string;
-    stars: number;
-    forks: number;
-    openIssues: number;
-    size: number;
-    pushedAt: string;
-    language: string;
-    license: string;
-    defaultBranch: string;
-    visibility: string;
-  };
-  tree?: any;
-  children?: FileNode[];
-};
+import { FileNode } from "@/lib/types";
 
 export const transformToTree = (
-  flatFiles: any[], 
-  repoName: string, 
-  metadata: any
+  flatFiles: any[],
+  repoName: string,
+  metadata: any,
 ): FileNode => {
   const rootNode: FileNode = {
     path: "",
@@ -42,13 +12,13 @@ export const transformToTree = (
     type: "root",
     size: 0,
     details: metadata,
-    children: []
+    children: [],
   };
 
   const map: { [key: string]: FileNode } = { "": rootNode };
 
   const sortedFiles = [...flatFiles].sort(
-    (a, b) => a.path.split("/").length - b.path.split("/").length
+    (a, b) => a.path.split("/").length - b.path.split("/").length,
   );
 
   sortedFiles.forEach((file) => {

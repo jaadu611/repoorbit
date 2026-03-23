@@ -1,4 +1,4 @@
-// just a navbar
+
 
 "use client";
 
@@ -6,8 +6,10 @@ import { useState } from "react";
 import { navlinks } from "@/constants/navbar.constants";
 import Link from "next/link";
 import { LucideIcon, LucideLayers } from "lucide-react";
+import { usePathname } from "next/navigation";
 
 const Navbar = () => {
+  const pathname = usePathname();
   const [isOpen, setIsOpen] = useState(false);
 
   return (
@@ -41,7 +43,10 @@ const Navbar = () => {
           )}
 
           <li>
-            <Link href={"/workspace"}>
+            <Link
+              className={`${pathname !== "/" ? "hidden" : ""}`}
+              href={"/workspace"}
+            >
               <button className="flex items-center gap-1.5 text-gray-100 border border-blue-700 px-3 py-1 rounded-full bg-blue-700 hover:bg-blue-600 hover:border-blue-600 transition-colors duration-300 cursor-pointer text-xs">
                 <LucideLayers size={12} />
                 Get started
@@ -100,10 +105,16 @@ const Navbar = () => {
             ),
           )}
           <li className="w-full pt-1">
-            <button className="w-full flex items-center justify-center gap-2 text-gray-100 border border-blue-700 px-3 py-1.5 rounded-full bg-blue-700 hover:bg-blue-600 hover:border-blue-600 transition-colors duration-300 cursor-pointer text-xs">
-              <LucideLayers size={12} />
-              Get started
-            </button>
+            <Link
+              className={`${pathname !== "/" ? "hidden" : ""}`}
+              href={"/workspace"}
+              onClick={() => setIsOpen(false)}
+            >
+              <button className="w-full flex items-center justify-center gap-2 text-gray-100 border border-blue-700 px-3 py-1.5 rounded-full bg-blue-700 hover:bg-blue-600 hover:border-blue-600 transition-colors duration-300 cursor-pointer text-xs">
+                <LucideLayers size={12} />
+                Get started
+              </button>
+            </Link>
           </li>
         </ul>
       </div>

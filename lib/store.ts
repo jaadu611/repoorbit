@@ -1,37 +1,59 @@
-// all ai generated
-
 import { create } from "zustand";
-import type { RepoContext, FolderContext, FileContext } from "@/lib/types";
+import type {
+  RepoContext,
+  FolderContext,
+  FileContext,
+  SelectionStore,
+  CommitDetail,
+} from "@/lib/types";
 
-type SelectionType = "root" | "repo" | "folder" | "file";
-
-interface Selection {
-  type: SelectionType;
-  name: string;
+export interface LightFileMetadata {
   path: string;
-  repoContext: RepoContext | null;
-  folderContext: FolderContext | null;
-  fileContext: FileContext | null;
+  name: string;
+  ext: string;
+  size: number;
+  depth: number;
+  isLarge: boolean;
+  imports: string[];
+  resolvedImports: string[];
+  metrics: {
+    lineCount: number;
+    charCount: number;
+    codeLines: number;
+    commentLines: number;
+    emptyLines: number;
+  };
+  analysis: {
+    exports: string[];
+    todoComments: string[];
+    functionCount: number;
+    classCount: number;
+    logicType: string;
+    isReact: boolean;
+    isTypeScript: boolean;
+    isTest: boolean;
+    isConfig: boolean;
+    hasJsx: boolean;
+  };
 }
 
-interface SelectionStore {
-  selection: Selection;
-  isInitialized: boolean;
-
-  setSelection: (
-    type: SelectionType,
-    name: string,
-    path: string,
-    details: RepoContext | FolderContext | FileContext | null,
-  ) => void;
-
-  setRepoContext: (ctx: RepoContext) => void;
-  setFolderContext: (ctx: FolderContext) => void;
-  setFileContext: (ctx: FileContext) => void;
-  resetToRepo: (repoMeta: RepoContext["meta"]) => void;
-}
-
-export const useSelectionStore = create<SelectionStore>((set) => ({
+export const useSelectionStore = create<
+  SelectionStore & {
+    filesMetadata: LightFileMetadata[];
+    importGraph: Record<string, string[]>;
+    setFilesMetadata: (
+      files:
+        | LightFileMetadata[]
+        | ((prev: LightFileMetadata[]) => LightFileMetadata[]),
+      graph?: Record<string, string[]>,
+    ) => void;
+    addFileMetadata: (file: LightFileMetadata) => void;
+    setCommitsByAuthor: (
+      commitsByAuthor: Record<string, CommitDetail[]>,
+    ) => void;
+    addCommitsForAuthor: (author: string, commits: CommitDetail[]) => void;
+  }
+>((set) => ({
   selection: {
     type: "root",
     name: "",
@@ -41,11 +63,66 @@ export const useSelectionStore = create<SelectionStore>((set) => ({
     fileContext: null,
   },
   isInitialized: false,
+  filesMetadata: [],
+  importGraph: {},
 
-  // ── setSelection ─────────────────────────────────────────────────────────
-  // KEY FIX: repoContext is NEVER wiped by folder/file clicks — it persists
-  // across the entire session once populated. Only the "active" context slot
-  // (folderContext / fileContext) is cleared when switching between them.
+  setFilesMetadata: (files, graph) =>
+    set((state) => {
+      const nextFiles =
+        typeof files === "function" ? files(state.filesMetadata) : files;
+      const nextGraph = graph ?? state.importGraph;
+      return { filesMetadata: nextFiles, importGraph: nextGraph };
+    }),
+
+  addFileMetadata: (file) =>
+    set((state) => ({
+      filesMetadata: [...state.filesMetadata, file],
+      importGraph: {
+        ...state.importGraph,
+        [file.path]: file.resolvedImports,
+      },
+    })),
+
+  setCommitsByAuthor: (commitsByAuthor) =>
+    set((state) => {
+      if (!state.selection.repoContext) return {};
+      const total = Object.values(commitsByAuthor).reduce(
+        (sum, commits) => sum + commits.length,
+        0,
+      );
+      return {
+        selection: {
+          ...state.selection,
+          repoContext: {
+            ...state.selection.repoContext,
+            commitsByAuthor,
+            totalCommitsFetched: total,
+          },
+        },
+      };
+    }),
+
+  addCommitsForAuthor: (author, commits) =>
+    set((state) => {
+      if (!state.selection.repoContext) return {};
+      const prev = state.selection.repoContext.commitsByAuthor ?? {};
+      const merged = {
+        ...prev,
+        [author]: [...(prev[author] ?? []), ...commits],
+      };
+      const total = Object.values(merged).reduce((sum, c) => sum + c.length, 0);
+      return {
+        selection: {
+          ...state.selection,
+          repoContext: {
+            ...state.selection.repoContext,
+            commitsByAuthor: merged,
+            totalCommitsFetched: total,
+          },
+        },
+      };
+    }),
+
   setSelection: (type, name, path, details) =>
     set((state) => ({
       isInitialized: true,
@@ -53,8 +130,6 @@ export const useSelectionStore = create<SelectionStore>((set) => ({
         type,
         name,
         path,
-        // repoContext: only update when explicitly navigating to repo/root.
-        // For folder/file clicks, carry the existing value forward.
         repoContext:
           type === "repo" || type === "root"
             ? ((details as RepoContext) ?? state.selection.repoContext)
@@ -86,7 +161,6 @@ export const useSelectionStore = create<SelectionStore>((set) => ({
         type: "folder",
         name: ctx.name,
         path: ctx.path,
-        // repoContext preserved — do NOT clear it
         folderContext: ctx,
         fileContext: null,
       },
@@ -100,7 +174,6 @@ export const useSelectionStore = create<SelectionStore>((set) => ({
         type: "file",
         name: ctx.name,
         path: ctx.path,
-        // repoContext preserved — do NOT clear it
         folderContext: null,
         fileContext: ctx,
       },
@@ -117,10 +190,11 @@ export const useSelectionStore = create<SelectionStore>((set) => ({
         folderContext: null,
         fileContext: null,
       },
+      filesMetadata: [],
+      importGraph: {},
     }),
 }));
 
-// ─── Convenience selectors ────────────────────────────────────────────────────
 export const useSelectionType = () =>
   useSelectionStore((s) => s.selection.type);
 export const useRepoContext = () =>
@@ -130,3 +204,13 @@ export const useFolderContext = () =>
 export const useFileContext = () =>
   useSelectionStore((s) => s.selection.fileContext);
 export const useIsInitialized = () => useSelectionStore((s) => s.isInitialized);
+export const useFilesMetadata = () => useSelectionStore((s) => s.filesMetadata);
+export const useImportGraph = () => useSelectionStore((s) => s.importGraph);
+export const useCommitsByAuthor = () =>
+  useSelectionStore((s) => s.selection.repoContext?.commitsByAuthor ?? {});
+export const useTotalCommitsFetched = () =>
+  useSelectionStore((s) => s.selection.repoContext?.totalCommitsFetched ?? 0);
+export const useIssues = () =>
+  useSelectionStore((s) => s.selection.repoContext?.issues ?? []);
+export const usePulls = () =>
+  useSelectionStore((s) => s.selection.repoContext?.pulls ?? []);

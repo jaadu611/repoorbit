@@ -1,8 +1,3 @@
-/**
- * almost completely ai made file sorry for who ever is seeing this file
- * idk whats happening here but probably shouldnt touch it
- */
-
 "use client";
 
 import React, {
@@ -19,7 +14,6 @@ import {
   GitBranch,
   FileCode2,
   X,
-  GitCommit,
   Hash,
   Layers,
   HardDrive,
@@ -29,101 +23,36 @@ import {
   ChevronDown,
   Calendar,
   FolderTree,
-  Users,
   Zap,
   FileText,
   Terminal,
-  Eye,
   Cpu,
   BarChart2,
   Box,
+  Loader2,
+  Users,
+  History,
+  Clock,
+  User,
+  Copy,
+  ExternalLink,
 } from "lucide-react";
-import { FileNode } from "@/modes/TreeMapper";
+import {
+  RepoTreeEntry,
+  FileNode,
+  TreeNode,
+  AnimatingNode,
+  AnimatingLink,
+} from "@/lib/types";
 import { EXT_GROUPS, hasData, ICON_SVGS } from "@/constants/treeView.constants";
 import { useSelectionStore } from "@/lib/store";
-import { RepoTreeEntry } from "@/lib/types";
 import Link from "next/link";
-
-// ─── Repo tree helpers ────────────────────────────────────────────────────────
-
-/** Recursively flattens a TreeNode tree into a list of RepoTreeEntry */
-function flattenTree(nodes: TreeNode[], depth = 1): RepoTreeEntry[] {
-  const result: RepoTreeEntry[] = [];
-  for (const n of nodes) {
-    result.push({
-      path: n.fileDetails?.path ?? n.id,
-      name: n.name,
-      type: n.type === "folder" ? "folder" : "file",
-      ext: n.ext,
-      size: n.size,
-      depth,
-    });
-    if (n.originalChildren.length > 0) {
-      result.push(...flattenTree(n.originalChildren, depth + 1));
-    }
-  }
-  return result;
-}
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-interface TreeNode {
-  id: string;
-  name: string;
-  type: "root" | "folder" | "file";
-  ext: string;
-  size: number;
-  details?: {
-    name: string;
-    fullName: string;
-    owner: string;
-    avatar: string;
-    stars: number;
-    forks: number;
-    openIssues: number;
-    size: number;
-    pushedAt: string;
-    language: string;
-    license: string;
-    defaultBranch: string;
-    visibility: string;
-  };
-  fileDetails?: {
-    depth: number;
-    path: string;
-    isLarge: boolean;
-    branchWeight: number;
-  };
-  originalChildren: TreeNode[];
-  children?: TreeNode[] | null;
-}
-
-interface AnimatingNode {
-  id: string;
-  cx: number;
-  cy: number;
-  tx: number;
-  ty: number;
-  opacity: number;
-  scale: number;
-  born: number;
-  closing: boolean;
-}
-
-interface AnimatingLink {
-  childId: string;
-  progress: number;
-  born: number;
-  closing: boolean;
-}
 
 const ANIM_DURATION = 320;
 const LINK_DURATION = 260;
 const ANIM_EASING = (t: number) => 1 - Math.pow(1 - t, 3);
 const LINK_EASING = (t: number) =>
   t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function fileColor(ext: string) {
   for (const g of EXT_GROUPS) if (g.exts.includes(ext)) return g;
@@ -213,6 +142,7 @@ function buildTree(nodes: any[], repoTotalSize = 0, depth = 1): TreeNode[] {
       type: n.type === "folder" ? "folder" : "file",
       ext,
       size: calculatedSize,
+      sha: n.sha ?? "",
       fileDetails: {
         depth,
         path: n.path,
@@ -240,8 +170,6 @@ const NODE_SEP = 48;
 const LEVEL_SEP = 140;
 const MIN_PANE_PX = 120;
 
-// ─── UI helpers ───────────────────────────────────────────────────────────────
-
 function StatPill({
   icon: Icon,
   label,
@@ -255,23 +183,23 @@ function StatPill({
 }) {
   return (
     <div
-      className="flex flex-col gap-0.5 rounded-lg px-2 py-1.5 border"
+      className="flex flex-col gap-1 rounded-xl px-2.5 py-2 border transition-all duration-300 hover:scale-[1.02] hover:shadow-lg hover:shadow-black/20"
       style={{
-        background: hexToRgba(accent, 0.04),
-        borderColor: hexToRgba(accent, 0.12),
+        background: `linear-gradient(135deg, ${hexToRgba(accent, 0.08)} 0%, ${hexToRgba(accent, 0.02)} 100%)`,
+        borderColor: hexToRgba(accent, 0.15),
       }}
     >
-      <div className="flex items-center gap-1.5">
-        <Icon size={9} style={{ color: accent }} />
+      <div className="flex items-center gap-1.5 opacity-60">
+        <Icon size={10} style={{ color: accent }} />
         <span
-          className="text-[8px] font-bold uppercase tracking-widest leading-none"
-          style={{ color: hexToRgba(accent, 0.6) }}
+          className="text-[7px] font-bold uppercase tracking-[0.15em] leading-none"
+          style={{ color: accent }}
         >
           {label}
         </span>
       </div>
       <div
-        className="text-[11px] font-mono font-bold truncate leading-tight"
+        className="text-[12px] font-mono font-bold truncate leading-tight tracking-tight"
         style={{ color: accent }}
       >
         {value}
@@ -289,19 +217,17 @@ function Badge({
 }) {
   return (
     <span
-      className="text-[8px] font-mono px-1 py-0 rounded-md border"
+      className="text-[9px] font-bold font-mono px-2 py-0.5 rounded-full border backdrop-blur-sm transition-colors"
       style={{
         color,
-        background: hexToRgba(color, 0.08),
-        borderColor: hexToRgba(color, 0.2),
+        background: hexToRgba(color, 0.12),
+        borderColor: hexToRgba(color, 0.25),
       }}
     >
       {children}
     </span>
   );
 }
-
-// ─── Component ────────────────────────────────────────────────────────────────
 
 export default function TreeView({
   data,
@@ -335,7 +261,6 @@ export default function TreeView({
   const setFolderContext = useSelectionStore((state) => state.setFolderContext);
   const setFileContext = useSelectionStore((state) => state.setFileContext);
 
-  // ── Rich context slices from Zustand ─────────────────────────────────────
   const storeFileContext = useSelectionStore((s) => s.selection.fileContext);
   const storeFolderContext = useSelectionStore(
     (s) => s.selection.folderContext,
@@ -356,6 +281,8 @@ export default function TreeView({
     content: string;
     imageDataUrl?: string;
     history?: any;
+    loading?: boolean;
+    error?: string;
   } | null>(null);
 
   const [topPx, setTopPx] = useState<number | null>(null);
@@ -567,7 +494,6 @@ export default function TreeView({
     rafRef.current = requestAnimationFrame(tick);
   }, [stopAnim]);
 
-  // ── Draw ──────────────────────────────────────────────────────────────────
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -607,7 +533,6 @@ export default function TreeView({
     const vyMin = -y / k - 150,
       vyMax = (cH - y) / k + 150;
 
-    // ── Links ──
     for (const link of hierarchy.links()) {
       const sx = Math.round(link.source.x ?? 0),
         sy = Math.round(link.source.y ?? 0);
@@ -661,7 +586,6 @@ export default function TreeView({
       ctx.restore();
     }
 
-    // ── Nodes ──
     for (const node of hierarchy.descendants()) {
       const d = node.data;
       const anim = animatingNodesRef.current.get(d.id);
@@ -704,7 +628,6 @@ export default function TreeView({
         ctx.arc(nx, ny, r * 2.5, 0, Math.PI * 2);
         ctx.fillStyle = grd;
         ctx.fill();
-
         ctx.beginPath();
         ctx.arc(nx, ny, r, 0, Math.PI * 2);
         ctx.fillStyle = "rgba(12,18,36,0.92)";
@@ -1040,323 +963,81 @@ export default function TreeView({
     [computeLayout, startAnimLoop],
   );
 
+  // Fetch file content from server cache
+  const fetchFileContent = useCallback(
+    async (filePath: string): Promise<any> => {
+      const repoFullName =
+        useSelectionStore.getState().selection.repoContext?.meta.fullName;
+      if (!repoFullName) return { content: "", error: "No repo context" };
+      try {
+        const res = await fetch(
+          `/api/file-content?repo=${encodeURIComponent(repoFullName)}&path=${encodeURIComponent(filePath)}`,
+        );
+        if (!res.ok) {
+          const text = await res.text();
+          return { content: "", error: text };
+        }
+        return await res.json();
+      } catch (err) {
+        return { content: "", error: "Fetch failed" };
+      }
+    },
+    [],
+  );
+
   const onClick = useCallback(
     async (e: React.MouseEvent<HTMLCanvasElement>) => {
       const rect = canvasRef.current!.getBoundingClientRect();
       const hit = hitTest(e.clientX - rect.left, e.clientY - rect.top);
       if (!hit) return;
-      const owner = data.details?.owner;
-      const repo = data.details?.name;
-      if (!owner || !repo) return;
-      const token = process.env.NEXT_PUBLIC_GITHUB_TOKEN;
-      const headers = {
-        Accept: "application/vnd.github.v3+json",
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      };
 
       if (hit.type === "folder") {
         toggleFolder(hit);
-        try {
-          const encodedPath = encodeURIComponent(hit.id);
-          const [contentsRes, commitsRes] = await Promise.all([
-            fetch(
-              `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`,
-              { headers },
-            ),
-            fetch(
-              `https://api.github.com/repos/${owner}/${repo}/commits?path=${encodedPath}&per_page=1`,
-              { headers },
-            ),
-          ]);
-          const folderContents: any[] = contentsRes.ok
-            ? await contentsRes.json()
-            : [];
-          const commitsData: any[] = commitsRes.ok
-            ? await commitsRes.json()
-            : [];
-          const lastCommit = commitsData[0] ?? null;
-          const children = folderContents.map((c: any) => ({
-            name: c.name,
-            path: c.path,
-            type: c.type,
-            size: c.size,
-            sha: c.sha,
-            htmlUrl: c.html_url,
-            gitUrl: c.git_url,
-            downloadUrl: c.download_url ?? null,
-            ext: c.name.includes(".")
-              ? (c.name.split(".").pop()?.toLowerCase() ?? "")
-              : "",
-          }));
-          const subtreeFlat = flattenTree(
-            hit.originalChildren,
-            hit.fileDetails?.depth ?? 1,
-          );
-          const subtreeFiles = subtreeFlat.filter((e) => e.type === "file");
-          const subtreeFolders = subtreeFlat.filter((e) => e.type === "folder");
-          const extFreq: Record<string, number> = {};
-          for (const e of subtreeFiles) {
-            if (e.ext) extFreq[e.ext] = (extFreq[e.ext] ?? 0) + 1;
-          }
-          const dominantExt =
-            Object.entries(extFreq).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
-          const childNames = children.map((c) => c.name.toLowerCase());
-          const hasIndex = childNames.some((n) =>
-            /^index\.|^main\.|^app\./.test(n),
-          );
-          const hasConfig = childNames.some(
-            (n) => n.includes("config") || n.endsWith(".json"),
-          );
-          const hasReadme = childNames.some((n) => n === "readme.md");
-          const hasTests = childNames.some((n) =>
-            /test|spec|__tests__/.test(n),
-          );
-          const hasStyles = childNames.some((n) =>
-            /\.css$|\.scss$|\.sass$/.test(n),
-          );
-          const hasDotfiles = childNames.some((n) => n.startsWith("."));
-          const folderContext = {
-            id: hit.id,
-            name: hit.name,
-            path: hit.fileDetails?.path ?? hit.id,
-            depth: hit.fileDetails?.depth ?? 0,
-            size: hit.size,
-            branchWeight: hit.fileDetails?.branchWeight ?? 0,
-            isLarge: hit.fileDetails?.isLarge ?? false,
-            children,
-            lastCommit: lastCommit
-              ? {
-                  sha: lastCommit.sha,
-                  message: lastCommit.commit.message,
-                  author: lastCommit.commit.author.name,
-                  authorEmail: lastCommit.commit.author.email,
-                  date: lastCommit.commit.author.date,
-                  htmlUrl: lastCommit.html_url,
-                  avatarUrl: lastCommit.author?.avatar_url ?? null,
-                  authorProfileUrl: lastCommit.author?.html_url ?? null,
-                  shortSha: lastCommit.sha.slice(0, 7),
-                }
-              : null,
-            subtree: subtreeFlat,
-            stats: {
-              totalFiles: subtreeFiles.length,
-              totalFolders: subtreeFolders.length,
-              totalSize: subtreeFiles.reduce((acc, e) => acc + e.size, 0),
-              maxDepth: subtreeFlat.reduce(
-                (acc, e) => Math.max(acc, e.depth),
-                0,
-              ),
-              extFrequency: extFreq,
-              dominantExt,
-            },
-            flags: {
-              hasIndex,
-              hasConfig,
-              hasReadme,
-              hasTests,
-              hasStyles,
-              hasDotfiles,
-              isEntryPoint: hasIndex,
-              isConfigFolder: hasConfig && !hasIndex,
-              isTestFolder: hasTests && subtreeFiles.length > 0,
-            },
-          };
-          setFolderContext(folderContext);
-          setSelection("folder", hit.name, hit.id, folderContext);
-        } catch {
-          setSelection("folder", hit.name, hit.id, null);
-        }
+        setSelection(
+          "folder",
+          hit.name,
+          hit.id,
+          (hit.fileDetails as any) ?? null,
+        );
       } else if (hit.type === "file") {
-        try {
-          const encodedPath = encodeURIComponent(hit.id);
-          const [contentRes, historyRes] = await Promise.allSettled([
-            fetch(
-              `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`,
-              { headers },
-            ),
-            fetch(
-              `https://api.github.com/repos/${owner}/${repo}/commits?path=${encodedPath}&per_page=100`,
-              { headers },
-            ),
-          ]);
-          if (contentRes.status === "rejected" || !contentRes.value.ok)
-            throw new Error("Failed to fetch file content");
-          const contentData = await contentRes.value.json();
-          const historyData: any[] =
-            historyRes.status === "fulfilled" && historyRes.value.ok
-              ? await historyRes.value.json()
-              : [];
-          let rawContent = "";
-          if (contentData.encoding === "base64")
-            rawContent = atob(contentData.content.replace(/\n/g, ""));
-          const lines = rawContent.split("\n");
-          const lineCount = lines.length,
-            charCount = rawContent.length;
-          const commits = historyData.map((c: any) => ({
-            sha: c.sha,
-            shortSha: c.sha.slice(0, 8),
-            message: c.commit.message,
-            author: c.commit.author.name,
-            authorEmail: c.commit.author.email,
-            date: c.commit.author.date,
-            htmlUrl: c.html_url,
-            avatarUrl: c.author?.avatar_url ?? null,
-            profileUrl: c.author?.html_url ?? null,
-            committer: c.commit.committer.name,
-            committerEmail: c.commit.committer.email,
-            verified: c.commit.verification?.verified ?? false,
-          }));
-          const contribMap = new Map<
-            string,
-            {
-              name: string;
-              email: string;
-              avatarUrl: string | null;
-              profileUrl: string | null;
-              commits: number;
-              firstCommit: string;
-              lastCommit: string;
-            }
-          >();
-          for (const c of historyData) {
-            const key = c.commit.author.email;
-            if (!contribMap.has(key))
-              contribMap.set(key, {
-                name: c.commit.author.name,
-                email: key,
-                avatarUrl: c.author?.avatar_url ?? null,
-                profileUrl: c.author?.html_url ?? null,
-                commits: 0,
-                firstCommit: c.commit.author.date,
-                lastCommit: c.commit.author.date,
-              });
-            const entry = contribMap.get(key)!;
-            entry.commits++;
-            if (c.commit.author.date < entry.firstCommit)
-              entry.firstCommit = c.commit.author.date;
-            if (c.commit.author.date > entry.lastCommit)
-              entry.lastCommit = c.commit.author.date;
-          }
-          const contributors = Array.from(contribMap.values()).sort(
-            (a, b) => b.commits - a.commits,
-          );
-          const topContributor = contributors[0] ?? null;
-          const emptyLines = lines.filter((l) => l.trim() === "").length;
-          const commentLines = lines.filter((l) =>
-            /^\s*(\/\/|#|\/\*|\*|<!--)/.test(l),
-          ).length;
-          const codeLines = lineCount - emptyLines - commentLines;
-          const importLines = rawContent.match(/^import .+/gm) ?? [];
-          const exportSymbols =
-            rawContent.match(
-              /export\s+(default\s+)?(const|function|class|type|interface|enum)\s+(\w+)/g,
-            ) ?? [];
-          const todoComments =
-            rawContent.match(/\/\/\s*(TODO|FIXME|HACK|NOTE|XXX):?.+/gi) ?? [];
-          const consoleLogs =
-            rawContent.match(/console\.(log|warn|error|info|debug)\(/g) ?? [];
-          const branchKeywords = (
-            rawContent.match(/\bif\b|\belse\b|\bswitch\b|\bcase\b|\b\?\s/g) ??
-            []
-          ).length;
-          const loopKeywords = (
-            rawContent.match(
-              /\bfor\b|\bwhile\b|\bdo\b|\b\.map\b|\b\.filter\b|\b\.reduce\b/g,
-            ) ?? []
-          ).length;
-          const asyncKeywords = (
-            rawContent.match(/\basync\b|\bawait\b|\b\.then\b|\b\.catch\b/g) ??
-            []
-          ).length;
-          const functionCount = (
-            rawContent.match(/\bfunction\b|\b=>\s*[{(]/g) ?? []
-          ).length;
-          const classCount = (rawContent.match(/\bclass\s+\w+/g) ?? []).length;
-          const isReact = /import\s+.*React|from\s+['"]react['"]/.test(
-            rawContent,
-          );
-          const isTypeScript = hit.ext === "ts" || hit.ext === "tsx";
-          const isTest =
-            /\.(test|spec)\.[a-z]+$/.test(hit.name) ||
-            /describe\(|it\(|test\(/.test(rawContent);
-          const isConfig = /config|\.env|rc\b/.test(hit.name.toLowerCase());
-          const hasJsx = /<[A-Z][A-Za-z]*[\s/>]|<\/[A-Z]/.test(rawContent);
-          const logicType = isTest
-            ? "Test / Spec"
-            : isConfig
-              ? "Config / Env"
-              : isReact && hasJsx
-                ? "UI Component (JSX)"
-                : isReact
-                  ? "React Hook / Utility"
-                  : "Logic / Utility / Backend";
-          const fileContext = {
-            id: hit.id,
+        const filesMetadata = useSelectionStore.getState().filesMetadata ?? [];
+        const richFile = filesMetadata.find((f: any) => f.path === hit.id);
+        setSelection(
+          "file",
+          hit.name,
+          hit.id,
+          richFile ?? (hit.fileDetails as any) ?? null,
+        );
+
+        // Open panel immediately in loading state
+        setActiveFile({
+          node: hit,
+          content: "",
+          loading: true,
+          imageDataUrl: undefined,
+          history: null,
+        });
+
+        // Fetch content from server cache
+        const data = await fetchFileContent(hit.id);
+        if (data && !data.error) {
+          setFileContext({
+            ...richFile,
+            ...data,
             name: hit.name,
-            path: hit.fileDetails?.path ?? hit.id,
-            ext: hit.ext,
-            depth: hit.fileDetails?.depth ?? 0,
-            isLarge: hit.fileDetails?.isLarge ?? false,
-            github: {
-              sha: contentData.sha,
-              size: contentData.size,
-              encoding: contentData.encoding,
-              htmlUrl: contentData.html_url,
-              gitUrl: contentData.git_url,
-              downloadUrl: contentData.download_url ?? null,
-              type: contentData.type,
-            },
-            content: rawContent,
-            metrics: {
-              lineCount,
-              charCount,
-              codeLines,
-              commentLines,
-              emptyLines,
-              byteSize: contentData.size,
-            },
-            analysis: {
-              imports: importLines.map((l) =>
-                l.replace(/^import\s+/, "").trim(),
-              ),
-              exports: exportSymbols.map((e) =>
-                e.replace(/^export\s+(default\s+)?/, "").trim(),
-              ),
-              todoComments,
-              consoleLogs: consoleLogs.length,
-              functionCount,
-              classCount,
-              complexity: {
-                score: branchKeywords + loopKeywords,
-                branches: branchKeywords,
-                loops: loopKeywords,
-                asyncOps: asyncKeywords,
-              },
-              logicType,
-              isReact,
-              isTypeScript,
-              isTest,
-              isConfig,
-              hasJsx,
-            },
-            commits,
-            contributors,
-            topContributor,
-            firstCommit:
-              commits.length > 0 ? commits[commits.length - 1] : null,
-            latestCommit: commits.length > 0 ? commits[0] : null,
-          };
-          setFileContext(fileContext);
-          setSelection("file", hit.name, hit.id, fileContext);
-          setActiveFile({
-            node: hit,
-            content: rawContent,
-            imageDataUrl: undefined,
-            history: historyData[0] || null,
+            path: hit.id,
           });
-        } catch (err: any) {
-          console.error("File selection error:", err.message);
         }
+        setActiveFile((prev) =>
+          prev?.node.id === hit.id
+            ? {
+                ...prev,
+                content: data.content ?? "",
+                loading: false,
+                error: data.error,
+              }
+            : prev,
+        );
       } else if (hit.type === "root") {
         const existing = useSelectionStore.getState().selection.repoContext;
         if (existing) {
@@ -1366,14 +1047,7 @@ export default function TreeView({
         }
       }
     },
-    [
-      hitTest,
-      toggleFolder,
-      data,
-      setSelection,
-      setFolderContext,
-      setFileContext,
-    ],
+    [hitTest, toggleFolder, data, setSelection, fetchFileContent],
   );
 
   const onMouseMove = useCallback(
@@ -1418,7 +1092,6 @@ export default function TreeView({
               </div>
             </div>
           </div>
-
           <div className="grid grid-cols-4 gap-1 mb-2">
             {[
               {
@@ -1436,7 +1109,11 @@ export default function TreeView({
                 v: rc?.meta.openIssues ?? node.details?.openIssues ?? 0,
                 c: "#f87171",
               },
-              { l: "Watch", v: rc?.github?.watchers ?? 0, c: "#34d399" },
+              {
+                l: "Files",
+                v: rc ? `${rc.stats.totalFiles}` : null,
+                c: "#94a3b8",
+              },
             ].map((s) => (
               <div
                 key={s.l}
@@ -1453,18 +1130,12 @@ export default function TreeView({
               </div>
             ))}
           </div>
-
           <div className="grid grid-cols-2 gap-x-4 gap-y-1 border-t border-white/5 pt-2">
             {[
               { k: "Lang", v: rc?.meta.language || "Mixed", c: "#fb923c" },
               { k: "Arch", v: rc?.stack.architecture, c: "#a78bfa" },
-              {
-                k: "Files",
-                v: rc ? `${rc.stats.totalFiles}` : null,
-                c: "#94a3b8",
-              },
+
               { k: "Items", v: rc?.stats.rootItemCount, c: "#34d399" },
-              { k: "Branch", v: rc?.meta.defaultBranch, c: "#67e8f9" },
               { k: "License", v: rc?.meta.license || "None", c: "#86efac" },
             ].map(
               (r) =>
@@ -1492,7 +1163,6 @@ export default function TreeView({
               </span>
             </div>
           </div>
-
           {rc?.stack && (
             <div className="flex flex-wrap gap-1 mt-2 pt-2 border-t border-white/5">
               {hasData
@@ -1504,10 +1174,9 @@ export default function TreeView({
                 ))}
             </div>
           )}
-
           {rc?.latestCommit && (
             <div className="mt-2 pt-1.5 border-t border-white/5 flex items-center gap-2">
-              <span className="text-[8px] font-mono px-1.5 py-0.5 rounded-sm bg-gray-900/50 border border-gray-800 text-gray-500 shrink-0 group-hover:text-blue-400 group-hover:border-blue-500/30 transition-colors">
+              <span className="text-[8px] font-mono px-1.5 py-0.5 rounded-sm bg-gray-900/50 border border-gray-800 text-gray-500 shrink-0">
                 {rc.latestCommit.shortSha}
               </span>
               <span className="text-[9px] text-gray-500 truncate">
@@ -1555,7 +1224,7 @@ export default function TreeView({
                 label: "Subtree",
                 value: fc
                   ? `${fc.stats.totalFiles}f ${fc.stats.totalFolders}d`
-                  : `${node.fileDetails?.branchWeight ?? "\u2014"}`,
+                  : `${node.fileDetails?.branchWeight ?? "—"}`,
                 color: "#34d399",
               },
             ].map((s) => (
@@ -1662,49 +1331,27 @@ export default function TreeView({
             </div>
           </div>
         </div>
-        {fctx && (
-          <>
-            <div className="grid grid-cols-3 gap-1">
-              {[
-                { v: fctx.metrics.lineCount, l: "Lines", c: "#94a3b8" },
-                { v: fctx.analysis.functionCount, l: "Funcs", c: "#818cf8" },
-                {
-                  v: fctx.analysis.complexity.score,
-                  l: "Cmplx",
-                  c:
-                    fctx.analysis.complexity.score > 20 ? "#f87171" : "#34d399",
-                },
-              ].map((s) => (
+        {fctx?.metrics && (
+          <div className="grid grid-cols-3 gap-1">
+            {[
+              { v: fctx.metrics.lineCount, l: "Lines", c: "#94a3b8" },
+              { v: fctx.analysis.functionCount, l: "Funcs", c: "#818cf8" },
+              { v: fctx.analysis.classCount, l: "Class", c: "#a78bfa" },
+            ].map((s) => (
+              <div
+                key={s.l}
+                className="bg-gray-800/50 rounded-lg py-1 border border-gray-700 text-center"
+              >
                 <div
-                  key={s.l}
-                  className="bg-gray-800/50 rounded-lg py-1 border border-gray-700 text-center"
+                  className="text-[10px] font-mono font-bold"
+                  style={{ color: s.c }}
                 >
-                  <div
-                    className="text-[10px] font-mono font-bold"
-                    style={{ color: s.c }}
-                  >
-                    {s.v}
-                  </div>
-                  <div className="text-[7px] text-gray-600 uppercase">
-                    {s.l}
-                  </div>
+                  {s.v}
                 </div>
-              ))}
-            </div>
-            {fctx.latestCommit && (
-              <div className="border-t border-gray-700 pt-2">
-                <div className="text-[8px] text-gray-500 uppercase tracking-wider mb-1">
-                  Last Commit
-                </div>
-                <div className="text-[9px] text-gray-300 truncate font-medium">
-                  {fctx.latestCommit.message.split("\n")[0].slice(0, 40)}
-                </div>
-                <div className="text-[8px] text-gray-500 font-mono mt-0.5">
-                  {fctx.latestCommit.author} \u00b7 {fctx.latestCommit.shortSha}
-                </div>
+                <div className="text-[7px] text-gray-600 uppercase">{s.l}</div>
               </div>
-            )}
-          </>
+            ))}
+          </div>
         )}
       </div>
     );
@@ -1723,7 +1370,6 @@ export default function TreeView({
         className="absolute left-0 right-0 top-0 overflow-hidden"
         style={{ bottom: activeFile ? `calc(100% - ${topPx ?? 0}px)` : 0 }}
       >
-        {/* Sidebar legend */}
         <div
           className="absolute right-0 border-l border-gray-700 top-0 bg-gray-900 bottom-0 z-10 flex flex-col transition-all duration-200 overflow-hidden"
           style={{ width: sidebarWidth }}
@@ -1848,11 +1494,10 @@ export default function TreeView({
           )}
         </div>
 
-        {/* Canvas */}
         <canvas
           ref={canvasRef}
           className="absolute inset-0 cursor-default"
-          style={{ right: sidebarWidth }} // This will automatically adapt to your narrower sidebar
+          style={{ right: sidebarWidth }}
           onClick={onClick}
           onMouseMove={onMouseMove}
           onMouseLeave={() => {
@@ -1861,19 +1506,18 @@ export default function TreeView({
           }}
         />
 
-        {/* Rich tooltip */}
         {tooltip && (
           <div
             className="absolute z-20 pointer-events-none px-3 py-2.5 rounded-xl font-mono shadow-2xl"
             style={{
-              left: tooltip.x + 15, // Brought closer to the node
+              left: tooltip.x + 15,
               top: Math.min(
                 tooltip.y - 8,
-                (treeContainerRef.current?.clientHeight ?? 400) - 300, // Adjusted max-height constraint for compact height
+                (treeContainerRef.current?.clientHeight ?? 400) - 300,
               ),
-              background: "#0f172a", // Sleeker, darker slate
-              border: "1px solid #334155", // Reduced weight from 2px to 1px
-              borderRadius: "12px", // Slightly tighter radius for smaller popups
+              background: "#0f172a",
+              border: "1px solid #334155",
+              borderRadius: "12px",
               boxShadow: "0 20px 50px rgba(0,0,0,0.5)",
             }}
           >
@@ -1882,37 +1526,35 @@ export default function TreeView({
         )}
       </div>
 
-      {/* Drag divider */}
       {activeFile && topPx !== null && (
         <div
           className="absolute left-0 right-0 z-30 flex items-center justify-center group"
-          style={{ top: topPx, height: 4, cursor: "row-resize" }} // Reduced height from 6 to 4
+          style={{ top: topPx, height: 4, cursor: "row-resize" }}
           onMouseDown={onDragStart}
         >
           <div
             className="absolute inset-0 transition-colors"
-            style={{ background: "rgba(30,41,59,0.4)" }} // Slightly more transparent
+            style={{ background: "rgba(30,41,59,0.4)" }}
           />
           <div
             className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity"
-            style={{ background: "rgba(59,130,246,0.2)" }} // Softer hover glow
+            style={{ background: "rgba(59,130,246,0.2)" }}
           />
           <div
-            className="relative z-10 flex items-center gap-1 px-2 py-0.5 rounded-full pointer-events-none" // Reduced px-3 to px-2
+            className="relative z-10 flex items-center gap-1 px-2 py-0.5 rounded-full pointer-events-none"
             style={{
               background: "rgba(10,16,28,0.95)",
-              border: "1px solid rgba(51,65,85,0.8)", // Sharper border color
+              border: "1px solid rgba(51,65,85,0.8)",
             }}
           >
             <GripHorizontal
-              size={9} // Reduced size from 10 to 9
+              size={9}
               className="text-slate-600 group-hover:text-blue-400 transition-colors"
             />
           </div>
         </div>
       )}
 
-      {/* Inspector pane */}
       {activeFile && topPx !== null && (
         <div
           className="absolute left-0 right-0 bottom-0 flex flex-col overflow-hidden"
@@ -1923,16 +1565,16 @@ export default function TreeView({
         >
           {/* Header */}
           <div
-            className="shrink-0 flex items-center gap-2.5 px-3 py-2" // Reduced px-4 to px-3 and py-2.5 to py-2
+            className="shrink-0 flex items-center gap-2.5 px-3 py-2"
             style={{
               background: fc
                 ? hexToRgba(fc.color, 0.03)
-                : "rgba(10,15,26,0.85)", // Subtle decrease in bg opacity
-              borderBottom: `1px solid ${fc ? hexToRgba(fc.color, 0.08) : "rgba(30,41,59,0.5)"}`, // Thinner-feeling border
+                : "rgba(10,15,26,0.85)",
+              borderBottom: `1px solid ${fc ? hexToRgba(fc.color, 0.08) : "rgba(30,41,59,0.5)"}`,
             }}
           >
             <div
-              className="shrink-0 w-7 h-7 rounded-lg flex items-center justify-center" // Shrunk from w-8 to w-7, radius xl to lg
+              className="shrink-0 w-7 h-7 rounded-lg flex items-center justify-center"
               style={{
                 background: fc
                   ? hexToRgba(fc.color, 0.08)
@@ -1942,7 +1584,6 @@ export default function TreeView({
             >
               {fc && <fc.icon size={12} style={{ color: fc.color }} />}
             </div>
-
             <div className="flex-1 min-w-0">
               <div className="text-[13px] font-bold text-white font-mono truncate leading-none">
                 {activeFile.node.name}
@@ -1951,9 +1592,8 @@ export default function TreeView({
                 {activeFile.node.fileDetails?.path}
               </div>
             </div>
-
             <div className="hidden sm:flex items-center gap-1 shrink-0">
-              {storeFileContext && (
+              {storeFileContext?.metrics && (
                 <>
                   <Badge color="#64748b">
                     {storeFileContext.metrics.lineCount}L
@@ -1973,7 +1613,6 @@ export default function TreeView({
                 {(activeFile.node.size / 1024).toFixed(1)} KB
               </Badge>
             </div>
-
             <button
               onClick={() => setActiveFile(null)}
               className="shrink-0 w-6 h-6 flex items-center justify-center rounded-md transition-all border border-slate-800 text-slate-600 hover:text-red-400 hover:bg-red-400/10 hover:border-red-400/20"
@@ -1982,15 +1621,14 @@ export default function TreeView({
             </button>
           </div>
 
-          {/* Body */}
           <div className="flex flex-1 min-h-0">
-            {/* Source */}
+            {/* Source pane */}
             <div
               className="flex flex-col border-r overflow-hidden"
-              style={{ width: "58%", borderColor: "rgba(30,41,59,0.5)" }} // Slightly lighter, thinner border
+              style={{ width: "58%", borderColor: "rgba(30,41,59,0.5)" }}
             >
               <div
-                className="shrink-0 flex items-center gap-2 px-3 py-1.5" // Reduced px-4 py-2
+                className="shrink-0 flex items-center gap-2 px-3 py-1.5"
                 style={{
                   borderBottom: "1px solid rgba(30,41,59,0.4)",
                   background: "rgba(4,7,14,0.7)",
@@ -2000,7 +1638,7 @@ export default function TreeView({
                 <span className="text-[9px] font-mono font-bold text-slate-600 uppercase tracking-widest">
                   {activeFile.imageDataUrl ? "Preview" : "Source"}
                 </span>
-                {storeFileContext && (
+                {storeFileContext?.metrics && (
                   <span className="ml-auto text-[9px] font-mono text-slate-600">
                     {storeFileContext.metrics.codeLines}c ·{" "}
                     {storeFileContext.metrics.commentLines}
@@ -2009,10 +1647,19 @@ export default function TreeView({
                   </span>
                 )}
               </div>
-              <div
-                className="flex-1 overflow-auto bg-[#020408]" // Slightly deeper black
-              >
-                {activeFile.imageDataUrl ? (
+              <div className="flex-1 overflow-auto bg-[#020408]">
+                {activeFile.loading ? (
+                  <div className="flex items-center justify-center w-full h-full gap-2 text-slate-600">
+                    <Loader2 size={14} className="animate-spin" />
+                    <span className="text-[10px] font-mono">Loading…</span>
+                  </div>
+                ) : activeFile.error && !activeFile.content ? (
+                  <div className="flex items-center justify-center w-full h-full">
+                    <span className="text-[10px] font-mono text-red-500/60">
+                      {activeFile.error}
+                    </span>
+                  </div>
+                ) : activeFile.imageDataUrl ? (
                   <div className="flex items-center justify-center w-full h-full min-h-[180px] p-4">
                     <img
                       src={activeFile.imageDataUrl}
@@ -2026,16 +1673,16 @@ export default function TreeView({
                     style={vscDarkPlus}
                     customStyle={{
                       margin: 0,
-                      padding: "16px", // Reduced from 20px
-                      fontSize: "12px", // Reduced from 13px
+                      padding: "16px",
+                      fontSize: "12px",
                       background: "transparent",
-                      lineHeight: "1.5", // Tightened from 1.65
+                      lineHeight: "1.5",
                     }}
                     showLineNumbers={true}
                     lineNumberStyle={{
-                      minWidth: "2.5em", // Shrunk from 3em
+                      minWidth: "2.5em",
                       paddingRight: "1em",
-                      color: "#1e293b", // Slate-800 for more subtle line numbers
+                      color: "#1e293b",
                       textAlign: "right",
                       userSelect: "none",
                     }}
@@ -2046,464 +1693,389 @@ export default function TreeView({
               </div>
             </div>
 
-            {/* Details */}
+            {/* Metadata pane */}
             <div
-              className="flex flex-col overflow-auto"
-              style={{ width: "42%", background: "#040810" }}
+              className="flex flex-col overflow-auto custom-scrollbar shadow-[inset_1px_0_0_rgba(255,255,255,0.05)]"
+              style={{ width: "42%", background: "#04070e" }}
             >
               {storeFileContext ? (
-                <div className="p-4 space-y-5">
-                  {/* Metrics */}
-                  <>
-                    <div className="flex items-center gap-1.5 mb-2">
-                      <BarChart2 size={10} className="text-slate-700" />
-                      <span className="text-[9px] font-mono font-bold text-slate-700 uppercase tracking-widest">
-                        Metrics
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-3 gap-1">
-                      <StatPill
-                        icon={FileText}
-                        label="Lines"
-                        value={storeFileContext.metrics.lineCount.toLocaleString()}
-                        accent="#94a3b8"
-                      />
-                      <StatPill
-                        icon={Code2}
-                        label="Code"
-                        value={storeFileContext.metrics.codeLines.toLocaleString()}
-                        accent="#60a5fa"
-                      />
-                      <StatPill
-                        icon={Hash}
-                        label="Blank"
-                        value={storeFileContext.metrics.emptyLines}
-                        accent="#475569"
-                      />
-                      <StatPill
-                        icon={Cpu}
-                        label="Functions"
-                        value={storeFileContext.analysis.functionCount}
-                        accent="#818cf8"
-                      />
-                      <StatPill
-                        icon={Box}
-                        label="Classes"
-                        value={storeFileContext.analysis.classCount}
-                        accent="#a78bfa"
-                      />
-                      <StatPill
-                        icon={Zap}
-                        label="Cmplx"
-                        value={storeFileContext.analysis.complexity.score}
-                        accent={
-                          storeFileContext.analysis.complexity.score > 20
-                            ? "#f87171"
-                            : storeFileContext.analysis.complexity.score > 10
-                              ? "#fbbf24"
-                              : "#34d399"
-                        }
-                      />
-                    </div>
-                  </>
-
-                  {/* Analysis */}
-                  <>
-                    <div className="flex items-center gap-1.5 mb-2">
-                      <Terminal size={10} className="text-slate-700" />
-                      <span className="text-[9px] font-mono font-bold text-slate-700 uppercase tracking-widest">
-                        Analysis
-                      </span>
-                    </div>
-                    <div className="space-y-1 text-[10px]">
-                      {[
-                        {
-                          k: "Type",
-                          v: storeFileContext.analysis.logicType,
-                          c: "#94a3b8",
-                        },
-                        {
-                          k: "Branches",
-                          v: storeFileContext.analysis.complexity.branches,
-                          c: "#fbbf24",
-                        },
-                        {
-                          k: "Loops",
-                          v: storeFileContext.analysis.complexity.loops,
-                          c: "#fb923c",
-                        },
-                        {
-                          k: "Async ops",
-                          v: storeFileContext.analysis.complexity.asyncOps,
-                          c: "#67e8f9",
-                        },
-                        {
-                          k: "console.log",
-                          v: storeFileContext.analysis.consoleLogs,
-                          c:
-                            storeFileContext.analysis.consoleLogs > 0
-                              ? "#fbbf24"
-                              : "#334155",
-                        },
-                        {
-                          k: "Imports",
-                          v: storeFileContext.analysis.imports.length,
-                          c: "#94a3b8",
-                        },
-                        {
-                          k: "Exports",
-                          v: storeFileContext.analysis.exports.length,
-                          c: "#94a3b8",
-                        },
-                      ].map((r) => (
-                        <div key={r.k} className="flex justify-between">
-                          <span className="text-slate-600">{r.k}</span>
-                          <span className="font-mono" style={{ color: r.c }}>
-                            {r.v}
+                <div className="p-5 space-y-7">
+                  {/* Latest Activity Summary */}
+                  {storeFileContext.latestCommit && (
+                    <div className="relative group">
+                      <div className="absolute -inset-0.5 bg-linear-to-r from-blue-500/20 to-purple-500/20 rounded-xl blur opacity-30 group-hover:opacity-50 transition duration-500" />
+                      <div className="relative p-3 rounded-xl border border-white/5 bg-gray-950/40 backdrop-blur-md">
+                        <div className="flex items-center gap-2 mb-2.5">
+                          <div className="p-1 rounded bg-blue-500/10 border border-blue-500/20">
+                            <History size={10} className="text-blue-400" />
+                          </div>
+                          <span className="text-[9px] font-mono font-bold text-slate-500 uppercase tracking-widest">
+                            Latest Update
+                          </span>
+                          <span className="ml-auto text-[8px] font-mono text-slate-600 bg-white/5 px-1.5 py-0.5 rounded border border-white/5">
+                            {storeFileContext.latestCommit.shortSha}
                           </span>
                         </div>
-                      ))}
-                    </div>
-
-                    <div className="flex flex-wrap gap-1 mt-2">
-                      {storeFileContext.analysis.isReact && (
-                        <Badge color="#61dafb">React</Badge>
-                      )}
-                      {storeFileContext.analysis.isTypeScript && (
-                        <Badge color="#3b82f6">TS</Badge>
-                      )}
-                      {storeFileContext.analysis.hasJsx && (
-                        <Badge color="#f472b6">JSX</Badge>
-                      )}
-                      {storeFileContext.analysis.isTest && (
-                        <Badge color="#34d399">Test</Badge>
-                      )}
-                      {storeFileContext.analysis.isConfig && (
-                        <Badge color="#fbbf24">Config</Badge>
-                      )}
-                    </div>
-
-                    {storeFileContext.analysis.todoComments.length > 0 && (
-                      <div
-                        className="mt-2 p-2 rounded-md border"
-                        style={{
-                          background: "rgba(251,191,36,0.02)",
-                          borderColor: "rgba(251,191,36,0.08)",
-                        }}
-                      >
-                        <div className="text-[8px] text-yellow-700/80 uppercase tracking-wider mb-1">
-                          {storeFileContext.analysis.todoComments.length} TODO
-                          {storeFileContext.analysis.todoComments.length > 1
-                            ? "s"
-                            : ""}
-                        </div>
-                        {storeFileContext.analysis.todoComments
-                          .slice(0, 3)
-                          .map((t, i) => (
-                            <div
-                              key={i}
-                              className="text-[9px] text-yellow-500/50 font-mono truncate leading-tight"
-                            >
-                              {t.trim()}
+                        <div className="flex items-center gap-2">
+                          {storeFileContext.latestCommit.avatarUrl ? (
+                            <img
+                              src={storeFileContext.latestCommit.avatarUrl}
+                              className="w-6 h-6 rounded-full border border-white/10 ring-2 ring-white/5"
+                              alt=""
+                            />
+                          ) : (
+                            <div className="w-6 h-6 rounded-full bg-slate-800 flex items-center justify-center">
+                              <User size={10} className="text-slate-500" />
                             </div>
-                          ))}
+                          )}
+                          <div className="min-w-0">
+                            <div className="text-[11px] text-slate-300 font-medium truncate leading-normal">
+                              {storeFileContext.latestCommit.message}
+                            </div>
+                            <div className="flex items-center gap-1.5 mt-0.5">
+                              <span className="text-[9px] text-blue-400/80 font-semibold">
+                                {storeFileContext.latestCommit.author}
+                              </span>
+                              <span className="text-[8px] text-slate-600 flex items-center gap-1">
+                                <Clock size={8} />
+                                {new Date(
+                                  storeFileContext.latestCommit.date,
+                                ).toLocaleDateString()}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Core Metrics */}
+                  <section>
+                    <div className="flex items-center gap-1.5 mb-3 px-1">
+                      <BarChart2 size={11} className="text-slate-400" />
+                      <h3 className="text-[10px] font-mono font-bold text-slate-400 uppercase tracking-[0.2em]">
+                        Code Metrics
+                      </h3>
+                    </div>
+                    {storeFileContext.metrics ? (
+                      <div className="grid grid-cols-3 gap-1.5">
+                        <StatPill
+                          icon={FileText}
+                          label="Lines"
+                          value={storeFileContext.metrics.lineCount.toLocaleString()}
+                          accent="#94a3b8"
+                        />
+                        <StatPill
+                          icon={Code2}
+                          label="Logic"
+                          value={storeFileContext.metrics.codeLines.toLocaleString()}
+                          accent="#60a5fa"
+                        />
+                        <StatPill
+                          icon={Hash}
+                          label="Empty"
+                          value={storeFileContext.metrics.emptyLines}
+                          accent="#475569"
+                        />
+                        <StatPill
+                          icon={Cpu}
+                          label="Funcs"
+                          value={storeFileContext.analysis?.functionCount ?? 0}
+                          accent="#818cf8"
+                        />
+                        <StatPill
+                          icon={Box}
+                          label="Classes"
+                          value={storeFileContext.analysis?.classCount ?? 0}
+                          accent="#a78bfa"
+                        />
+                        <StatPill
+                          icon={Zap}
+                          label="Exports"
+                          value={
+                            storeFileContext.analysis?.exports?.length ?? 0
+                          }
+                          accent="#34d399"
+                        />
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-1.5">
+                        <StatPill
+                          icon={HardDrive}
+                          label="Size"
+                          value={`${(storeFileContext.size / 1024).toFixed(1)} KB`}
+                          accent="#60a5fa"
+                        />
+                        <StatPill
+                          icon={Hash}
+                          label="Depth"
+                          value={`Level ${storeFileContext.depth}`}
+                          accent="#64748b"
+                        />
                       </div>
                     )}
-                  </>
+                  </section>
 
-                  {/* File info */}
-                  <>
-                    <div className="flex items-center gap-1.5 mb-2">
-                      <Layers size={10} className="text-slate-700" />
-                      <span className="text-[9px] font-mono font-bold text-slate-700 uppercase tracking-widest">
-                        File Info
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-2 gap-1">
-                      <StatPill
-                        icon={HardDrive}
-                        label="Size"
-                        value={`${(storeFileContext.github.size / 1024).toFixed(1)} KB`}
-                        accent={
-                          storeFileContext.isLarge ? "#fb923c" : "#60a5fa"
-                        }
-                      />
-                      <StatPill
-                        icon={Hash}
-                        label="Depth"
-                        value={`L${storeFileContext.depth}`}
-                        accent="#64748b"
-                      />
-                      <StatPill
-                        icon={FileCode2}
-                        label="Ext"
-                        value={
-                          storeFileContext.ext
-                            ? `.${storeFileContext.ext}`
-                            : "none"
-                        }
-                        accent={fc?.color ?? "#94a3b8"}
-                      />
-                      <StatPill
-                        icon={Calendar}
-                        label="Modified"
-                        value={
-                          storeFileContext.latestCommit
-                            ? new Date(
-                                storeFileContext.latestCommit.date,
-                              ).toLocaleDateString()
-                            : "\u2014"
-                        }
-                        accent="#c084fc"
-                      />
-                    </div>
-                    <div className="mt-1">
-                      <StatPill
-                        icon={FolderTree}
-                        label="Path"
-                        value={storeFileContext.path}
-                        accent="#475569"
-                      />
-                    </div>
-                    {storeFileContext.isLarge && (
-                      <div
-                        className="mt-1 flex items-center gap-1.5 px-2 py-1.5 rounded-md border"
-                        style={{
-                          background: "rgba(251,146,60,0.03)",
-                          borderColor: "rgba(251,146,60,0.12)",
-                        }}
-                      >
-                        <div className="w-1 h-1 rounded-full bg-orange-400/70 animate-pulse" />
-                        <span className="text-[9px] text-orange-400/70">
-                          Large file — exceeds 500 KB
-                        </span>
+                  {/* Analysis Breakdown */}
+                  {storeFileContext.analysis && (
+                    <section>
+                      <div className="flex items-center gap-1.5 mb-3 px-1">
+                        <Terminal size={11} className="text-slate-400" />
+                        <h3 className="text-[10px] font-mono font-bold text-slate-400 uppercase tracking-[0.2em]">
+                          Deep Analysis
+                        </h3>
                       </div>
-                    )}
-                  </>
-
-                  {/* Contributors */}
-                  {storeFileContext.contributors.length > 0 && (
-                    <div>
-                      <div className="flex items-center gap-1.5 mb-2">
-                        <Users size={10} className="text-slate-700" />
-                        <span className="text-[9px] font-mono font-bold text-slate-700 uppercase tracking-widest">
-                          Contributors ({storeFileContext.contributors.length})
-                        </span>
-                      </div>
-                      <div className="space-y-1">
-                        {storeFileContext.contributors.slice(0, 4).map((c) => (
-                          <div
-                            key={c.email}
-                            className="flex items-center gap-2 px-2 py-1.5 rounded-md"
-                            style={{
-                              background: "rgba(255,255,255,0.02)",
-                              border: "1px solid rgba(255,255,255,0.03)",
-                            }}
-                          >
-                            {c.avatarUrl ? (
-                              <img
-                                src={c.avatarUrl}
-                                className="w-5 h-5 rounded-full border border-white/5 shrink-0"
-                                alt=""
-                              />
-                            ) : (
-                              <div className="w-5 h-5 rounded-full bg-slate-900 border border-slate-800 shrink-0 flex items-center justify-center">
-                                <span className="text-[8px] text-slate-600">
-                                  {c.name[0]}
+                      <div className="rounded-xl border border-white/5 bg-white/2 p-3 space-y-3">
+                        <div className="space-y-2">
+                          {[
+                            {
+                              label: "Component Logic",
+                              value: storeFileContext.analysis.logicType,
+                              color: "#60a5fa",
+                            },
+                            {
+                              label: "Resolved Imports",
+                              value:
+                                storeFileContext.resolvedImports?.length ?? 0,
+                              color: "#94a3b8",
+                            },
+                            {
+                              label: "Exposed Symbols",
+                              value:
+                                storeFileContext.analysis.exports?.length ?? 0,
+                              color: "#a78bfa",
+                            },
+                            {
+                              label: "Technical Debt",
+                              value: `${storeFileContext.analysis.todoComments?.length ?? 0} TODOs`,
+                              color:
+                                (storeFileContext.analysis.todoComments
+                                  ?.length ?? 0) > 0
+                                  ? "#fbbf24"
+                                  : "#334155",
+                            },
+                          ].map((item) => (
+                            <div
+                              key={item.label}
+                              className="flex items-center justify-between text-[11px]"
+                            >
+                              <span className="text-slate-500 font-medium font-mono lowercase">
+                                {item.label}
+                              </span>
+                              <div className="flex items-center gap-2">
+                                <div className="h-0.5 w-12 bg-slate-800 rounded-full overflow-hidden">
+                                  <div
+                                    className="h-full rounded-full"
+                                    style={{
+                                      background: item.color,
+                                      width:
+                                        typeof item.value === "string"
+                                          ? "100%"
+                                          : `${Math.min(100, (Number(item.value) || 0) * 10)}%`,
+                                      opacity: 0.3,
+                                    }}
+                                  />
+                                </div>
+                                <span
+                                  className="font-bold font-mono"
+                                  style={{ color: item.color }}
+                                >
+                                  {item.value}
                                 </span>
                               </div>
-                            )}
-                            <div className="flex-1 min-w-0">
-                              <div className="text-[10px] text-slate-300 font-medium truncate">
-                                {c.name}
-                              </div>
-                              <div className="text-[8px] text-slate-600 font-mono leading-none">
-                                {c.firstCommit.slice(0, 10)} →{" "}
-                                {c.lastCommit.slice(0, 10)}
-                              </div>
                             </div>
-                            <div className="text-[10px] font-mono font-bold text-slate-600 shrink-0">
-                              {c.commits}c
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Commit history */}
-                  {storeFileContext.commits.length > 0 && (
-                    <div>
-                      <div className="flex items-center gap-1.5 mb-2">
-                        <GitCommit size={10} className="text-slate-700" />
-                        <span className="text-[9px] font-mono font-bold text-slate-700 uppercase tracking-widest">
-                          History ({storeFileContext.commits.length})
-                        </span>
-                      </div>
-                      <div className="space-y-0.5">
-                        {storeFileContext.commits.slice(0, 5).map((c) => (
-                          <a
-                            key={c.sha}
-                            href={c.htmlUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="flex items-start gap-2 px-2 py-1.5 rounded-md transition-colors group"
-                            style={{
-                              border: "1px solid rgba(255,255,255,0.02)",
-                            }}
-                            onMouseEnter={(e) => {
-                              e.currentTarget.style.background =
-                                "rgba(255,255,255,0.035)";
-                            }}
-                            onMouseLeave={(e) => {
-                              e.currentTarget.style.background = "transparent";
-                            }}
-                          >
-                            <span className="text-[8px] font-mono text-slate-700 mt-0.5 shrink-0 group-hover:text-blue-500 transition-colors">
-                              {c.shortSha}
-                            </span>
-                            <div className="flex-1 min-w-0">
-                              <div className="text-[10px] text-slate-400 truncate leading-tight">
-                                {c.message.split("\n")[0]}
-                              </div>
-                              <div className="text-[8px] text-slate-700 mt-0.5 font-mono">
-                                {c.author} ·{" "}
-                                {new Date(c.date).toLocaleDateString()}
-                                {c.verified ? " ✓" : ""}
-                              </div>
-                            </div>
-                          </a>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* GitHub link */}
-                  <Link
-                    href={storeFileContext.github.htmlUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-[10px] font-mono transition-all"
-                    style={{
-                      color: "#475569",
-                      background: "rgba(255,255,255,0.02)",
-                      border: "1px solid rgba(255,255,255,0.05)",
-                    }}
-                    onMouseEnter={(e) => {
-                      e.currentTarget.style.color = "#60a5fa";
-                      e.currentTarget.style.borderColor =
-                        "rgba(96,165,250,0.18)";
-                      e.currentTarget.style.background =
-                        "rgba(255,255,255,0.04)";
-                    }}
-                    onMouseLeave={(e) => {
-                      e.currentTarget.style.color = "#475569";
-                      e.currentTarget.style.borderColor =
-                        "rgba(255,255,255,0.05)";
-                      e.currentTarget.style.background =
-                        "rgba(255,255,255,0.02)";
-                    }}
-                  >
-                    <Eye size={10} />
-                    View on GitHub
-                  </Link>
-                </div>
-              ) : (
-                /* Fallback when store not yet populated */
-                <div className="p-2.5 space-y-3.5">
-                  {activeFile.history && (
-                    <div className="pb-3 border-b border-white/5">
-                      <div className="flex items-center gap-1.5 mb-1.5">
-                        <GitCommit size={10} className="text-slate-600" />
-                        <span className="text-[9px] font-mono font-bold text-slate-600 uppercase tracking-widest">
-                          Last Commit
-                        </span>
-                      </div>
-                      <div
-                        className="flex items-start gap-2 rounded-md p-2 border"
-                        style={{
-                          background: "rgba(255,255,255,0.015)",
-                          borderColor: "rgba(255,255,255,0.04)",
-                        }}
-                      >
-                        {activeFile.history.author?.avatar_url && (
-                          <img
-                            src={activeFile.history.author.avatar_url}
-                            className="w-6 h-6 rounded-sm border border-white/5 shrink-0"
-                            alt="author"
-                          />
-                        )}
-                        <div className="min-w-0">
-                          <p className="text-[10px] text-slate-300 font-medium leading-tight line-clamp-2">
-                            {activeFile.history.commit.message}
-                          </p>
-                          <div className="flex items-center gap-2 mt-0.5">
-                            <span className="text-[9px] text-blue-400/80">
-                              {activeFile.history.commit.author.name}
-                            </span>
-                            <span className="text-[8px] text-slate-600 font-mono">
-                              {activeFile.history.sha?.slice(0, 7)}
-                            </span>
-                          </div>
+                          ))}
+                        </div>
+                        <div className="flex flex-wrap gap-1.5 pt-1">
+                          {storeFileContext.analysis.isReact && (
+                            <Badge color="#61dafb">React Component</Badge>
+                          )}
+                          {storeFileContext.analysis.isTypeScript && (
+                            <Badge color="#3b82f6">TypeScript</Badge>
+                          )}
+                          {storeFileContext.analysis.hasJsx && (
+                            <Badge color="#f472b6">JSX Enabled</Badge>
+                          )}
+                          {storeFileContext.analysis.isTest && (
+                            <Badge color="#34d399">Test Script</Badge>
+                          )}
+                          {storeFileContext.analysis.isConfig && (
+                            <Badge color="#fbbf24">Environment</Badge>
+                          )}
                         </div>
                       </div>
-                    </div>
+                    </section>
                   )}
-                  <div>
-                    <div className="flex items-center gap-1.5 mb-1.5">
-                      <Layers size={10} className="text-slate-600" />
-                      <span className="text-[9px] font-mono font-bold text-slate-600 uppercase tracking-widest">
-                        File Info
-                      </span>
+
+                  {/* Contributors */}
+                  {storeFileContext.contributors &&
+                    storeFileContext.contributors.length > 0 && (
+                      <section>
+                        <div className="flex items-center gap-1.5 mb-3 px-1">
+                          <Users size={11} className="text-slate-400" />
+                          <h3 className="text-[10px] font-mono font-bold text-slate-400 uppercase tracking-[0.2em]">
+                            Contributors
+                          </h3>
+                        </div>
+                        <div className="flex flex-col gap-2">
+                          {storeFileContext.contributors
+                            .slice(0, 5)
+                            .map((u: any, ix: number) => {
+                              const CardTag = u.profileUrl ? "a" : "div";
+                              return (
+                                <CardTag
+                                  key={u.name || ix}
+                                  {...(u.profileUrl
+                                    ? {
+                                        href: u.profileUrl,
+                                        target: "_blank",
+                                        rel: "noreferrer",
+                                      }
+                                    : {})}
+                                  className="flex items-center gap-2.5 p-2 rounded-lg border border-white/5 bg-white/1 hover:bg-white/3 transition-colors group cursor-pointer"
+                                >
+                                  {u.avatarUrl ? (
+                                    <img
+                                      src={u.avatarUrl}
+                                      className="w-7 h-7 rounded-lg border border-white/10"
+                                      alt=""
+                                    />
+                                  ) : (
+                                    <div className="w-7 h-7 rounded-lg bg-slate-800 flex items-center justify-center border border-white/5 text-slate-500">
+                                      <User size={12} />
+                                    </div>
+                                  )}
+                                  <div className="flex-1 min-w-0">
+                                    <div className="flex items-center justify-between">
+                                      <span className="text-[11px] font-bold text-slate-300 group-hover:text-blue-400 truncate transition-colors">
+                                        {u.name}
+                                      </span>
+                                      <span className="text-[10px] font-mono text-slate-500">
+                                        {u.commits} commits
+                                      </span>
+                                    </div>
+                                    <div className="h-1 w-full bg-slate-800 rounded-full mt-1.5 overflow-hidden">
+                                      <div
+                                        className="h-full bg-blue-500/40 rounded-full"
+                                        style={{
+                                          width: `${Math.min(100, (u.commits / (storeFileContext.contributors[0]?.commits || 1)) * 100)}%`,
+                                        }}
+                                      />
+                                    </div>
+                                  </div>
+                                </CardTag>
+                              );
+                            })}
+                        </div>
+                      </section>
+                    )}
+
+                  {/* History Timeline */}
+                  {storeFileContext.commits &&
+                    storeFileContext.commits.length > 0 && (
+                      <section>
+                        <div className="flex items-center gap-1.5 mb-3 px-1">
+                          <History size={11} className="text-slate-400" />
+                          <h3 className="text-[10px] font-mono font-bold text-slate-400 uppercase tracking-[0.2em]">
+                            Timeline
+                          </h3>
+                        </div>
+                        <div className="relative space-y-4 before:absolute before:inset-0 before:left-[11px] before:w-px before:bg-white/4">
+                          {storeFileContext.commits
+                            .slice(0, 6)
+                            .map((c: any, ix: number) => (
+                              <div
+                                key={c.sha || ix}
+                                className="relative pl-7 group"
+                              >
+                                <div className="absolute left-[8px] top-1.5 w-1.5 h-1.5 rounded-full bg-slate-700 ring-4 ring-gray-950 z-10 group-hover:bg-blue-500 transition-colors" />
+                                <div className="text-[11px] text-slate-400 group-hover:text-slate-200 transition-colors cursor-default">
+                                  {c.message}
+                                </div>
+                                <div className="flex items-center gap-2 mt-1">
+                                  <span className="text-[9px] font-bold text-blue-500/70 font-mono">
+                                    {c.shortSha}
+                                  </span>
+                                  <span className="text-[8px] text-slate-600 font-mono">
+                                    {new Date(c.date).toLocaleDateString()}
+                                  </span>
+                                </div>
+                              </div>
+                            ))}
+                        </div>
+                      </section>
+                    )}
+
+                  {/* Path & Technical Info */}
+                  <section className="pt-2">
+                    <div className="rounded-xl border border-dashed border-white/10 p-3 space-y-3 bg-black/20">
+                      <div className="flex flex-col gap-1.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-slate-600 uppercase tracking-widest font-bold text-[9px]">
+                            Repository Path
+                          </span>
+                          <button
+                            onClick={() => navigator.clipboard.writeText(storeFileContext.path)}
+                            className="text-slate-500 hover:text-blue-400 p-1 rounded hover:bg-white/5 transition-colors cursor-pointer"
+                            title="Copy path"
+                          >
+                            <Copy size={9} />
+                          </button>
+                        </div>
+                        <div className="text-[10px] text-slate-400 font-mono break-all p-2 rounded-lg bg-white/2 border border-white/5 leading-relaxed">
+                          {storeFileContext.path}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-between">
+                        <span className="text-slate-600 uppercase tracking-widest font-bold text-[9px]">
+                          Object Metadata
+                        </span>
+                        <div className="flex items-center gap-1.5 p-1 rounded bg-white/2 border border-white/5">
+                          <span className="text-[9px] font-bold text-slate-500 font-mono pl-1">
+                            SHA: {activeFile.node.sha?.slice(0, 8)}
+                          </span>
+                          <button
+                            onClick={() => navigator.clipboard.writeText(activeFile.node.sha ?? "")}
+                            className="text-slate-600 hover:text-blue-400 p-1 rounded hover:bg-white/5 transition-colors cursor-pointer"
+                            title="Copy SHA"
+                          >
+                            <Copy size={8} />
+                          </button>
+                        </div>
+                      </div>
+
+                      {storeRepoContext && (
+                        <a
+                          href={`${storeRepoContext.github?.htmlUrl}/blob/${storeRepoContext.meta?.defaultBranch}/${storeFileContext.path}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="flex items-center justify-center gap-2 w-full py-2.5 rounded-xl border border-white/5 bg-white/5 hover:bg-white/10 transition-all group cursor-pointer mt-1"
+                        >
+                          <span className="text-[10px] font-bold text-slate-400 group-hover:text-blue-100 uppercase tracking-widest transition-colors">
+                            View on GitHub
+                          </span>
+                          <ExternalLink size={10} className="text-slate-500 group-hover:text-blue-400 transition-colors" />
+                        </a>
+                      )}
                     </div>
-                    <div className="grid grid-cols-2 gap-1">
-                      <StatPill
-                        icon={HardDrive}
-                        label="Size"
-                        value={`${(activeFile.node.size / 1024).toFixed(1)} KB`}
-                        accent={
-                          activeFile.node.fileDetails?.isLarge
-                            ? "#fb923c"
-                            : "#60a5fa"
-                        }
-                      />
-                      <StatPill
-                        icon={Hash}
-                        label="Depth"
-                        value={`L${activeFile.node.fileDetails?.depth}`}
-                        accent="#64748b"
-                      />
-                      <StatPill
-                        icon={FileCode2}
-                        label="Ext"
-                        value={
-                          activeFile.node.ext
-                            ? `.${activeFile.node.ext}`
-                            : "none"
-                        }
-                        accent={fc?.color ?? "#94a3b8"}
-                      />
-                      <StatPill
-                        icon={Calendar}
-                        label="Modified"
-                        value={
-                          activeFile.history?.commit?.author?.date
-                            ? new Date(
-                                activeFile.history.commit.author.date,
-                              ).toLocaleDateString()
-                            : "—"
-                        }
-                        accent="#c084fc"
-                      />
+                  </section>
+                </div>
+              ) : (
+                <div className="flex-1 flex flex-col items-center justify-center p-8 gap-4 opacity-30">
+                  <div className="relative">
+                    <FileCode2 size={40} className="text-slate-700" />
+                    <div className="absolute -bottom-2 -right-2 p-1.5 rounded bg-blue-500/10 border border-blue-500/20">
+                      <Loader2 size={12} className="text-blue-500 animate-spin" />
                     </div>
-                    <div className="mt-1">
-                      <StatPill
-                        icon={FolderTree}
-                        label="Path"
-                        value={activeFile.node.fileDetails?.path ?? ""}
-                        accent="#475569"
-                      />
-                    </div>
+                  </div>
+                  <div className="text-center">
+                    <p className="text-[11px] font-mono text-slate-600 uppercase tracking-[0.2em] mb-1">
+                      Hydrating Metadata
+                    </p>
+                    <p className="text-[9px] text-slate-800 font-mono">
+                      Establishing connection to repository stream
+                    </p>
                   </div>
                 </div>
               )}

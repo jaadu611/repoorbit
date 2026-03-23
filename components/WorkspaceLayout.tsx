@@ -5,17 +5,7 @@ import Link from "next/link";
 import { TreePine, Orbit, Waypoints, Search, Cpu } from "lucide-react";
 import TreeView from "@/components/TreeView";
 import AiChat from "@/components/AiChat";
-import { FileNode } from "@/modes/TreeMapper";
-import { FullRepoData } from "@/app/workspace/page";
-
-interface WorkspaceLayoutProps {
-  repoUrl: string | undefined;
-  activeMode: string;
-  filter: string;
-  fullRepoData: FullRepoData | null;
-  treeRoot: FileNode | null;
-  error: string | null;
-}
+import { WorkspaceLayoutProps } from "@/lib/types";
 
 export default function WorkspaceLayout({
   repoUrl,
@@ -66,7 +56,7 @@ export default function WorkspaceLayout({
   return (
     <div
       id="workspace-viewport"
-      className="h-[92vh] w-full bg-[#05080f] text-gray-100 flex gap-3 overflow-hidden font-sans p-3 mx-auto"
+      className="h-[93.6vh] w-full bg-[#05080f] text-gray-100 flex gap-3 overflow-hidden font-sans p-3 mx-auto"
     >
       <section className="flex flex-col flex-1 min-h-0 bg-transparent">
         <header className="flex items-center gap-3 px-3 py-2 bg-gray-950 border border-gray-700/50 rounded-t-xl">
@@ -78,9 +68,9 @@ export default function WorkspaceLayout({
             <input
               key={`repo-input-${repoUrl}`}
               name="repo"
-              defaultValue={repoUrl?.replace("https://github.com/", "") || ""}
+              defaultValue={repoUrl || ""}
               type="text"
-              placeholder="Enter github repo url"
+              placeholder="owner/repo or github.com/owner/repo"
               className="flex-1 bg-transparent outline-none font-mono text-[13px] placeholder:text-slate-600"
             />
             <input type="hidden" name="mode" value={activeMode} />

@@ -1,28 +1,7 @@
-import { getRepoData } from "@/lib/github";
-import { FileNode, transformToTree } from "@/modes/TreeMapper";
-import type { RepoContext } from "@/lib/types";
+import { getRepoData, parseRepoInput } from "@/lib/github";
+import { transformToTree } from "@/modes/TreeMapper";
+import type { FileNode, FullRepoData } from "@/lib/types";
 import WorkspaceLayout from "@/components/WorkspaceLayout";
-
-export interface FullRepoData {
-  tree: any[];
-  readme: string;
-  metadata: {
-    name: string;
-    fullName: string;
-    owner: string;
-    avatar: string;
-    stars: number;
-    forks: number;
-    openIssues: number;
-    size: number;
-    pushedAt: string;
-    language: string;
-    license: string;
-    defaultBranch: string;
-    visibility: string;
-  };
-  repoContext: RepoContext;
-}
 
 export default async function Workspace({
   searchParams,
@@ -31,8 +10,18 @@ export default async function Workspace({
 }) {
   const params = await searchParams;
   const activeMode = (params.mode as string) || "tree";
-  const repoUrl = params.repo as string;
+  const rawRepo = params.repo as string | undefined;
   const filter = (params.filter as string) || "";
+
+  let repoUrl: string | undefined;
+  if (rawRepo) {
+    try {
+      const { owner, repo } = parseRepoInput(rawRepo);
+      repoUrl = `${owner}/${repo}`;
+    } catch {
+      repoUrl = rawRepo;
+    }
+  }
 
   let treeRoot: FileNode | null = null;
   let error: string | null = null;
@@ -40,21 +29,24 @@ export default async function Workspace({
 
   if (repoUrl) {
     try {
-      const cleanUrl = repoUrl.replace(/\/$/, "");
-      const [owner, repo] = cleanUrl
-        .replace("https://github.com/", "")
-        .split("/");
+      const { owner, repo } = parseRepoInput(repoUrl);
 
-      const { tree, metadata, readme, repoContext } = await getRepoData(
-        owner,
-        repo,
-      );
+      const {
+        tree,
+        metadata,
+        readme,
+        repoContext,
+        filesMetadata,
+        importGraph,
+      } = await getRepoData(owner, repo);
 
       fullRepoData = {
         tree,
         metadata,
         readme,
         repoContext,
+        filesMetadata,
+        importGraph,
       };
 
       treeRoot = transformToTree(tree, repo, metadata);

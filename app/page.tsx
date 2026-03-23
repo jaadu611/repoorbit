@@ -14,7 +14,7 @@ const Page = () => {
   return (
     <div className="w-full bg-gray-900">
       <div className="relative w-full px-6 py-20 md:py-24 overflow-hidden flex items-center">
-        {/* Background Grids */}
+        {}
         <div
           className="absolute inset-0 z-0"
           style={{
@@ -25,9 +25,9 @@ const Page = () => {
         <div className="absolute inset-0 z-0 bg-linear-to-b from-gray-900 via-transparent to-gray-900" />
         <div className="absolute inset-0 z-0 bg-linear-to-r from-gray-900 via-transparent to-gray-900" />
 
-        {/* Hero Content */}
+        {}
         <section className="relative z-10 w-full max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-12 lg:gap-16">
-          {/* left */}
+          {}
           <div className="flex flex-col items-center md:items-start flex-1 text-center md:text-left">
             <h1 className="text-gray-100 text-5xl lg:text-6xl xl:text-7xl font-black tracking-tighter leading-none md:leading-[0.95]">
               Visualize your <br />
@@ -40,7 +40,7 @@ const Page = () => {
               of a codebase into a visual map so you don't go insane
             </p>
 
-            {/* Bottom stuff */}
+            {}
             <div className="mt-10 flex flex-wrap items-center justify-center md:justify-start gap-2 md:gap-4 border-t border-gray-800/60 pt-8 w-full">
               <div className="flex items-center gap-2 border-2 border-gray-600 px-3 py-2 rounded-full">
                 <LockOpen
@@ -73,7 +73,7 @@ const Page = () => {
             </div>
           </div>
 
-          {/* right */}
+          {}
           <div className="flex-1 w-full max-w-xl lg:max-w-2xl">
             <div className="rounded-2xl border border-gray-700 bg-gray-800/40 p-3 backdrop-blur-xl shadow-2xl">
               <div className="rounded-lg overflow-hidden">
@@ -88,7 +88,7 @@ const Page = () => {
         </section>
       </div>
 
-      {/* sections */}
+      {}
       {sectionData.map(
         ({
           id,
@@ -114,7 +114,7 @@ const Page = () => {
             <div className="flex-1 w-full max-w-xl lg:max-w-2xl group">
               <div className="relative">
                 <div className="relative rounded-2xl border border-gray-700 bg-gray-800/40 p-3 backdrop-blur-xl shadow-2xl">
-                  {/* placeholder */}
+                  {}
                   <img
                     className="w-full h-auto opacity-90"
                     src={imageSrc}
@@ -147,7 +147,7 @@ const Page = () => {
         ),
       )}
 
-      {/* final section befoore footer */}
+      {}
       <section className="relative z-10 w-full max-w-7xl mx-auto px-6 py-24 flex flex-col items-center text-center border-t-2 border-gray-800">
         <div className="flex flex-col items-center max-w-4xl">
           <h2 className="text-gray-100 text-5xl md:text-8xl font-black tracking-tighter">
@@ -170,7 +170,7 @@ const Page = () => {
 
       <footer className="relative z-10 w-full max-w-7xl mx-auto px-6 py-12 border-t border-gray-800">
         <div className="flex flex-col md:flex-row justify-between items-start gap-12">
-          {/* Left Side */}
+          {}
           <div className="flex flex-col gap-4">
             <div className="flex items-center gap-2">
               <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center">
@@ -186,7 +186,7 @@ const Page = () => {
             </p>
           </div>
 
-          {/* Right Side */}
+          {}
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-12 md:gap-24">
             <div className="flex flex-col gap-4">
               <h4 className="text-gray-100 font-bold text-sm uppercase tracking-widest">
@@ -244,7 +244,7 @@ const Page = () => {
           </p>
 
           <div className="flex items-center gap-6 text-gray-500">
-            {/* i dont have these */}
+            {}
             <span className="hover:text-white cursor-pointer transition-colors text-xs font-bold uppercase tracking-widest">
               Twitter
             </span>
