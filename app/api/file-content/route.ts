@@ -1,5 +1,4 @@
-import { getCachedFiles } from "@/lib/serverCache";
-import { parseRepoInput, fetchCommitsForPath } from "@/lib/github";
+import { parseRepoInput, fetchCommitsForPath, fetchFileContent, analyzeFile, parseImports } from "@/lib/github";
 import { CommitDetail } from "@/lib/types";
 
 export async function GET(req: Request) {
@@ -11,17 +10,26 @@ export async function GET(req: Request) {
     return new Response("Missing repo or path param", { status: 400 });
   }
 
-  const cached = getCachedFiles(repo);
-  if (!cached) {
-    return new Response("Repo not cached — please re-index", { status: 404 });
-  }
-
-  const file = cached.files.get(filePath);
-  if (!file) {
-    return new Response("File not found in cache", { status: 404 });
-  }
-
   const { owner, repo: repoName } = parseRepoInput(repo);
+  
+  // Real-time fetch directly from GitHub API
+  const content = await fetchFileContent(owner, repoName, filePath);
+  if (content === null) {
+    return new Response("File not found on GitHub", { status: 404 });
+  }
+
+  // Analyze the file metrics on the fly for the UI
+  const filename = filePath.split("/").pop() ?? filePath;
+  const analysis = analyzeFile(filename, content);
+  const imports = parseImports(content);
+  const metrics = {
+    lineCount: analysis.lineCount,
+    codeLines: analysis.codeLines,
+    emptyLines: analysis.emptyLines,
+    commentLines: analysis.commentLines,
+    charCount: analysis.charCount,
+  };
+
   const commits = await fetchCommitsForPath(owner, repoName, filePath);
 
   // Derive contributors from commits for this specific file
@@ -51,11 +59,11 @@ export async function GET(req: Request) {
   );
 
   return Response.json({
-    path: file.path,
-    content: file.content,
-    analysis: file.analysis,
-    metrics: file.metrics,
-    imports: file.imports,
+    path: filePath,
+    content,
+    analysis,
+    metrics,
+    imports,
     commits,
     contributors,
     latestCommit: commits[0] ?? null,

@@ -1,118 +1,40 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback, ReactNode } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { Cpu, Send, Loader2, Github, Square, Trash2 } from "lucide-react";
 import { useSelectionStore } from "@/lib/store";
 import { FullRepoData } from "@/lib/types";
+import ReactMarkdown from "react-markdown";
 
 interface AiChatProps {
   repoData: FullRepoData;
 }
 
-type IndexStatus = "idle" | "indexing" | "embedding" | "ready" | "failed";
-
 const AiChat = ({ repoData }: AiChatProps) => {
-  const [messages, setMessages] = useState<
-    { role: string; content: ReactNode }[]
-  >([]);
+  const [messages, setMessages] = useState<{ role: string; content: string }[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [indexStatus, setIndexStatus] = useState<IndexStatus>("idle");
-  const [indexProgress, setIndexProgress] = useState(0);
-  const [embeddingProgress, setEmbeddingProgress] = useState(0);
-  const [embeddingTotal, setEmbeddingTotal] = useState(0);
-
+  const [currentStatus, setCurrentStatus] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const { repoContext: repoCtx } = useSelectionStore((s) => s.selection);
   const setRepoContext = useSelectionStore((s) => s.setRepoContext);
-  const addFileMetadata = useSelectionStore((s) => s.addFileMetadata);
-  const filesMetadata = useSelectionStore((s) => s.filesMetadata);
 
   useEffect(() => {
     if (repoData.repoContext) setRepoContext(repoData.repoContext);
   }, [repoData.repoContext, setRepoContext]);
 
-  useEffect(() => {
-    if (!repoData.tree?.length || indexStatus !== "idle") return;
-
-    const startIndexing = async () => {
-      setIndexStatus("indexing");
-      setIndexProgress(0);
-
-      try {
-        const response = await fetch("/api/index", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            owner: repoData.metadata.owner,
-            repo: repoData.metadata.name,
-            repoFullName:
-              repoData.repoContext?.meta.fullName ??
-              `${repoData.metadata.owner}/${repoData.metadata.name}`,
-            tree: repoData.tree,
-            pushedAt: repoData.repoContext?.meta.pushedAt ?? "",
-            defaultBranch: repoData.metadata.defaultBranch,
-          }),
-        });
-
-        if (!response.ok) throw new Error("Connection failed");
-
-        const reader = response.body?.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-        if (!reader) return;
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            const data = JSON.parse(line);
-
-            if (data.type === "file_data") {
-              addFileMetadata(data.file);
-            }
-
-            if (data.type === "progress") {
-              setIndexProgress(data.percentage);
-            }
-
-            if (data.type === "embedding_start") {
-              setIndexStatus("embedding");
-              setEmbeddingTotal(data.total);
-              setEmbeddingProgress(0);
-            }
-
-            if (data.type === "embedding_progress") {
-              setEmbeddingProgress(data.percentage ?? 0);
-            }
-
-            if (data.type === "done") {
-              setIndexStatus("ready");
-              setIndexProgress(100);
-              setEmbeddingProgress(100);
-            }
-
-            if (data.type === "error") {
-              throw new Error(data.message);
-            }
-          }
-        }
-      } catch (error) {
-        console.error("Streaming error:", error);
-        setIndexStatus("failed");
-      }
-    };
-
-    startIndexing();
-  }, [repoData.tree, repoData.metadata, repoData.repoContext]);
+  const stopAll = useCallback(() => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setIsLoading(false);
+    setCurrentStatus(null);
+  }, []);
 
   const handleSend = useCallback(
     async (e?: React.FormEvent) => {
@@ -127,74 +49,116 @@ const AiChat = ({ repoData }: AiChatProps) => {
         { role: "assistant", content: "" },
       ]);
       setIsLoading(true);
+      setCurrentStatus("Starting architect engine...");
 
       const controller = new AbortController();
       abortControllerRef.current = controller;
 
       try {
-        const response = await fetch("/api/chat", {
+        // 1. Start the Job
+        const startResponse = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             query: userMessage,
             repoContext: repoCtx ?? repoData.repoContext,
+            owner: repoData.metadata.owner,
+            repo: repoData.metadata.name,
+            tree: repoData.tree,
+            defaultBranch: repoData.metadata.defaultBranch,
           }),
           signal: controller.signal,
         });
 
-        if (!response.ok) throw new Error("API error");
-
-        const reader = response.body?.getReader();
-        const decoder = new TextDecoder();
-        let accumulated = "";
-        let buffer = "";
-
-        while (true) {
-          const { value, done } = await reader!.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            try {
-              const parsed = JSON.parse(line);
-              const text: string = parsed.response ?? "";
-              if (text) {
-                accumulated += text;
-                setMessages((prev) => {
-                  const updated = [...prev];
-                  updated[updated.length - 1] = {
-                    ...updated[updated.length - 1],
-                    content: accumulated,
-                  };
-                  return updated;
-                });
-              }
-            } catch {}
-          }
+        if (!startResponse.ok) {
+          const data = await startResponse.json();
+          throw new Error(data.error || "API error");
         }
+
+        const { taskId } = await startResponse.json();
+
+        // 2. Poll for Completion
+        pollIntervalRef.current = setInterval(async () => {
+          if (controller.signal.aborted) {
+            clearInterval(pollIntervalRef.current!);
+            pollIntervalRef.current = null;
+            return;
+          }
+
+          try {
+            const pollResponse = await fetch(`/api/chat?taskId=${taskId}`, {
+              signal: controller.signal,
+            });
+            const job = await pollResponse.json();
+
+            // Show real automator milestone if available
+            if (job.statusText) {
+              setCurrentStatus(job.statusText);
+            }
+
+            if (job.status === "done") {
+              clearInterval(pollIntervalRef.current!);
+              pollIntervalRef.current = null;
+              abortControllerRef.current = null;
+              setMessages((prev) => {
+                const updated = [...prev];
+                updated[updated.length - 1] = {
+                  ...updated[updated.length - 1],
+                  content: job.result,
+                };
+                return updated;
+              });
+              setIsLoading(false);
+              setCurrentStatus(null);
+            } else if (job.status === "error") {
+              clearInterval(pollIntervalRef.current!);
+              pollIntervalRef.current = null;
+              abortControllerRef.current = null;
+              const errMsg = job.error || "Generation failed";
+              setMessages((prev) => {
+                const updated = [...prev];
+                updated[updated.length - 1] = {
+                  role: "assistant",
+                  content: `⚠️ Error: ${errMsg}`,
+                };
+                return updated;
+              });
+              setIsLoading(false);
+              setCurrentStatus(null);
+            }
+          } catch (pollErr: any) {
+            if (pollErr.name !== "AbortError") {
+              console.error("Polling error:", pollErr);
+              clearInterval(pollIntervalRef.current!);
+              pollIntervalRef.current = null;
+              abortControllerRef.current = null;
+              setIsLoading(false);
+              setCurrentStatus(null);
+            }
+          }
+        }, 3000);
+
       } catch (err: any) {
         if (err?.name !== "AbortError") {
-          setMessages((prev) => [
-            ...prev,
-            {
+          abortControllerRef.current = null;
+          setMessages((prev) => {
+            const updated = [...prev];
+            updated[updated.length - 1] = {
               role: "assistant",
-              content: "⚠️ Connection error. Is Ollama running?",
-            },
-          ]);
+              content: `⚠️ Error: ${err.message}`,
+            };
+            return updated;
+          });
+          setIsLoading(false);
+          setCurrentStatus(null);
         }
-      } finally {
-        abortControllerRef.current = null;
-        setIsLoading(false);
       }
     },
-    [input, isLoading, repoCtx, repoData.repoContext],
+    [input, isLoading, repoCtx, repoData, stopAll],
   );
 
   const handleStop = () => {
-    abortControllerRef.current?.abort();
-    setIsLoading(false);
+    stopAll();
   };
 
   const handleClear = () => {
@@ -203,20 +167,6 @@ const AiChat = ({ repoData }: AiChatProps) => {
   };
 
   const repoName = repoCtx?.meta.name ?? repoData.metadata.name;
-
-  const emptyStateText =
-    indexStatus === "indexing"
-      ? "Indexing files…"
-      : indexStatus === "embedding"
-        ? "Building embeddings… you can ask questions now."
-        : indexStatus === "ready"
-          ? `${filesMetadata.length} files indexed — ask anything.`
-          : indexStatus === "failed"
-            ? "Indexing failed. Try reloading."
-            : "Ask anything about the repo.";
-
-  const isProcessing =
-    indexStatus === "indexing" || indexStatus === "embedding";
 
   return (
     <div className="w-72 shrink-0 flex flex-col bg-gray-900 border border-gray-700 rounded-xl overflow-hidden h-full shadow-2xl">
@@ -233,53 +183,10 @@ const AiChat = ({ repoData }: AiChatProps) => {
         </span>
       </div>
 
-      {isProcessing && (
-        <div className="px-3 py-1.5 border-b border-gray-800 bg-gray-950/30 space-y-1.5">
-          {/* Indexing bar */}
-          <div>
-            <div className="flex items-center justify-between mb-0.5">
-              <span className="text-[9px] font-mono text-slate-500">
-                {indexStatus === "indexing" ? "Indexing files" : "Indexing"}
-              </span>
-              <span className="text-[9px] font-mono text-slate-500">
-                {indexProgress}%
-              </span>
-            </div>
-            <div className="h-0.5 w-full bg-gray-800 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-blue-500 transition-all duration-300"
-                style={{ width: `${indexProgress}%` }}
-              />
-            </div>
-          </div>
-
-          {/* Embedding bar — shows once embedding starts */}
-          {indexStatus === "embedding" && (
-            <div>
-              <div className="flex items-center justify-between mb-0.5">
-                <span className="text-[9px] font-mono text-slate-500">
-                  Building embeddings
-                </span>
-                <span className="text-[9px] font-mono text-purple-400">
-                  {embeddingProgress}%
-                  {embeddingTotal > 0 ? ` of ${embeddingTotal}` : ""}
-                </span>
-              </div>
-              <div className="h-0.5 w-full bg-gray-800 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-purple-500 transition-all duration-500"
-                  style={{ width: `${embeddingProgress}%` }}
-                />
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
       <div className="flex-1 overflow-y-auto p-3 space-y-3">
         {messages.length === 0 && (
           <p className="text-[10px] font-mono text-slate-600 text-center mt-6 leading-relaxed">
-            {emptyStateText}
+            Generate NotebookLM context here.
           </p>
         )}
         {messages.map((msg, i) => (
@@ -288,14 +195,43 @@ const AiChat = ({ repoData }: AiChatProps) => {
             className={`flex flex-col ${msg.role === "user" ? "items-end" : "items-start"}`}
           >
             <div
-              className={`max-w-[92%] p-2.5 rounded-lg text-[10px] font-mono leading-normal overflow-auto whitespace-pre-wrap ${
+              className={`max-w-[92%] p-2.5 rounded-lg text-[10px] font-mono leading-relaxed overflow-auto ${
                 msg.role === "user"
-                  ? "bg-blue-600/10 border border-blue-500/20 text-blue-100"
+                  ? "bg-blue-600/10 border border-blue-500/20 text-blue-100 whitespace-pre-wrap"
                   : "bg-slate-900/50 border border-slate-800 text-slate-300"
               }`}
             >
-              {msg.content === "" && isLoading ? (
-                <Loader2 size={11} className="animate-spin" />
+              {msg.role === "assistant" && msg.content === "" && isLoading ? (
+                <div className="flex items-center gap-2 text-slate-400">
+                  <Loader2 size={11} className="animate-spin text-blue-500" />
+                  <span className="animate-pulse">{currentStatus || "Thinking..."}</span>
+                </div>
+              ) : msg.role === "assistant" ? (
+                <ReactMarkdown
+                  components={{
+                    p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
+                    h1: ({ children }) => <h1 className="font-bold text-[11px] text-slate-100 mt-3 mb-1">{children}</h1>,
+                    h2: ({ children }) => <h2 className="font-bold text-[11px] text-slate-100 mt-3 mb-1">{children}</h2>,
+                    h3: ({ children }) => <h3 className="font-semibold text-[10px] text-slate-200 mt-2 mb-1">{children}</h3>,
+                    ul: ({ children }) => <ul className="list-disc list-inside space-y-0.5 mb-2 pl-1">{children}</ul>,
+                    ol: ({ children }) => <ol className="list-decimal list-inside space-y-0.5 mb-2 pl-1">{children}</ol>,
+                    li: ({ children }) => <li className="text-slate-300">{children}</li>,
+                    code: ({ inline, children }: any) =>
+                      inline ? (
+                        <code className="bg-slate-800 text-blue-300 px-1 py-0.5 rounded text-[9px]">{children}</code>
+                      ) : (
+                        <pre className="bg-slate-800/80 border border-slate-700 rounded p-2 mt-1 mb-2 overflow-x-auto">
+                          <code className="text-[9px] text-blue-200 whitespace-pre">{children}</code>
+                        </pre>
+                      ),
+                    strong: ({ children }) => <strong className="text-slate-100 font-semibold">{children}</strong>,
+                    blockquote: ({ children }) => (
+                      <blockquote className="border-l-2 border-blue-500/50 pl-2 my-1 text-slate-400 italic">{children}</blockquote>
+                    ),
+                  }}
+                >
+                  {msg.content as string}
+                </ReactMarkdown>
               ) : (
                 msg.content
               )}
@@ -323,13 +259,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             disabled={isLoading}
-            placeholder={
-              indexStatus === "indexing"
-                ? `Indexing… (${indexProgress}%)`
-                : indexStatus === "embedding"
-                  ? "Embedding in background…"
-                  : `Ask about ${repoName}`
-            }
+            placeholder={isLoading ? "Generating context..." : "Ask to generate context..."}
             className="w-full bg-gray-950 border border-gray-700 text-[10px] font-mono text-slate-300 pl-3 pr-8 py-2 rounded-lg outline-none focus:border-blue-500/40 transition-all disabled:opacity-50"
           />
           {isLoading ? (

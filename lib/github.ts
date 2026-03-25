@@ -155,6 +155,70 @@ export async function fetchCommitsForPath(
   }
 }
 
+export async function fetchFileContent(owner: string, repo: string, path: string, ref = "main"): Promise<string | null> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${ref}`;
+  try {
+    const res = await fetch(url, {
+      headers: { ...getHeaders(), Accept: "application/vnd.github.raw" },
+      ...noCache,
+    });
+    if (!res.ok) return null;
+    return await res.text();
+  } catch {
+    return null;
+  }
+}
+
+export function parseImports(content: string): string[] {
+  const results: string[] = [];
+  const importRegex = /(?:import|from)\s+['"]([^'"]+)['"]/g;
+  const requireRegex = /require\(['"]([^'"]+)['"]\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = importRegex.exec(content)) !== null) results.push(m[1]);
+  while ((m = requireRegex.exec(content)) !== null) results.push(m[1]);
+  return results.filter((i) => i.startsWith(".") || i.startsWith("/"));
+}
+
+export function analyzeFile(filename: string, content: string) {
+  const lines = content.split("\n");
+  const functionCount = (content.match(/\bfunction\b|\b=>\s*[{(]/g) ?? []).length;
+  const classCount = (content.match(/\bclass\s+\w+/g) ?? []).length;
+  const isReact = /import\s+.*React|from\s+['"]react['"]/.test(content);
+  const isTest = /\.(test|spec)\.[a-z]+$/.test(filename) || /describe\(|it\(|test\(/.test(content);
+  const isConfig = /config|\.env|rc\b/.test(filename.toLowerCase());
+  const isTypeScript = /\.(ts|tsx)$/.test(filename);
+  const hasJsx = /\.(tsx|jsx)$/.test(filename) || /<[A-Z][A-Za-z0-9]*\s*\/?>/.test(content);
+
+  const exportMatches = content.matchAll(
+    /export\s+(?:default\s+)?(?:async\s+)?(?:(function|class|type|interface|enum)\s+(\w+)|const\s+(\w+)\s*=)/g,
+  );
+  const exportsLine = [...exportMatches].map((m) => (m[2] ?? m[3] ?? "").trim()).filter(Boolean);
+
+  const todoComments = (content.match(/\/\/.*TODO:?.*$|#.*TODO:?.*$/gm) ?? []).map((t: string) => t.replace(/^\s*\/\/\s*|^\s*#\s*/, ""));
+
+  const commentLines = lines.filter((l) => /^\s*(\/\/|#|\/\*)/.test(l)).length;
+  const emptyLines = lines.filter((l) => !l.trim()).length;
+  const codeLines = lines.length - commentLines - emptyLines;
+
+  return {
+    exports: exportsLine,
+    todoComments,
+    functionCount,
+    classCount,
+    isReact,
+    isTest,
+    isConfig,
+    isTypeScript,
+    hasJsx,
+    lineCount: lines.length,
+    codeLines,
+    emptyLines,
+    commentLines,
+    charCount: content.length,
+    logicType: isTest ? "Test" : isConfig ? "Config" : isReact ? "React Logic" : "Core Logic",
+  };
+}
+
 export const getRepoData = async (owner: string, repo: string) => {
   const url = `https://api.github.com/repos/${owner}/${repo}`;
   const headers = getHeaders();

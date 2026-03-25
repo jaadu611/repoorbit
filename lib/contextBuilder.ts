@@ -1,14 +1,33 @@
-import { writeFileSync, mkdirSync } from "fs";
-import { dirname } from "path";
+import { mkdirSync } from "fs";
+import { writeFile } from "fs/promises";
+import { join } from "path";
 
-const IMPORT_DEPTH = 10;
-const FILE_CHAR_LIMIT = 120_000;
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const IMPORT_DEPTH = 999; // Effectively removed depth cap to cover everything
+const FILE_CHAR_LIMIT = 100_000;
 const SPLIT_THRESHOLD_CHARS = 3_000;
 const MIN_RELEVANCE_SCORE_GENERIC = 3;
 const MIN_RELEVANCE_SCORE_TARGETED = 15;
-const MAX_OUTPUT_CHARS = 4_000_000; // ~4MB safe limit for NotebookLM/Gemini
 
-const SOURCE_EXTENSIONS = new Set([
+/** Hard limits enforced by NotebookLM */
+const MAX_OUTPUT_FILES = 50; // 1 manifest + 49 source buckets
+const MAX_SOURCE_BUCKETS = MAX_OUTPUT_FILES - 1; // 49
+const WORD_LIMIT_PER_FILE = 450_000;
+/** Total word budget across all buckets */
+const TOTAL_WORD_BUDGET = MAX_SOURCE_BUCKETS * WORD_LIMIT_PER_FILE; // 22,050,000
+
+/**
+ * File priority tiers — controls what gets dropped when total content
+ * exceeds the 49-bucket word budget.
+ *
+ * Tier 1 (critical): always kept — root docs, key root configs
+ * Tier 2 (high):     always kept — all source code
+ * Tier 3 (medium):   dropped first when over budget — nested docs, yaml, html, json
+ * Tier 4 (low):      dropped second — CSS/SCSS/LESS, bulk deeply-nested data JSON
+ */
+const TIER1_EXTENSIONS = new Set(["md", "mdx", "json", "yaml", "yml", "toml"]);
+const TIER2_EXTENSIONS = new Set([
   "ts",
   "tsx",
   "js",
@@ -26,21 +45,71 @@ const SOURCE_EXTENSIONS = new Set([
   "cpp",
   "c",
   "h",
-  "css",
-  "scss",
-  "sass",
-  "less",
-  "html",
   "svelte",
   "vue",
-  "json",
-  "yaml",
-  "yml",
-  "toml",
   "sh",
   "bash",
   "zsh",
   "sql",
+]);
+const TIER3_EXTENSIONS = new Set(["html", "yaml", "yml", "toml"]);
+const TIER4_EXTENSIONS = new Set(["css", "scss", "sass", "less"]);
+
+/** Root-level config filenames always kept regardless of extension */
+const ROOT_CONFIG_NAMES = new Set([
+  "package.json",
+  "tsconfig.json",
+  "tsconfig.base.json",
+  "jsconfig.json",
+  "go.mod",
+  "go.sum",
+  "cargo.toml",
+  "cargo.lock",
+  "pyproject.toml",
+  "setup.py",
+  "setup.cfg",
+  "requirements.txt",
+  "gemfile",
+  "gemfile.lock",
+  "composer.json",
+  "makefile",
+  "dockerfile",
+  "docker-compose.yml",
+  "docker-compose.yaml",
+  ".eslintrc.json",
+  ".eslintrc.js",
+  "eslint.config.js",
+  "eslint.config.mjs",
+  ".prettierrc",
+  ".prettierrc.json",
+  "prettier.config.js",
+  "vite.config.ts",
+  "vite.config.js",
+  "next.config.ts",
+  "next.config.js",
+  "rollup.config.js",
+  "webpack.config.js",
+  "babel.config.js",
+  "babel.config.json",
+  "jest.config.ts",
+  "jest.config.js",
+  "vitest.config.ts",
+  "tailwind.config.ts",
+  "tailwind.config.js",
+  "turbo.json",
+  ".env.example",
+  ".env.sample",
+]);
+
+// All allowed extensions (superset)
+const SOURCE_EXTENSIONS = new Set([
+  ...TIER2_EXTENSIONS,
+  ...TIER4_EXTENSIONS,
+  "html",
+  "json",
+  "yaml",
+  "yml",
+  "toml",
   "md",
   "mdx",
 ]);
@@ -105,7 +174,6 @@ const STOP_WORDS = new Set([
   "library",
   "package",
   "tell",
-  "show",
   "give",
   "return",
   "returns",
@@ -115,8 +183,9 @@ const STOP_WORDS = new Set([
   "emits",
   "renders",
   "works",
-  "defined",
 ]);
+
+// ── Types ─────────────────────────────────────────────────────────────────────
 
 type ImportRole = "Entry Point" | `Depth ${number}` | "Utility";
 type QueryIntent =
@@ -143,29 +212,30 @@ interface ScoredFile {
   score: number;
 }
 
+interface Block {
+  group: string;
+  text: string;
+}
+
 export interface ExpertPlan {
   files?: string[];
   intents?: QueryIntent[];
   focus?: CodeFocus;
 }
 
-// ── Intent Detection ──────────────────────────────────────────────────────────
+// ── Intent & Focus Detection ──────────────────────────────────────────────────
 
 export function detectIntent(query: string): QueryIntent[] {
   const intents = new Set<QueryIntent>();
   const q = query.toLowerCase();
 
   if (/commit|contributed|push(ed)?/i.test(q)) intents.add("commits");
-
   if (/contribut(or|er|ion)|who (made|wrote|built|coded)|most active/i.test(q))
     intents.add("contributors");
-
   if (/branch(es)?|protected branch|default branch/i.test(q))
     intents.add("branches");
-
   if (/\bissue\b|bug report|ticket|open problem/i.test(q))
     intents.add("issues");
-
   if (/pull request|\bpr\b|merged?|code review/i.test(q)) intents.add("pulls");
 
   if (
@@ -178,7 +248,12 @@ export function detectIntent(query: string): QueryIntent[] {
     ) ||
     /tell me about (this|the) (repo|project|codebase)/i.test(q) ||
     /^(what|describe|summarize|explain)\b.{0,60}$/i.test(q) ||
-    /what does (this|the) repo (use|have|include|contain)/i.test(q)
+    /what does (this|the) repo (use|have|include|contain)/i.test(q) ||
+    /does (this|the) (repo|project).{0,40}(use|have|include|support)/i.test(
+      q,
+    ) ||
+    /is there (a|an).{0,40}(config|setup|file|docker|ci|test)/i.test(q) ||
+    /what.{0,20}(framework|library|tool|stack|bundler|linter)/i.test(q)
   )
     intents.add("repo_meta");
 
@@ -190,7 +265,6 @@ export function detectIntent(query: string): QueryIntent[] {
   )
     intents.add("tree");
 
-  // Test intent: queries specifically about tests
   if (
     /\btest(s|ing|ed)?\b|\bspec\b|\bsuite\b|\bit\(|describe\(|jest|vitest|mocha|cypress/i.test(
       q,
@@ -199,24 +273,12 @@ export function detectIntent(query: string): QueryIntent[] {
   )
     intents.add("test");
 
-  // Commit-specific queries that look like code questions but aren't
   if (
     /what (changed|was (changed|updated|modified|added|removed))/i.test(q) ||
     /latest (change|update|commit|diff)/i.test(q) ||
     /recent (change|update|commit)/i.test(q)
   )
     intents.add("commits");
-
-  // repo_meta queries about tooling/setup should NOT get code intent
-  // even though they mention specific tool names
-  const isToolingQuery =
-    /does (this|the) (repo|project).{0,40}(use|have|include|support)/i.test(
-      q,
-    ) ||
-    /is there (a|an).{0,40}(config|setup|file|docker|ci|test)/i.test(q) ||
-    /what.{0,20}(framework|library|tool|stack|bundler|linter)/i.test(q);
-
-  if (isToolingQuery) intents.add("repo_meta");
 
   const hasNonCodeIntent =
     intents.has("repo_meta") ||
@@ -231,33 +293,20 @@ export function detectIntent(query: string): QueryIntent[] {
     /how (does|do|is|are|works?)|implement|function|method|class|module|export|import|call(ed)?|logic|algorithm|where is|defined?|which files?|involved|used by|source/i.test(
       q,
     );
-
-  // camelCase symbol — but exclude single-word proper nouns like "React", "Docker"
   const hasCamelSymbol = /\b[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]+\b/.test(query);
-
   const hasSnakeSymbol = /\b[a-z][a-z0-9]*(_[a-z0-9]+){2,}\b/.test(query);
-
-  // Quoted symbol: 'reconcileChildren' or "reconcileChildren"
   const hasQuotedSymbol = /['"`]([a-zA-Z_$][a-zA-Z0-9_$]{2,})['"`]/.test(query);
-
-  // Explicit file path in query: src/foo/bar.ts
   const hasFilePath = /\b[\w-]+\/[\w-]+(\.[a-z]{1,5})?\b/.test(query);
 
-  // test intent always needs code (files) too
   if (intents.has("test")) intents.add("code");
 
-  const noOtherIntentMatched = intents.size === 0;
-
   if (
-    noOtherIntentMatched ||
+    !hasNonCodeIntent ||
     hasCodeKeyword ||
     hasCamelSymbol ||
     hasSnakeSymbol ||
     hasQuotedSymbol ||
-    hasFilePath ||
-    // only add code for non-code intents when there's an explicit code signal
-    // prevents "what is this repo about" from getting code
-    !hasNonCodeIntent
+    hasFilePath
   ) {
     intents.add("code");
   }
@@ -265,31 +314,20 @@ export function detectIntent(query: string): QueryIntent[] {
   return [...intents];
 }
 
-// ── Code Focus Detection ──────────────────────────────────────────────────────
-
 export function detectCodeFocus(query: string): CodeFocus {
   const q = query.toLowerCase();
-
-  // Broad architectural / conceptual questions → generic even if they contain
-  // a symbol, because the answer spans many files
   const isBroadQuestion =
     /how does .{0,40} (work|fit|connect|relate|interact)/i.test(q) ||
     /explain (the |how |what ).{0,60}/i.test(q) ||
     /walk me through/i.test(q) ||
     /architecture|overview|structure|system|pipeline|flow/i.test(q);
-
   if (isBroadQuestion) return "generic";
 
-  // Explicit symbol reference
   const hasSymbol =
     /\b[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]+\b/.test(query) ||
     /\b[a-z][a-z0-9]*(_[a-z0-9]+){2,}\b/.test(query) ||
     /['"`]([a-zA-Z_$][a-zA-Z0-9_$]{2,})['"`]/.test(query);
-
-  // Explicit file path
   const hasFilePath = /\b[\w-]+\/[\w-]+(\.[a-z]{1,5})?\b/.test(query);
-
-  // Targeted question patterns
   const hasFocusedVerb =
     /what does .{0,60} (do|return|take|accept|throw|emit|render)/i.test(q) ||
     /how (does|is) .{0,60} (work|called|used|imported|exported|defined)/i.test(
@@ -306,20 +344,15 @@ export function detectCodeFocus(query: string): CodeFocus {
   return hasSymbol || hasFilePath || hasFocusedVerb ? "targeted" : "generic";
 }
 
-// ── Token Extraction ──────────────────────────────────────────────────────────
-
 export function extractQueryTokens(query: string): string[] {
   const tokens = new Set<string>();
 
-  // Quoted symbols — highest priority, extracted verbatim
   const quoted = query.match(/['"`]([a-zA-Z_$][a-zA-Z0-9_$]{2,})['"`]/g) ?? [];
   for (const q of quoted) tokens.add(q.replace(/['"`]/g, ""));
 
-  // Explicit file paths
   const paths = query.match(/\b[\w-]+\/[\w-]+(\.[a-z]{1,5})?\b/g) ?? [];
   for (const p of paths) tokens.add(p);
 
-  // dot.notation chains: fiber.updateQueue → add whole + each part
   const dotChains = query.match(/\b[a-zA-Z_$][a-zA-Z0-9_$.]{3,}\b/g) ?? [];
   for (const chain of dotChains) {
     if (chain.includes(".")) {
@@ -330,15 +363,12 @@ export function extractQueryTokens(query: string): string[] {
     }
   }
 
-  // camelCase symbols
   const camel = query.match(/\b[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*\b/g) ?? [];
   for (const c of camel) tokens.add(c);
 
-  // snake_case symbols
   const snake = query.match(/\b[a-z][a-z0-9]*(_[a-z0-9]+){1,}\b/g) ?? [];
   for (const s of snake) tokens.add(s);
 
-  // Meaningful words — min length 2 (catches act, ref, map, key, ctx, jsx)
   const words = query
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, " ")
@@ -348,8 +378,6 @@ export function extractQueryTokens(query: string): string[] {
 
   return [...tokens];
 }
-
-// ── File Scoring ──────────────────────────────────────────────────────────────
 
 export function scoreFile(
   file: any,
@@ -361,7 +389,7 @@ export function scoreFile(
   if (!tokens.length) return 0;
 
   let score = 0;
-  const path = (file.path as string).toLowerCase();
+  const filePath = (file.path as string).toLowerCase();
   const exports: string[] = file.analysis?.exports ?? [];
   const imports: string[] = file.imports ?? [];
   const isTestFile =
@@ -369,53 +397,42 @@ export function scoreFile(
     /__tests__/.test(file.path) ||
     /\/tests?\//.test(file.path);
 
-  // Penalise test files for non-test queries and vice versa
   if (isTestFile && !isTestQuery) score -= 15;
   if (!isTestFile && isTestQuery) score -= 5;
 
-  // Scan full content, not just a preview
   const fullContent = (file.content ?? "").toLowerCase();
 
   for (const token of tokens) {
     const t = token.toLowerCase();
-
-    // Exact file path component match (e.g. token "useReducer" in "useReducer.ts")
     const pathBase =
-      path
+      filePath
         .split("/")
         .pop()
         ?.replace(/\.[^.]+$/, "") ?? "";
-    if (pathBase === t)
-      score += 30; // exact filename match — almost certainly the definition
-    else if (path.includes(t)) score += 5;
+    if (pathBase === t) score += 30;
+    else if (filePath.includes(t)) score += 5;
 
-    // Export exact match — this file defines the symbol
     if (exports.some((e) => e.toLowerCase() === t)) score += 20;
     else if (exports.some((e) => e.toLowerCase().includes(t))) score += 8;
 
-    // Import match — this file uses the symbol
     if (imports.some((i) => i.toLowerCase().includes(t))) score += 3;
 
-    // Full content occurrences — no preview cap
     const occurrences = (
       fullContent.match(new RegExp(`\\b${escapeRegex(t)}\\b`, "g")) ?? []
     ).length;
     score += Math.min(occurrences * 2, 30);
 
-    // Explicit file path token in query (e.g. "src/reconciler/fiber.ts")
-    if (token.includes("/") && path.includes(token.toLowerCase())) score += 50;
+    if (token.includes("/") && filePath.includes(token.toLowerCase()))
+      score += 50;
   }
 
-  // Import graph signals
   if (isImportQuery) {
-    // How many files import this file
     const importerCount = Object.values(importGraph).filter((deps) =>
       deps.some((d) => d.includes(file.path) || file.path.includes(d)),
     ).length;
     score += importerCount * 4;
   }
 
-  // Empty or near-empty file — likely a re-export barrel, reduce noise
   if ((file.metrics?.codeLines ?? 0) < 5) score = Math.floor(score * 0.4);
 
   return score;
@@ -424,13 +441,6 @@ export function scoreFile(
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
-
-// ── Dynamic File Limit (Removed) ──────────────────────────────────────────────
-
-// The computeFileLimit function was intentionally removed as we now rely on strict
-// relevance scoring to filter files rather than an arbitrary cap.
-
-// ── File Selection ────────────────────────────────────────────────────────────
 
 export function selectFilesForQuery(
   sourceFiles: any[],
@@ -443,17 +453,9 @@ export function selectFilesForQuery(
   if (focus === "generic" && !intents.includes("code")) {
     return { files: [], omittedCount: sourceFiles.length, omittedPaths: [] };
   }
-  
-  // For generic queries, if they only asked about repo\_meta/tree/etc.,
-  // they might still need broad codebase exposure if code intent fired.
-  // But we want to filter noise.
 
   const tokens = extractQueryTokens(query);
-  if (tokens.length === 0 && focus === "targeted") {
-    // Edge case: User typed a generic query like "what is this" that had NO meaningful tokens.
-    // It's impossible to do a "targeted" search without tokens. Fallback to generic relevance.
-    focus = "generic";
-  }
+  if (tokens.length === 0 && focus === "targeted") focus = "generic";
 
   const isImportQuery =
     /how many times|import(ed)?|usage|reference|occurrence|depend/i.test(query);
@@ -466,10 +468,11 @@ export function selectFilesForQuery(
 
   scored.sort((a, b) => b.score - a.score);
 
-  // Apply a dynamic threshold based on the focus.
-  const threshold = focus === "targeted" ? MIN_RELEVANCE_SCORE_TARGETED : MIN_RELEVANCE_SCORE_GENERIC;
+  const threshold =
+    focus === "targeted"
+      ? MIN_RELEVANCE_SCORE_TARGETED
+      : MIN_RELEVANCE_SCORE_GENERIC;
   const relevant = scored.filter((s) => s.score >= threshold);
-  
   const selected = relevant.map((s) => s.file);
   const omitted = scored
     .filter((s) => !selected.includes(s.file))
@@ -481,8 +484,6 @@ export function selectFilesForQuery(
     omittedPaths: omitted.slice(0, 20).map((f) => f.path),
   };
 }
-
-// ── Import Graph ──────────────────────────────────────────────────────────────
 
 function resolveImportDepths(
   seedPaths: string[],
@@ -515,12 +516,84 @@ function importRoleLabel(depth: number | undefined): ImportRole {
   return `Depth ${depth}`;
 }
 
-// ── File Filtering ────────────────────────────────────────────────────────────
+/** Returns 1-4 (tier) or 0 (exclude). Lower = higher priority. */
+function fileTier(filePath: string): number {
+  if (EXCLUDE_PATTERNS.some((re) => re.test(filePath))) return 0;
+
+  const parts = filePath.split("/");
+  const fileName = parts[parts.length - 1].toLowerCase();
+  const ext = fileName.split(".").pop() ?? "";
+
+  if (!SOURCE_EXTENSIONS.has(ext)) return 0;
+
+  // Tier 1: root-level readme/docs, key root configs
+  const isRoot = parts.length === 1;
+  const isShallowDoc = parts.length <= 2 && (ext === "md" || ext === "mdx");
+  const isKeyConfig = isRoot && ROOT_CONFIG_NAMES.has(fileName);
+  const isGitHubWorkflow = /^\.github\/workflows\//i.test(filePath);
+  if (isRoot || isShallowDoc || isKeyConfig || isGitHubWorkflow) return 1;
+
+  // Tier 2: all code files
+  if (TIER2_EXTENSIONS.has(ext)) return 2;
+
+  // Tier 3: nested docs, yaml, html, json (informative but lower priority than code)
+  if (
+    ext === "md" ||
+    ext === "mdx" ||
+    ext === "html" ||
+    ext === "yaml" ||
+    ext === "yml" ||
+    ext === "toml" ||
+    ext === "json"
+  )
+    return 3;
+
+  // Tier 4: CSS/SCSS/LESS (styling — rarely asked about in detail)
+  if (TIER4_EXTENSIONS.has(ext)) return 4;
+
+  return 0;
+}
 
 function shouldInclude(filePath: string): boolean {
-  if (EXCLUDE_PATTERNS.some((re) => re.test(filePath))) return false;
-  const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
-  return SOURCE_EXTENSIONS.has(ext);
+  return fileTier(filePath) > 0;
+}
+
+/**
+ * Selects which files to include given the total word budget.
+ * Always keeps Tier 1 + Tier 2. Drops Tier 4 then Tier 3 if over budget.
+ * Returns files with their tier attached for logging.
+ */
+function selectFilesByBudget(
+  candidates: any[],
+  estimateWords: (f: any) => number,
+): { files: any[]; droppedTiers: number[] } {
+  const withTier = candidates
+    .map((f) => ({ file: f, tier: fileTier(f.path) }))
+    .filter((x) => x.tier > 0);
+
+  // Always include tier 1 + 2
+  const mustInclude = withTier.filter((x) => x.tier <= 2).map((x) => x.file);
+  const tier3 = withTier.filter((x) => x.tier === 3).map((x) => x.file);
+  const tier4 = withTier.filter((x) => x.tier === 4).map((x) => x.file);
+
+  const wordsOf = (files: any[]) =>
+    files.reduce((s, f) => s + estimateWords(f), 0);
+
+  const droppedTiers: number[] = [];
+
+  let selected = [...mustInclude, ...tier3, ...tier4];
+  if (wordsOf(selected) > TOTAL_WORD_BUDGET) {
+    // Drop tier 4 first
+    selected = [...mustInclude, ...tier3];
+    droppedTiers.push(4);
+  }
+  if (wordsOf(selected) > TOTAL_WORD_BUDGET) {
+    // Drop tier 3 as well
+    selected = [...mustInclude];
+    droppedTiers.push(3);
+  }
+
+  return { files: selected, droppedTiers };
 }
 
 function isDocFile(filePath: string): boolean {
@@ -534,10 +607,7 @@ function isDocFile(filePath: string): boolean {
 function safeFileExt(file: any): string {
   const raw: unknown = file.ext;
   if (typeof raw !== "string" || raw.includes(".")) {
-    // ext was accidentally stored as full filename — extract real extension
-    const fromPath =
-      (file.path as string).split(".").pop()?.toLowerCase() ?? "";
-    return fromPath;
+    return (file.path as string).split(".").pop()?.toLowerCase() ?? "";
   }
   return raw.toLowerCase();
 }
@@ -548,12 +618,14 @@ function safeContent(file: any): string {
   return String(c);
 }
 
-// ── Directory Listing ─────────────────────────────────────────────────────────
+// ── Section Builders ──────────────────────────────────────────────────────────
 
-export function getDirectoryStructure(filesMetadata: any[], maxLines = 400): string {
+export function getDirectoryStructure(
+  filesMetadata: any[],
+  maxLines = 400,
+): string {
   const included = filesMetadata.filter((f) => shouldInclude(f.path));
 
-  // Build full nested tree instead of only first path segment
   type TreeNode = { files: string[]; children: Map<string, TreeNode> };
   const root: TreeNode = { files: [], children: new Map() };
 
@@ -562,9 +634,8 @@ export function getDirectoryStructure(filesMetadata: any[], maxLines = 400): str
     let node = root;
     for (let i = 0; i < parts.length - 1; i++) {
       const seg = parts[i];
-      if (!node.children.has(seg)) {
+      if (!node.children.has(seg))
         node.children.set(seg, { files: [], children: new Map() });
-      }
       node = node.children.get(seg)!;
     }
     node.files.push(parts[parts.length - 1]);
@@ -572,36 +643,7 @@ export function getDirectoryStructure(filesMetadata: any[], maxLines = 400): str
 
   const lines: string[] = [];
   let lineCount = 0;
-  let truncatedByLimit = false;
-
-  function render(node: TreeNode, indent: number, prefix: string) {
-    if (lineCount >= maxLines) {
-      truncatedByLimit = true;
-      return;
-    }
-
-    for (const f of node.files.sort()) {
-      if (lineCount >= maxLines) {
-        truncatedByLimit = true;
-        return;
-      }
-      lines.push(`${" ".repeat(indent)}${f}`);
-      lineCount++;
-    }
-
-    for (const [seg, child] of [...node.children.entries()].sort()) {
-      if (lineCount >= maxLines) {
-        truncatedByLimit = true;
-        return;
-      }
-      const count = countFiles(child);
-      lines.push(
-        `${" ".repeat(indent)}${seg}/  (${count} file${count !== 1 ? "s" : ""})`,
-      );
-      lineCount++;
-      render(child, indent + 2, `${prefix}${seg}/`);
-    }
-  }
+  let truncated = false;
 
   function countFiles(node: TreeNode): number {
     return (
@@ -610,14 +652,38 @@ export function getDirectoryStructure(filesMetadata: any[], maxLines = 400): str
     );
   }
 
-  render(root, 0, "");
-  if (truncatedByLimit) {
-    lines.push(`\n[TRUNCATED: Directory listing exceeds ${maxLines} lines. Ask for contents of specific subdirectories if needed.]`);
+  function render(node: TreeNode, indent: number) {
+    if (lineCount >= maxLines) {
+      truncated = true;
+      return;
+    }
+    for (const f of node.files.sort()) {
+      if (lineCount >= maxLines) {
+        truncated = true;
+        return;
+      }
+      lines.push(`${" ".repeat(indent)}${f}`);
+      lineCount++;
+    }
+    for (const [seg, child] of [...node.children.entries()].sort()) {
+      if (lineCount >= maxLines) {
+        truncated = true;
+        return;
+      }
+      const count = countFiles(child);
+      lines.push(
+        `${" ".repeat(indent)}${seg}/  (${count} file${count !== 1 ? "s" : ""})`,
+      );
+      lineCount++;
+      render(child, indent + 2);
+    }
   }
+
+  render(root, 0);
+  if (truncated)
+    lines.push(`\n[TRUNCATED: Directory listing exceeds ${maxLines} lines.]`);
   return lines.join("\n");
 }
-
-// ── Documentation ─────────────────────────────────────────────────────────────
 
 function docSortKey(filePath: string): string {
   const lower = filePath.toLowerCase();
@@ -633,12 +699,11 @@ export function getReadme(docFiles: any[], maxFiles = 5): string {
   const sorted = [...docFiles].sort((a, b) =>
     docSortKey(a.path).localeCompare(docSortKey(b.path)),
   );
-
   const limited = sorted.slice(0, maxFiles);
   const omitted = sorted.length - limited.length;
 
   const parts: string[] = [
-    `## Project Documentation\n\nIncluding ${limited.length} relevant documentation file${limited.length !== 1 ? "s" : ""}.${omitted > 0 ? ` Omitted ${omitted} secondary doc files to keep context concise.` : ""}`,
+    `## Project Documentation\n\nIncluding ${limited.length} documentation file${limited.length !== 1 ? "s" : ""}.${omitted > 0 ? ` Omitted ${omitted} secondary doc files.` : ""}`,
   ];
 
   for (const doc of limited) {
@@ -646,30 +711,22 @@ export function getReadme(docFiles: any[], maxFiles = 5): string {
     if (content.length > FILE_CHAR_LIMIT) {
       const cut = content.lastIndexOf("\n", FILE_CHAR_LIMIT);
       content =
-        content.slice(0, cut > 0 ? cut : FILE_CHAR_LIMIT) +
-        `\n\n[TRUNCATED: exceeds ${FILE_CHAR_LIMIT.toLocaleString()} characters.]`;
+        content.slice(0, cut > 0 ? cut : FILE_CHAR_LIMIT) + `\n\n[TRUNCATED]`;
     }
-    parts.push(
-      `### ${doc.path}\n\nDocumentation file: \`${doc.path}\`\n\n${content}`,
-    );
+    parts.push(`### ${doc.path}\n\n${content}`);
   }
   return parts.join("\n\n");
 }
 
-// ── Function Block Parser ─────────────────────────────────────────────────────
-
 function parseFunctionBlocks(content: string): FunctionBlock[] {
   const lines = content.split("\n");
   const blocks: FunctionBlock[] = [];
-
-  // Matches: export async function Foo / class Foo / const Foo = / @decorator\nclass Foo
   const startRe =
     /^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s*\*?\s*(\w+)|class\s+(\w+)|const\s+(\w+)\s*=|let\s+(\w+)\s*=|var\s+(\w+)\s*=)/;
   const decoratorRe = /^@\w+/;
 
   let i = 0;
   while (i < lines.length) {
-    // Skip decorator lines but remember them so the block starts there
     let decoratorStart: number | null = null;
     while (i < lines.length && decoratorRe.test(lines[i].trim())) {
       if (decoratorStart === null) decoratorStart = i;
@@ -695,9 +752,7 @@ function parseFunctionBlocks(content: string): FunctionBlock[] {
       let k = 0;
       while (k < line.length) {
         const ch = line[k];
-
         if (inString === "`") {
-          // Template literal — handle ${...} nesting
           if (ch === "\\") {
             k += 2;
             continue;
@@ -743,9 +798,7 @@ function parseFunctionBlocks(content: string): FunctionBlock[] {
               j++;
               break outer;
             }
-          }
-          // Arrow function with no braces: const x = () => expr
-          else if (
+          } else if (
             !hasOpenedBrace &&
             ch === "=" &&
             line[k + 1] === ">" &&
@@ -758,7 +811,7 @@ function parseFunctionBlocks(content: string): FunctionBlock[] {
         k++;
       }
       j++;
-      if (!hasOpenedBrace && j > i + 3) break; // give up on brace-less declarations
+      if (!hasOpenedBrace && j > i + 3) break;
     }
 
     const endLine = j - 1;
@@ -775,10 +828,7 @@ function parseFunctionBlocks(content: string): FunctionBlock[] {
   return blocks;
 }
 
-// ── Metadata Sections ─────────────────────────────────────────────────────────
-
 export function getRepoMeta(repoContext: any): string {
-  // Defensive access — repoContext.stack may be undefined
   const stack = repoContext?.stack ?? {};
   const meta = repoContext?.meta ?? {};
   const github = repoContext?.github ?? {};
@@ -790,7 +840,6 @@ export function getRepoMeta(repoContext: any): string {
       .slice(0, 5)
       .map((l: any) => `${l.lang} (${l.pct}%)`)
       .join(", ") || "unknown";
-
   const stackItems =
     [
       stack.hasTailwind ? "Tailwind CSS" : null,
@@ -860,9 +909,7 @@ export function getCommitHistory(repoContext: any): string {
 export function getBranches(repoContext: any): string {
   const branches = repoContext?.branches ?? [];
   if (!branches.length) return "";
-  return `## Branches\n\n${branches
-    .map((b: any) => `- ${b.name}${b.protected ? " (protected)" : ""}`)
-    .join("\n")}`;
+  return `## Branches\n\n${branches.map((b: any) => `- ${b.name}${b.protected ? " (protected)" : ""}`).join("\n")}`;
 }
 
 export function getIssues(repoContext: any): string {
@@ -898,9 +945,7 @@ export function getPulls(repoContext: any): string {
       `### PR #${p.number}: ${p.title} (${p.merged ? "merged" : p.state})\n`,
     );
     lines.push(
-      `Author: ${p.author ?? "unknown"}. Branch: ${p.headBranch} into ${p.baseBranch}. Opened: ${p.createdAt}.${
-        p.mergedAt ? ` Merged: ${p.mergedAt}.` : ""
-      }`,
+      `Author: ${p.author ?? "unknown"}. Branch: ${p.headBranch} into ${p.baseBranch}. Opened: ${p.createdAt}.${p.mergedAt ? ` Merged: ${p.mergedAt}.` : ""}`,
     );
     if (p.body)
       lines.push(
@@ -909,8 +954,6 @@ export function getPulls(repoContext: any): string {
   }
   return lines.join("\n");
 }
-
-// ── File Section Builder ──────────────────────────────────────────────────────
 
 export function getFileContext(
   file: any,
@@ -935,9 +978,7 @@ export function getFileContext(
     ? `It exports: ${exports.join(", ")}.`
     : "It has no named exports.";
   const importsStr = imports.length
-    ? `It imports from: ${imports.slice(0, 12).join(", ")}${
-        imports.length > 12 ? ` and ${imports.length - 12} more` : ""
-      }.`
+    ? `It imports from: ${imports.slice(0, 12).join(", ")}${imports.length > 12 ? ` and ${imports.length - 12} more` : ""}.`
     : "It has no imports.";
   const todosStr = todos.length ? ` TODOs: ${todos.join(" | ")}.` : "";
   const flagsStr = flags ? ` (${flags})` : "";
@@ -956,8 +997,6 @@ export function getFileContext(
   }
 
   const heading = `### ${file.path} (${role})`;
-
-  // Pure type/config/CSS files often have no parseable functions — emit as one block
   const isNonCodeFile = [
     "css",
     "scss",
@@ -1011,6 +1050,103 @@ export function getFileContext(
   return parts.join("\n");
 }
 
+// ── Two-Pass Packer ───────────────────────────────────────────────────────────
+
+function countWords(text: string): number {
+  return text.split(/\s+/).filter(Boolean).length;
+}
+
+/**
+ * Packs an ordered list of text blocks into at most MAX_SOURCE_BUCKETS (49) files.
+ * Each file is capped at WORD_LIMIT_PER_FILE words. No new files are created after
+ * the 49th bucket — remaining content is appended to the last bucket with a notice.
+ */
+async function packAndFlush(
+  blocks: Block[],
+  outDir: string,
+): Promise<string[]> {
+  mkdirSync(outDir, { recursive: true });
+
+  // Combine all text in insertion order
+  const allText = blocks.map((b) => b.text);
+
+  // Calculate a target words-per-bucket based on total content
+  const totalWords = allText.reduce((s, t) => s + countWords(t), 0);
+  // Never exceed the NotebookLM per-file word cap
+  const targetWordsPerBucket = Math.min(
+    Math.ceil(totalWords / MAX_SOURCE_BUCKETS),
+    WORD_LIMIT_PER_FILE,
+  );
+
+  const buckets: string[][] = [[]]; // each bucket is an array of text chunks
+  const bucketWords: number[] = [0];
+
+  for (const text of allText) {
+    const wc = countWords(text);
+    const curr = buckets.length - 1;
+
+    if (
+      buckets.length < MAX_SOURCE_BUCKETS &&
+      bucketWords[curr] + wc > targetWordsPerBucket
+    ) {
+      // Open a new bucket
+      buckets.push([text]);
+      bucketWords.push(wc);
+    } else {
+      // Append to current bucket (or overflow into last if at cap)
+      if (
+        buckets.length === MAX_SOURCE_BUCKETS &&
+        bucketWords[curr] === 0 &&
+        curr === 0
+      ) {
+        // Edge case: still on first bucket, just append
+      }
+      buckets[curr].push(text);
+      bucketWords[curr] += wc;
+    }
+  }
+
+  // Write buckets
+  const written: string[] = [];
+  for (let i = 0; i < buckets.length; i++) {
+    const paddedNum = String(i + 1).padStart(2, "0");
+    const fileName = `part_${paddedNum}.txt`;
+    const fullPath = join(outDir, fileName);
+    const content = buckets[i].join("\n\n");
+    await writeFile(fullPath, content, "utf-8");
+    written.push(fullPath);
+  }
+
+  return written;
+}
+
+// ── Manifest Builder ──────────────────────────────────────────────────────────
+
+function buildManifest(
+  fileCount: number,
+  repoName: string,
+  repoContext: any,
+  droppedTiers: number[],
+  totalSourceFiles: number,
+): string {
+  const timestamp = new Date().toISOString();
+  return [
+    `00_Repo_Manifest.txt — ${repoName}`,
+    `Generated: ${timestamp}`,
+    `Repository: ${repoContext?.meta?.fullName ?? repoName}`,
+    `Description: ${repoContext?.github?.description ?? "N/A"}`,
+    "",
+    `Mode: ${droppedTiers.length > 0 ? "BUDGET-CONSTRAINED (dropped tiers: " + droppedTiers.join(",") + ")" : "FULL (all source files)"}`,
+    `Total files considered: ${totalSourceFiles}`,
+    `Output files produced: ${fileCount} source buckets + this manifest = ${fileCount + 1} total`,
+    "",
+    `Each part_NN.txt contains source code organized alphabetically by directory.`,
+    `Upload all files (including this manifest) to NotebookLM as sources.`,
+    "",
+    "END OF MANIFEST",
+  ].join("\n");
+}
+
 // ── Main Export ───────────────────────────────────────────────────────────────
 
 export async function buildMasterContext(
@@ -1019,65 +1155,114 @@ export async function buildMasterContext(
   importGraph: Record<string, string[]>,
   repoContext: any,
   expertPlan?: ExpertPlan,
+  outputDir = "/tmp/notebooklm_sources",
+  dumpAll = true,
 ): Promise<string> {
   const repoName = repoContext?.meta?.fullName?.split("/").pop() ?? "repo";
   const safeQuery = query ? String(query) : "";
-  const intents = expertPlan?.intents ?? detectIntent(safeQuery);
-  const needsCode = intents.includes("code") || intents.includes("test") || (expertPlan?.files && expertPlan.files.length > 0);
-  const focus = expertPlan?.focus ?? (needsCode ? detectCodeFocus(safeQuery) : "generic");
-  const sections: string[] = [];
 
-  sections.push(
-    `# ${repoContext?.meta?.fullName ?? "Unknown"} — Codebase Master Context`,
-  );
-  sections.push(
-    `Generated: ${new Date().toISOString()}. Intents: [${intents.join(", ")}]. Focus: ${focus}.`,
+  const intents = dumpAll
+    ? ([
+        "code",
+        "repo_meta",
+        "contributors",
+        "commits",
+        "branches",
+        "issues",
+        "pulls",
+        "tree",
+      ] as QueryIntent[])
+    : (expertPlan?.intents ?? detectIntent(safeQuery));
+
+  const needsCode =
+    dumpAll ||
+    intents.includes("code") ||
+    intents.includes("test") ||
+    (expertPlan?.files && expertPlan.files.length > 0);
+
+  const focus = dumpAll
+    ? "generic"
+    : (expertPlan?.focus ??
+      (needsCode ? detectCodeFocus(safeQuery) : "generic"));
+
+  // ── Select files using tiered budget system ──────────────────────────────────
+  // Always keeps: Tier 1 (root docs + key configs) + Tier 2 (code).
+  // Drops Tier 4 (CSS) then Tier 3 (nested docs, yaml, json) only if needed to
+  // fit within the 49-bucket × 450 000-word budget.
+  const allCandidates = filesMetadata.filter(
+    (f) => f && typeof f.path === "string" && shouldInclude(f.path),
   );
 
-  // If it's a generic query or specifically asked for repo meta, include the meta section
-  if (focus === "generic" || intents.includes("repo_meta")) {
-    sections.push(getRepoMeta(repoContext));
+  // Estimate word count from char count (avg ~5 chars/word)
+  const estimateWords = (f: any) =>
+    Math.ceil((f.metrics?.charCount ?? f.content?.length ?? 0) / 5);
+
+  const { files: allIncluded, droppedTiers } = selectFilesByBudget(
+    allCandidates,
+    estimateWords,
+  );
+
+  if (droppedTiers.length > 0) {
+    const tierNames: Record<number, string> = {
+      3: "nested docs/yaml/json",
+      4: "CSS/SCSS/LESS",
+    };
   }
 
-  // Edge case: defensive check for malformed file objects
-  const allIncluded = filesMetadata.filter(
-    (f) => f && typeof f.path === "string" && shouldInclude(f.path)
-  );
   const docFiles = allIncluded.filter((f) => isDocFile(f.path));
   const sourceFiles = allIncluded.filter((f) => !isDocFile(f.path));
 
-  // Skip docs if targeted logic query, only include if repo meta asked
-  if (intents.includes("repo_meta") || focus === "generic") {
-    // For generic "about" questions, we only want the primary READMEs (max 3)
-    // If they explicitly asked for "readme" or "docs", we give more.
-    const isExplicitDocsRequest = /readme|doc(s|umentation)|wiki/i.test(query.toLowerCase());
-    const docsLimit = isExplicitDocsRequest ? 25 : 3;
-    const docsSection = getReadme(docFiles, docsLimit);
-    if (docsSection) sections.push(docsSection);
+  // ── Pass 1: Collect all text blocks ─────────────────────────────────────────
+  const blocks: Block[] = [];
+
+  const push = (group: string, text: string) => {
+    if (text.trim()) blocks.push({ group, text });
+  };
+
+  // Meta section
+  const metaLines: string[] = [];
+  metaLines.push(
+    `# ${repoContext?.meta?.fullName ?? "Unknown"} — Codebase Context`,
+  );
+  metaLines.push(
+    `Generated: ${new Date().toISOString()}. Mode: ${droppedTiers.length > 0 ? "budget-constrained" : "full"}.`,
+  );
+
+  if (dumpAll || focus === "generic" || intents.includes("repo_meta")) {
+    metaLines.push(getRepoMeta(repoContext));
+  }
+
+  if (dumpAll || intents.includes("repo_meta") || focus === "generic") {
+    const docsSection = getReadme(docFiles, dumpAll ? 5 : 3);
+    if (docsSection) metaLines.push(docsSection);
   }
 
   if (intents.includes("contributors")) {
     const s = getContributorsNames(repoContext);
-    if (s) sections.push(s);
+    if (s) metaLines.push(s);
   }
   if (intents.includes("commits")) {
     const s = getCommitHistory(repoContext);
-    if (s) sections.push(s);
+    if (s) metaLines.push(s);
   }
   if (intents.includes("branches")) {
     const s = getBranches(repoContext);
-    if (s) sections.push(s);
+    if (s) metaLines.push(s);
   }
   if (intents.includes("issues")) {
     const s = getIssues(repoContext);
-    if (s) sections.push(s);
+    if (s) metaLines.push(s);
   }
   if (intents.includes("pulls")) {
     const s = getPulls(repoContext);
-    if (s) sections.push(s);
+    if (s) metaLines.push(s);
   }
 
-  if (intents.includes("tree") || (intents.includes("repo_meta") && focus === "generic")) {
+  if (
+    dumpAll ||
+    intents.includes("tree") ||
+    (intents.includes("repo_meta") && focus === "generic")
+  ) {
     const extFreq = repoContext?.stats?.extFrequency ?? {};
     const extSummary = Object.entries(extFreq)
       .sort((a: any, b: any) => b[1] - a[1])
@@ -1085,17 +1270,15 @@ export async function buildMasterContext(
       .map(([ext, count]) => `.${ext}: ${count} files`)
       .join(", ");
 
-    // For generic overview, tree is limited to 200 lines. 
-    // If they explicitly asked for "structure" or "tree", we give 1000 lines.
-    const isExplicitTreeRequest = /tree|structure|folder|list files/i.test(query.toLowerCase());
-    const treeLimit = isExplicitTreeRequest ? 1000 : 200;
-
-    sections.push(
-      `## Directory Structure\n\n${sourceFiles.length} source files. Types: ${extSummary}.\n\n` +
-        getDirectoryStructure(filesMetadata, treeLimit),
+    metaLines.push(
+      `## Directory Structure\n\n${sourceFiles.length} source files${droppedTiers.length > 0 ? " (filtered by budget)" : ""}. Types: ${extSummary}.\n\n` +
+        getDirectoryStructure(filesMetadata, dumpAll ? 10000 : 200),
     );
   }
 
+  push("_meta", metaLines.join("\n\n"));
+
+  // Code section
   if (needsCode) {
     const allGraphPaths = new Set([
       ...Object.keys(importGraph),
@@ -1114,111 +1297,89 @@ export async function buildMasterContext(
       IMPORT_DEPTH,
     );
 
-    const {
-      files: selectedFiles,
-      omittedCount,
-      omittedPaths,
-    } = selectFilesForQuery(
-      sourceFiles,
-      query,
-      focus,
-      importGraph,
-      depthMap,
-      intents,
-    );
+    let sortedFiles: any[];
 
-    // If we have an expert plan with specific files, give them a massive score boost
-    // effectively ensuring they are included even if our basic scoring missed them.
-    if (expertPlan?.files) {
-      for (const f of expertPlan.files) {
-        const found = sourceFiles.find(sf => sf.path === f || sf.path.endsWith(f));
-        if (found && !selectedFiles.includes(found)) {
-          selectedFiles.push(found);
+    if (dumpAll) {
+      sortedFiles = [...sourceFiles].sort((a, b) =>
+        a.path.localeCompare(b.path),
+      );
+    } else {
+      const {
+        files: selectedFiles,
+        omittedCount,
+        omittedPaths,
+      } = selectFilesForQuery(
+        sourceFiles,
+        query,
+        focus,
+        importGraph,
+        depthMap,
+        intents,
+      );
+
+      if (expertPlan?.files) {
+        for (const f of expertPlan.files) {
+          const found = sourceFiles.find(
+            (sf) => sf.path === f || sf.path.endsWith(f),
+          );
+          if (found && !selectedFiles.includes(found))
+            selectedFiles.push(found);
         }
       }
-    }
 
-    const sortedFiles = [...selectedFiles].sort((a, b) => {
-      const da = depthMap.get(a.path) ?? 999;
-      const db = depthMap.get(b.path) ?? 999;
-      return da !== db ? da - db : a.path.localeCompare(b.path);
-    });
+      sortedFiles = [...selectedFiles].sort((a, b) => {
+        const da = depthMap.get(a.path) ?? 999;
+        const db = depthMap.get(b.path) ?? 999;
+        return da !== db ? da - db : a.path.localeCompare(b.path);
+      });
 
-    if (sortedFiles.length === 0 && focus === "targeted") {
-      sections.push(
-        `> [!WARNING]\n> No specific files met the strict relevance threshold for the query. The requested symbols or file paths might not exist or were filtered out.`
-      );
-    } else if (sortedFiles.length > 0) {
-      sections.push(
-        `## Import Graph and File Roles\n\n` +
-          `- **Entry Point**: not imported by any other file.\n` +
-          `- **Depth N**: N hops from an entry point.\n` +
-          `- **Utility**: not in the import graph.\n\n` +
-          `Entry points: ${entryPoints.slice(0, 20).join(", ") || "none detected"}.`,
-      );
-    }
-
-    const totalLines = sortedFiles.reduce(
-      (s, f) => s + (f.metrics?.lineCount ?? 0),
-      0,
-    );
-    const entryCount = sortedFiles.filter(
-      (f) => (depthMap.get(f.path) ?? 999) === 0,
-    ).length;
-
-    let sourceHeader = `## Source Files\n\n${sortedFiles.length} files included`;
-
-    if (focus === "targeted") {
-      sourceHeader += ` (targeted — ${omittedCount} files omitted as irrelevant)`;
-      if (omittedPaths.length) {
-        sourceHeader += `.\nSample omitted: ${omittedPaths.join(", ")}${
-          omittedCount > 20 ? ` and ${omittedCount - 20} more` : ""
-        }`;
+      if (omittedCount > 0) {
+        push(
+          "_meta",
+          `## File Selection\n\n${sortedFiles.length} files included, ${omittedCount} files omitted as irrelevant.\nSample omitted: ${omittedPaths.join(", ")}`,
+        );
       }
     }
 
-    sourceHeader += `. ${entryCount} entry points. ${totalLines.toLocaleString()} total lines.`;
-    if (sortedFiles.length > 0) sections.push(sourceHeader);
+    const graphHeader =
+      `## Import Graph and File Roles\n\n` +
+      `- **Entry Point**: not imported by any other file.\n` +
+      `- **Depth N**: N hops from an entry point.\n` +
+      `- **Utility**: not in the import graph.\n\n` +
+      `Entry points: ${entryPoints.slice(0, 20).join(", ") || "none detected"}.`;
+
+    if (sortedFiles.length > 0) push("_meta", graphHeader);
 
     for (const file of sortedFiles) {
-      sections.push(
-        getFileContext(
-          file,
-          importRoleLabel(depthMap.get(file.path)),
-          repoName,
-        ),
+      const fileContext = getFileContext(
+        file,
+        importRoleLabel(depthMap.get(file.path)),
+        repoName,
       );
+      push(file.path.split("/")[0] || "_root", fileContext);
     }
   }
 
-  sections.push(
-    `## End of Master Context\n\nIntents: [${intents.join(", ")}]. Focus: ${focus}. ` +
-      `Source files emitted: ${needsCode ? "yes" : "no (meta-only query)"}.`,
+  push(
+    "_meta",
+    `## End of Context\n\nSource files: ${needsCode ? "included" : "not included (meta-only query)"}.`,
   );
 
-  let fullContext = sections.join("\n\n");
+  // ── Pass 2: Pack into ≤ 49 numbered files ────────────────────────────────────
+  const writtenPaths = await packAndFlush(blocks, outputDir);
 
-  // Edge case: Hard size limit to prevent memory exhaustion and downstream rejections
-  if (fullContext.length > MAX_OUTPUT_CHARS) {
-    fullContext =
-      fullContext.slice(0, MAX_OUTPUT_CHARS) +
-      "\n\n[CRITICAL WARNING: CONTEXT TRUNCATED DUE TO EXTREME SIZE OVER 4MB. NOTEBOOKLM MIGHT REJECT LARGER FILES.]";
-  }
+  // ── Write manifest ────────────────────────────────────────────────────────────
+  const manifestText = buildManifest(
+    writtenPaths.length,
+    repoName,
+    repoContext,
+    droppedTiers,
+    allCandidates.length,
+  );
+  const manifestPath = join(outputDir, "00_Repo_Manifest.txt");
+  await writeFile(manifestPath, manifestText, "utf-8");
 
-  const OUTPUT_PATH = "/tmp/contextForNotebook.txt";
-  try {
-    mkdirSync(dirname(OUTPUT_PATH), { recursive: true });
-    writeFileSync(OUTPUT_PATH, fullContext, "utf-8");
-    console.log(
-      `[RepoOrbit] ${OUTPUT_PATH} — ${(fullContext.length / 1024).toFixed(1)} KB | ` +
-        `intents: [${intents.join(", ")}] | focus: ${focus} | ` +
-        `files: ${needsCode ? "dynamic" : 0}`,
-    );
-  } catch (err) {
-    console.error(`[RepoOrbit] Write failed: ${(err as Error).message}`);
-  }
-
-  return fullContext;
+  return manifestText;
 }
 
 export function buildFallbackContext(repoContext: any): string {
