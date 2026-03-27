@@ -10,13 +10,90 @@ interface AiChatProps {
   repoData: FullRepoData;
 }
 
+const MarkdownRenderer = ({ content }: { content: string }) => (
+  <ReactMarkdown
+    components={{
+      p: ({ children }) => (
+        <p className="mb-2 last:mb-0 leading-relaxed">{children}</p>
+      ),
+      h1: ({ children }) => (
+        <h1 className="font-bold text-[11px] text-slate-100 mt-3 mb-1 border-b border-slate-700 pb-1">
+          {children}
+        </h1>
+      ),
+      h2: ({ children }) => (
+        <h2 className="font-bold text-[11px] text-slate-100 mt-3 mb-1">
+          {children}
+        </h2>
+      ),
+      h3: ({ children }) => (
+        <h3 className="font-semibold text-[10px] text-slate-200 mt-2 mb-1">
+          {children}
+        </h3>
+      ),
+      ul: ({ children }) => (
+        <ul className="list-disc list-inside space-y-0.5 mb-2 pl-1">
+          {children}
+        </ul>
+      ),
+      ol: ({ children }) => (
+        <ol className="list-decimal list-inside space-y-0.5 mb-2 pl-1">
+          {children}
+        </ol>
+      ),
+      li: ({ children }) => (
+        <li className="text-slate-300 leading-relaxed">{children}</li>
+      ),
+      code: ({ inline, children }: any) =>
+        inline ? (
+          <code className="bg-slate-800 text-blue-300 px-1 py-0.5 rounded text-[9px] font-mono">
+            {children}
+          </code>
+        ) : (
+          <pre className="bg-slate-800/80 border border-slate-700 rounded p-2 mt-1 mb-2 overflow-x-auto">
+            <code className="text-[9px] text-blue-200 whitespace-pre font-mono">
+              {children}
+            </code>
+          </pre>
+        ),
+      strong: ({ children }) => (
+        <strong className="text-slate-100 font-semibold">{children}</strong>
+      ),
+      em: ({ children }) => (
+        <em className="text-slate-300 italic">{children}</em>
+      ),
+      blockquote: ({ children }) => (
+        <blockquote className="border-l-2 border-blue-500/50 pl-2 my-1 text-slate-400 italic">
+          {children}
+        </blockquote>
+      ),
+      a: ({ href, children }) => (
+        <a
+          href={href}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-blue-400 hover:text-blue-300 underline underline-offset-2"
+        >
+          {children}
+        </a>
+      ),
+      hr: () => <hr className="border-slate-700 my-2" />,
+    }}
+  >
+    {content}
+  </ReactMarkdown>
+);
+
 const AiChat = ({ repoData }: AiChatProps) => {
-  const [messages, setMessages] = useState<{ role: string; content: string }[]>([]);
+  const [messages, setMessages] = useState<
+    { role: string; content: string; streaming?: boolean }[]
+  >([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [currentStatus, setCurrentStatus] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const { repoContext: repoCtx } = useSelectionStore((s) => s.selection);
   const setRepoContext = useSelectionStore((s) => s.setRepoContext);
@@ -24,6 +101,10 @@ const AiChat = ({ repoData }: AiChatProps) => {
   useEffect(() => {
     if (repoData.repoContext) setRepoContext(repoData.repoContext);
   }, [repoData.repoContext, setRepoContext]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
   const stopAll = useCallback(() => {
     if (pollIntervalRef.current) {
@@ -34,6 +115,11 @@ const AiChat = ({ repoData }: AiChatProps) => {
     abortControllerRef.current = null;
     setIsLoading(false);
     setCurrentStatus(null);
+    setMessages((prev) =>
+      prev.map((m, i) =>
+        i === prev.length - 1 && m.streaming ? { ...m, streaming: false } : m,
+      ),
+    );
   }, []);
 
   const handleSend = useCallback(
@@ -46,7 +132,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
       setMessages((prev) => [
         ...prev,
         { role: "user", content: userMessage },
-        { role: "assistant", content: "" },
+        { role: "assistant", content: "", streaming: true },
       ]);
       setIsLoading(true);
       setCurrentStatus("Starting architect engine...");
@@ -55,7 +141,6 @@ const AiChat = ({ repoData }: AiChatProps) => {
       abortControllerRef.current = controller;
 
       try {
-
         const startResponse = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -94,6 +179,18 @@ const AiChat = ({ repoData }: AiChatProps) => {
               setCurrentStatus(job.statusText);
             }
 
+            if (job.partialResult) {
+              setMessages((prev) => {
+                const updated = [...prev];
+                updated[updated.length - 1] = {
+                  ...updated[updated.length - 1],
+                  content: job.partialResult,
+                  streaming: true,
+                };
+                return updated;
+              });
+            }
+
             if (job.status === "done") {
               clearInterval(pollIntervalRef.current!);
               pollIntervalRef.current = null;
@@ -101,8 +198,9 @@ const AiChat = ({ repoData }: AiChatProps) => {
               setMessages((prev) => {
                 const updated = [...prev];
                 updated[updated.length - 1] = {
-                  ...updated[updated.length - 1],
+                  role: "assistant",
                   content: job.result,
+                  streaming: false,
                 };
                 return updated;
               });
@@ -112,12 +210,12 @@ const AiChat = ({ repoData }: AiChatProps) => {
               clearInterval(pollIntervalRef.current!);
               pollIntervalRef.current = null;
               abortControllerRef.current = null;
-              const errMsg = job.error || "Generation failed";
               setMessages((prev) => {
                 const updated = [...prev];
                 updated[updated.length - 1] = {
                   role: "assistant",
-                  content: ` Error: ${errMsg}`,
+                  content: `**Error:** ${job.error || "Generation failed"}`,
+                  streaming: false,
                 };
                 return updated;
               });
@@ -134,8 +232,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
               setCurrentStatus(null);
             }
           }
-        }, 3000);
-
+        }, 1000);
       } catch (err: any) {
         if (err?.name !== "AbortError") {
           abortControllerRef.current = null;
@@ -143,7 +240,8 @@ const AiChat = ({ repoData }: AiChatProps) => {
             const updated = [...prev];
             updated[updated.length - 1] = {
               role: "assistant",
-              content: ` Error: ${err.message}`,
+              content: `**Error:** ${err.message}`,
+              streaming: false,
             };
             return updated;
           });
@@ -155,10 +253,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
     [input, isLoading, repoCtx, repoData, stopAll],
   );
 
-  const handleStop = () => {
-    stopAll();
-  };
-
+  const handleStop = () => stopAll();
   const handleClear = () => {
     if (isLoading) handleStop();
     setMessages([]);
@@ -168,6 +263,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
 
   return (
     <div className="w-72 shrink-0 flex flex-col bg-gray-900 border border-gray-700 rounded-xl overflow-hidden h-full shadow-2xl">
+      {/* Header */}
       <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between bg-gray-950/50">
         <div className="flex items-center gap-1.5">
           <Cpu size={12} className="text-blue-500" />
@@ -181,12 +277,14 @@ const AiChat = ({ repoData }: AiChatProps) => {
         </span>
       </div>
 
+      {/* Messages */}
       <div className="flex-1 overflow-y-auto p-3 space-y-3">
         {messages.length === 0 && (
           <p className="text-[10px] font-mono text-slate-600 text-center mt-6 leading-relaxed">
-            Generate NotebookLM context here.
+            Ask anything about this repo.
           </p>
         )}
+
         {messages.map((msg, i) => (
           <div
             key={i}
@@ -199,45 +297,50 @@ const AiChat = ({ repoData }: AiChatProps) => {
                   : "bg-slate-900/50 border border-slate-800 text-slate-300"
               }`}
             >
-              {msg.role === "assistant" && msg.content === "" && isLoading ? (
-                <div className="flex items-center gap-2 text-slate-400">
-                  <Loader2 size={11} className="animate-spin text-blue-500" />
-                  <span className="animate-pulse">{currentStatus || "Thinking..."}</span>
+              {msg.role === "assistant" ? (
+                <div className="flex flex-col gap-1">
+                  {/* Empty + loading = show spinner */}
+                  {msg.content === "" && msg.streaming ? (
+                    <div className="flex items-center gap-2 text-slate-400">
+                      <Loader2
+                        size={11}
+                        className="animate-spin text-blue-500"
+                      />
+                      <span className="animate-pulse">
+                        {currentStatus || "Thinking..."}
+                      </span>
+                    </div>
+                  ) : (
+                    <>
+                      {/* Live markdown render — updates as partialResult grows */}
+                      <MarkdownRenderer content={msg.content} />
+
+                      {/* Status bar shown while streaming */}
+                      {msg.streaming && (
+                        <div className="flex items-center gap-1.5 text-slate-500 mt-1 border-t border-slate-800/50 pt-1.5">
+                          <Loader2
+                            size={10}
+                            className="animate-spin text-blue-500/70 shrink-0"
+                          />
+                          <span className="text-[9px] animate-pulse truncate">
+                            {currentStatus || "Generating..."}
+                          </span>
+                        </div>
+                      )}
+                    </>
+                  )}
                 </div>
-              ) : msg.role === "assistant" ? (
-                <ReactMarkdown
-                  components={{
-                    p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
-                    h1: ({ children }) => <h1 className="font-bold text-[11px] text-slate-100 mt-3 mb-1">{children}</h1>,
-                    h2: ({ children }) => <h2 className="font-bold text-[11px] text-slate-100 mt-3 mb-1">{children}</h2>,
-                    h3: ({ children }) => <h3 className="font-semibold text-[10px] text-slate-200 mt-2 mb-1">{children}</h3>,
-                    ul: ({ children }) => <ul className="list-disc list-inside space-y-0.5 mb-2 pl-1">{children}</ul>,
-                    ol: ({ children }) => <ol className="list-decimal list-inside space-y-0.5 mb-2 pl-1">{children}</ol>,
-                    li: ({ children }) => <li className="text-slate-300">{children}</li>,
-                    code: ({ inline, children }: any) =>
-                      inline ? (
-                        <code className="bg-slate-800 text-blue-300 px-1 py-0.5 rounded text-[9px]">{children}</code>
-                      ) : (
-                        <pre className="bg-slate-800/80 border border-slate-700 rounded p-2 mt-1 mb-2 overflow-x-auto">
-                          <code className="text-[9px] text-blue-200 whitespace-pre">{children}</code>
-                        </pre>
-                      ),
-                    strong: ({ children }) => <strong className="text-slate-100 font-semibold">{children}</strong>,
-                    blockquote: ({ children }) => (
-                      <blockquote className="border-l-2 border-blue-500/50 pl-2 my-1 text-slate-400 italic">{children}</blockquote>
-                    ),
-                  }}
-                >
-                  {msg.content as string}
-                </ReactMarkdown>
               ) : (
                 msg.content
               )}
             </div>
           </div>
         ))}
+
+        <div ref={messagesEndRef} />
       </div>
 
+      {/* Input */}
       <form
         onSubmit={handleSend}
         className="p-2.5 bg-gray-950 border-t border-gray-700 flex items-center gap-2"
@@ -257,7 +360,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             disabled={isLoading}
-            placeholder={isLoading ? "Generating context..." : "Ask to generate context..."}
+            placeholder={isLoading ? "Generating..." : "Ask about this repo..."}
             className="w-full bg-gray-950 border border-gray-700 text-[10px] font-mono text-slate-300 pl-3 pr-8 py-2 rounded-lg outline-none focus:border-blue-500/40 transition-all disabled:opacity-50"
           />
           {isLoading ? (

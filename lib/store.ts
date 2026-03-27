@@ -195,22 +195,4 @@ export const useSelectionStore = create<
     }),
 }));
 
-export const useSelectionType = () =>
-  useSelectionStore((s) => s.selection.type);
-export const useRepoContext = () =>
-  useSelectionStore((s) => s.selection.repoContext);
-export const useFolderContext = () =>
-  useSelectionStore((s) => s.selection.folderContext);
-export const useFileContext = () =>
-  useSelectionStore((s) => s.selection.fileContext);
-export const useIsInitialized = () => useSelectionStore((s) => s.isInitialized);
-export const useFilesMetadata = () => useSelectionStore((s) => s.filesMetadata);
-export const useImportGraph = () => useSelectionStore((s) => s.importGraph);
-export const useCommitsByAuthor = () =>
-  useSelectionStore((s) => s.selection.repoContext?.commitsByAuthor ?? {});
-export const useTotalCommitsFetched = () =>
-  useSelectionStore((s) => s.selection.repoContext?.totalCommitsFetched ?? 0);
-export const useIssues = () =>
-  useSelectionStore((s) => s.selection.repoContext?.issues ?? []);
-export const usePulls = () =>
-  useSelectionStore((s) => s.selection.repoContext?.pulls ?? []);
+

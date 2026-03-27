@@ -1,22 +1,13 @@
 import { NextResponse } from "next/server";
-import { buildMasterContext, buildFallbackContext } from "@/lib/contextBuilder";
+import { buildMasterContext } from "@/lib/contextBuilder";
 import { chromium, BrowserContext, Page } from "playwright";
 import path from "path";
 import fs from "fs";
-import { parseImports, analyzeFile } from "@/lib/github";
-import { getArchitectPrompt } from "@/lib/prompts";
+import { analyzeFile } from "@/lib/github";
 import { automateNotebookLM } from "@/lib/notebooklmAutomator";
 
 const CONTEXT_DIR_PATH = "/tmp/notebooklm_sources";
-const GEMINI_CONTEXT_PATH = "/tmp/contextForGemini.txt";
 const NOTEBOOKLM_URL = "https://notebooklm.google.com/";
-const token = (
-  process.env.GITHUB_TOKEN ||
-  process.env.NEXT_PUBLIC_GITHUB_TOKEN ||
-  ""
-)
-  .trim()
-  .replace(/^["']|["']$/g, "");
 
 const GLOBAL_JOBS_KEY = Symbol.for("repoorbit.playwright.jobs");
 const activeJobs: Map<
@@ -24,6 +15,7 @@ const activeJobs: Map<
   {
     status: "pending" | "done" | "error";
     result?: string;
+    partialResult?: string;
     error?: string;
     statusText?: string;
   }
@@ -46,13 +38,24 @@ async function getOrCreateContext(): Promise<BrowserContext> {
       sharedContext = null;
     }
   }
-  const profilePath = path.join(process.cwd(), ".notebooklm-profile");
-  sharedContext = await chromium.launchPersistentContext(profilePath, { 
-    headless: false,
-    args: ["--disable-blink-features=AutomationControlled"]
-  });
-  (global as any)[GLOBAL_CONTEXT_KEY] = sharedContext;
-  return sharedContext;
+  try {
+    const browser = await chromium.connectOverCDP("http://localhost:9222");
+    sharedContext = browser.contexts()[0];
+    (global as any)[GLOBAL_CONTEXT_KEY] = sharedContext;
+    return sharedContext;
+  } catch (err: any) {
+    console.warn(
+      "Could not connect to CDP on 9222, falling back to new browser: ",
+      err.message,
+    );
+    const profilePath = path.join(process.cwd(), ".notebooklm-profile");
+    sharedContext = await chromium.launchPersistentContext(profilePath, {
+      headless: false,
+      args: ["--disable-blink-features=AutomationControlled"],
+    });
+    (global as any)[GLOBAL_CONTEXT_KEY] = sharedContext;
+    return sharedContext;
+  }
 }
 
 async function fetchFileContents(
@@ -63,8 +66,8 @@ async function fetchFileContents(
   onStatus?: (msg: string) => void,
 ) {
   const result = new Map<string, string>();
-  const CHUNK_SIZE = 50; 
-  const CONCURRENCY = 5; 
+  const CHUNK_SIZE = 50;
+  const CONCURRENCY = 5;
 
   let token = process.env.GITHUB_TOKEN || process.env.NEXT_PUBLIC_GITHUB_TOKEN;
 
@@ -155,9 +158,14 @@ async function uploadAndGetResult(
 
     if (!page) throw new Error("Could not create or find a NotebookLM page.");
 
-    const onStatus = (msg: string) => {
+    const onStatus = (msg: string, partial?: string) => {
       const job = activeJobs.get(taskId);
-      if (job) activeJobs.set(taskId, { ...job, statusText: msg });
+      if (job)
+        activeJobs.set(taskId, {
+          ...job,
+          statusText: msg,
+          partialResult: partial,
+        });
     };
 
     const result = await automateNotebookLM(
@@ -191,9 +199,14 @@ export async function POST(req: Request) {
 
     const processJob = async () => {
       try {
-        const setStatus = (msg: string) => {
+        const setStatus = (msg: string, partial?: string) => {
           const job = activeJobs.get(taskId);
-          if (job) activeJobs.set(taskId, { ...job, statusText: msg });
+          if (job)
+            activeJobs.set(taskId, {
+              ...job,
+              statusText: msg,
+              partialResult: partial,
+            });
         };
 
         if (!fs.existsSync(outDir)) {

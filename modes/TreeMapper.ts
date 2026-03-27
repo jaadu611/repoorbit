@@ -59,11 +59,4 @@ export const transformToTree = (
 
   return rootNode;
 };
-export const enrichNode = (node: FileNode, commitData: any): FileNode => {
-  return {
-    ...node,
-    author: commitData.commit.author.name,
-    createdAt: commitData.commit.author.date,
-    lastModified: commitData.commit.committer.date,
-  };
-};
+
