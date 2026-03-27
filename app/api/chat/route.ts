@@ -18,7 +18,6 @@ const token = (
   .trim()
   .replace(/^["']|["']$/g, "");
 
-// Global session management
 const GLOBAL_JOBS_KEY = Symbol.for("repoorbit.playwright.jobs");
 const activeJobs: Map<
   string,
@@ -47,30 +46,25 @@ async function getOrCreateContext(): Promise<BrowserContext> {
       sharedContext = null;
     }
   }
-  try {
-    const browser = await chromium.connectOverCDP("http://127.0.0.1:9222", {
-      timeout: 2000,
-    });
-    sharedContext = browser.contexts()[0];
-  } catch {
-    const browser = await chromium.launch({ headless: false });
-    sharedContext = await browser.newContext();
-  }
+  const profilePath = path.join(process.cwd(), ".notebooklm-profile");
+  sharedContext = await chromium.launchPersistentContext(profilePath, { 
+    headless: false,
+    args: ["--disable-blink-features=AutomationControlled"]
+  });
   (global as any)[GLOBAL_CONTEXT_KEY] = sharedContext;
   return sharedContext;
 }
 
-// RESTORE: GitHub content fetcher (Essential for buildMasterContext)
 async function fetchFileContents(
   owner: string,
   repo: string,
   files: any[],
   ref: string,
-  onStatus?: (msg: string) => void
+  onStatus?: (msg: string) => void,
 ) {
   const result = new Map<string, string>();
-  const CHUNK_SIZE = 50; // Keep GraphQL complexity well within limits
-  const CONCURRENCY = 5; // Fetch up to 250 files simultaneously in parallel blocks
+  const CHUNK_SIZE = 50; 
+  const CONCURRENCY = 5; 
 
   let token = process.env.GITHUB_TOKEN || process.env.NEXT_PUBLIC_GITHUB_TOKEN;
 
@@ -79,12 +73,20 @@ async function fetchFileContents(
     allChunks.push(files.slice(i, i + CHUNK_SIZE));
   }
 
-  for (let blockIndex = 0; blockIndex < allChunks.length; blockIndex += CONCURRENCY) {
+  for (
+    let blockIndex = 0;
+    blockIndex < allChunks.length;
+    blockIndex += CONCURRENCY
+  ) {
     const batchedChunks = allChunks.slice(blockIndex, blockIndex + CONCURRENCY);
     const upperLimit = Math.min(blockIndex + CONCURRENCY, allChunks.length);
-    
-    console.log(`[GitHub API] Fetching chunks ${blockIndex + 1} to ${upperLimit} of ${allChunks.length}...`);
-    onStatus?.(`Downloading repo logic (${upperLimit}/${allChunks.length} chunks)`);
+
+    console.log(
+      `[GitHub API] Fetching chunks ${blockIndex + 1} to ${upperLimit} of ${allChunks.length}...`,
+    );
+    onStatus?.(
+      `Downloading repo logic (${upperLimit}/${allChunks.length} chunks)`,
+    );
 
     await Promise.all(
       batchedChunks.map(async (chunk, chunkOffset) => {
@@ -123,7 +125,7 @@ async function fetchFileContents(
         } catch (err: any) {
           console.error(`[GitHub API] GraphQL request failed: ${err.message}`);
         }
-      })
+      }),
     );
   }
 
@@ -143,9 +145,7 @@ async function uploadAndGetResult(
       p.url().includes("notebooklm.google.com"),
     );
 
-    if (page) {
-      await page.bringToFront();
-    } else {
+    if (!page) {
       page = await context.newPage();
       await page.goto(NOTEBOOKLM_URL, {
         waitUntil: "domcontentloaded",
@@ -188,8 +188,7 @@ export async function POST(req: Request) {
     activeJobs.set(taskId, { status: "pending" });
 
     const outDir = path.join(CONTEXT_DIR_PATH, owner, repo);
-    
-    // Background the entire heavy ingestion and automation process
+
     const processJob = async () => {
       try {
         const setStatus = (msg: string) => {
@@ -204,44 +203,81 @@ export async function POST(req: Request) {
           const coreFiles = tree.filter((f: any) => {
             const p = f.path;
             const pLower = p.toLowerCase();
-            
-            // Skip massive auto-generated folders or redundant data
-            if (pLower.includes("node_modules/") || pLower.includes(".git/")) return false;
-            if (pLower.includes("dist/") || pLower.includes("build/") || pLower.includes("out/")) return false;
-            
-            // Skip massive generic fixtures/snapshots which eat context limit without adding logic.
-            if (pLower.includes("__snapshots__") || pLower.includes("fixtures/") || pLower.endsWith(".snap")) return false;
 
-            // Skip strict binaries, heavy assets, and locked deps
+            if (pLower.includes("node_modules/") || pLower.includes(".git/"))
+              return false;
+            if (
+              pLower.includes("dist/") ||
+              pLower.includes("build/") ||
+              pLower.includes("out/")
+            )
+              return false;
+
+            if (
+              pLower.includes("__snapshots__") ||
+              pLower.includes("fixtures/") ||
+              pLower.endsWith(".snap")
+            )
+              return false;
+
             const ignoredExtensions = [
-               ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".bmp", ".webp",
-               ".mp4", ".mp3", ".wav", ".zip", ".tar", ".gz", ".pdf", ".ttf", ".woff", ".woff2",
-               ".lock", ".log", "-lock.yaml", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"
+              ".png",
+              ".jpg",
+              ".jpeg",
+              ".gif",
+              ".ico",
+              ".svg",
+              ".bmp",
+              ".webp",
+              ".mp4",
+              ".mp3",
+              ".wav",
+              ".zip",
+              ".tar",
+              ".gz",
+              ".pdf",
+              ".ttf",
+              ".woff",
+              ".woff2",
+              ".lock",
+              ".log",
+              "-lock.yaml",
+              "package-lock.json",
+              "yarn.lock",
+              "pnpm-lock.yaml",
             ];
-            
-            if (ignoredExtensions.some(ext => pLower.endsWith(ext))) return false;
+
+            if (ignoredExtensions.some((ext) => pLower.endsWith(ext)))
+              return false;
 
             return true;
           });
 
-          // No artificial string limits—we fetch EVERY remaining core file in batched chunks.
           const contents = await fetchFileContents(
             owner,
             repo,
             coreFiles,
             defaultBranch || "main",
-            setStatus
+            setStatus,
           );
-          
+
           setStatus("Running static code analysis...");
           const metadata = Array.from(contents.entries()).map(([p, c]) => ({
             path: p,
             content: c,
             analysis: analyzeFile(p, c),
           }));
-          
+
           setStatus("Chunking and structuring contexts...");
-          await buildMasterContext(query, metadata, {}, repoContext, undefined, outDir, true);
+          await buildMasterContext(
+            query,
+            metadata,
+            {},
+            repoContext,
+            undefined,
+            outDir,
+            true,
+          );
         }
 
         setStatus("Bootstrapping Playwright engine...");
@@ -250,7 +286,7 @@ export async function POST(req: Request) {
           .filter((f) => f.endsWith(".txt"))
           .map((f) => path.join(outDir, f))
           .sort();
-          
+
         const context = await getOrCreateContext();
         await uploadAndGetResult(context, files, query, taskId, repo);
       } catch (err: any) {
@@ -259,7 +295,6 @@ export async function POST(req: Request) {
       }
     };
 
-    // Execute passively so we instantly return the taskId for UI polling
     processJob().catch(console.error);
     return NextResponse.json({ success: true, taskId });
   } catch (err: any) {

@@ -963,7 +963,6 @@ export default function TreeView({
     [computeLayout, startAnimLoop],
   );
 
-  // Fetch file content from server cache
   const fetchFileContent = useCallback(
     async (filePath: string): Promise<any> => {
       const repoFullName =
@@ -1009,7 +1008,6 @@ export default function TreeView({
           richFile ?? (hit.fileDetails as any) ?? null,
         );
 
-        // Open panel immediately in loading state
         setActiveFile({
           node: hit,
           content: "",
@@ -1018,7 +1016,6 @@ export default function TreeView({
           history: null,
         });
 
-        // Fetch content from server cache
         const data = await fetchFileContent(hit.id);
         if (data && !data.error) {
           setFileContext({
@@ -1563,7 +1560,7 @@ export default function TreeView({
             background: "linear-gradient(180deg, #060b14 0%, #060810 100%)",
           }}
         >
-          {/* Header */}
+          {}
           <div
             className="shrink-0 flex items-center gap-2.5 px-3 py-2"
             style={{
@@ -1622,7 +1619,7 @@ export default function TreeView({
           </div>
 
           <div className="flex flex-1 min-h-0">
-            {/* Source pane */}
+            {}
             <div
               className="flex flex-col border-r overflow-hidden"
               style={{ width: "58%", borderColor: "rgba(30,41,59,0.5)" }}
@@ -1640,10 +1637,10 @@ export default function TreeView({
                 </span>
                 {storeFileContext?.metrics && (
                   <span className="ml-auto text-[9px] font-mono text-slate-600">
-                    {storeFileContext.metrics.codeLines}c ·{" "}
-                    {storeFileContext.metrics.commentLines}
-                    {" // · "}
-                    {storeFileContext.metrics.emptyLines}Ø
+                    {storeFileContext.metrics.codeLines}c ·
+                    {storeFileContext.metrics.commentLines}m ·
+                    {storeFileContext.metrics.emptyLines}e
+
                   </span>
                 )}
               </div>
@@ -1693,14 +1690,14 @@ export default function TreeView({
               </div>
             </div>
 
-            {/* Metadata pane */}
+            {}
             <div
               className="flex flex-col overflow-auto custom-scrollbar shadow-[inset_1px_0_0_rgba(255,255,255,0.05)]"
               style={{ width: "42%", background: "#04070e" }}
             >
               {storeFileContext ? (
                 <div className="p-5 space-y-7">
-                  {/* Latest Activity Summary */}
+                  {}
                   {storeFileContext.latestCommit && (
                     <div className="relative group">
                       <div className="absolute -inset-0.5 bg-linear-to-r from-blue-500/20 to-purple-500/20 rounded-xl blur opacity-30 group-hover:opacity-50 transition duration-500" />
@@ -1749,7 +1746,7 @@ export default function TreeView({
                     </div>
                   )}
 
-                  {/* Core Metrics */}
+                  {}
                   <section>
                     <div className="flex items-center gap-1.5 mb-3 px-1">
                       <BarChart2 size={11} className="text-slate-400" />
@@ -1816,7 +1813,7 @@ export default function TreeView({
                     )}
                   </section>
 
-                  {/* Analysis Breakdown */}
+                  {}
                   {storeFileContext.analysis && (
                     <section>
                       <div className="flex items-center gap-1.5 mb-3 px-1">
@@ -1907,7 +1904,7 @@ export default function TreeView({
                     </section>
                   )}
 
-                  {/* Contributors */}
+                  {}
                   {storeFileContext.contributors &&
                     storeFileContext.contributors.length > 0 && (
                       <section>
@@ -1970,7 +1967,7 @@ export default function TreeView({
                       </section>
                     )}
 
-                  {/* History Timeline */}
+                  {}
                   {storeFileContext.commits &&
                     storeFileContext.commits.length > 0 && (
                       <section>
@@ -2006,7 +2003,7 @@ export default function TreeView({
                       </section>
                     )}
 
-                  {/* Path & Technical Info */}
+                  {}
                   <section className="pt-2">
                     <div className="rounded-xl border border-dashed border-white/10 p-3 space-y-3 bg-black/20">
                       <div className="flex flex-col gap-1.5">

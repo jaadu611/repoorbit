@@ -5,7 +5,6 @@ import { getArchitectPrompt } from "./prompts";
 
 const CDP_URL = "http://127.0.0.1:9222";
 
-// NotebookLM UI button labels that leak into scraped innerText
 const UI_JUNK_LABELS = [
   "keep_pin",
   "Save to note",
@@ -50,20 +49,16 @@ function cleanScrapedText(raw: string): string {
       if (UI_JUNK_LABELS.includes(t)) return false;
       if (/^[-*_]{3,}$/.test(t)) return false;
       if (/^\d{1,2}$/.test(t)) return false;
-      if (/^[.,;:]{1,2}$/.test(t)) return false; // strip orphaned punctuation left by citation stripping
+      if (/^[.,;:]{1,2}$/.test(t)) return false; 
       return true;
     })
     .join("\n")
-    .replace(/(\S)\d{1,2}(\s)/g, "$1$2") // strip inline citations like "resolveDispatcher()1 2"
-    .replace(/(\S)\d{1,2}$/gm, "$1") // strip trailing citations at end of line
-    .replace(/\n{3,}/g, "\n\n") // collapse excessive blank lines
+    .replace(/(\S)\d{1,2}(\s)/g, "$1$2") 
+    .replace(/(\S)\d{1,2}$/gm, "$1") 
+    .replace(/\n{3,}/g, "\n\n") 
     .trim();
 }
 
-/**
- * Core automation logic for NotebookLM.
- * Can be reused with an existing page and specific file list.
- */
 export async function automateNotebookLM(
   page: Page,
   files: string[],
@@ -71,14 +66,13 @@ export async function automateNotebookLM(
   repoName: string,
   onStatus?: (msg: string) => void,
 ): Promise<string> {
-  // 1. Identify/Create Notebook
+
   const notebookTitle = `@RepoOrbit: ${repoName}`;
   let url = page.url();
   let shouldUploadSources = true;
 
-  // If already in a notebook, verify it is for the correct repo
   if (url.includes("/notebook/")) {
-    await page.waitForTimeout(1000); // let title render
+    await page.waitForTimeout(1000); 
     const currentTitle = await page.title();
     if (!currentTitle.includes(notebookTitle)) {
       onStatus?.("Switching to different repo notebook...");
@@ -118,9 +112,8 @@ export async function automateNotebookLM(
       await page.waitForURL((u) => u.href.includes("/notebook/"), {
         timeout: 30000,
       });
-      await page.waitForTimeout(3000); // Give the new notebook UI time to settle
+      await page.waitForTimeout(3000); 
 
-      // NotebookLM usually starts with "Untitled notebook" that needs to be clicked
       const titleEditTrigger = page
         .locator(
           '[aria-label*="Rename notebook"], .notebook-title-edit, span:has-text("Untitled notebook"), h2:has-text("Untitled notebook")',
@@ -129,7 +122,7 @@ export async function automateNotebookLM(
 
       if (await titleEditTrigger.isVisible().catch(() => false)) {
         await titleEditTrigger.click({ force: true });
-        await page.waitForTimeout(500); // wait for input to appear
+        await page.waitForTimeout(500); 
       }
 
       const titleInput = page
@@ -146,10 +139,9 @@ export async function automateNotebookLM(
     }
   }
 
-  // 2. Upload Sources (Multi-file ingest)
   if (shouldUploadSources) {
     onStatus?.("Checking existing sources...");
-    const filesToUpload: string[] = files; // Since it's a new notebook, we confidently upload everything
+    const filesToUpload: string[] = files; 
 
     if (filesToUpload.length > 0) {
       onStatus?.(
@@ -173,7 +165,6 @@ export async function automateNotebookLM(
       for (let i = 0; i < filesToUpload.length; i += BATCH_SIZE) {
         const batch = filesToUpload.slice(i, i + BATCH_SIZE);
 
-        // The modal closes after every upload. Re-open it if necessary.
         let isModalOpen = await uploadIconBtn.isVisible().catch(() => false);
         if (!isModalOpen) {
           const addSourceBtn = page
@@ -194,13 +185,13 @@ export async function automateNotebookLM(
         onStatus?.(
           `Uploading context files... (${Math.min(i + BATCH_SIZE, filesToUpload.length)}/${filesToUpload.length})`,
         );
-        await page.waitForTimeout(4000); // Give the UI a moment to register the batch
+        await page.waitForTimeout(4000); 
       }
 
       const targetCount = initialCount + filesToUpload.length;
       const uploadStartTime = Date.now();
       while (Date.now() - uploadStartTime < 300000) {
-        // 5 minute timeout for massive repos
+
         const currentCount = await page.evaluate(() => {
           const counter = document.querySelector(".sources-count-text");
           if (counter)
@@ -221,13 +212,9 @@ export async function automateNotebookLM(
     }
   }
 
-  // 3. Submit Query
   onStatus?.("Submitting your query...");
   const architectPrompt = getArchitectPrompt(query);
 
-  // Snapshot all existing AI response texts BEFORE submitting.
-  // The poll loop will only accept responses whose text is NOT in this snapshot,
-  // preventing stale previous answers from being returned as the new response.
   const existingResponseSnapshot: Set<string> = await page.evaluate(() => {
     function findDeep(selector: string, root: any = document): HTMLElement[] {
       let els: HTMLElement[] = Array.from(root.querySelectorAll(selector));
@@ -259,17 +246,16 @@ export async function automateNotebookLM(
   await page.fill(inputSelector, architectPrompt);
   await page.keyboard.press("Enter");
 
-  // 4. Polling Loop
   onStatus?.("Waiting for AI to respond...");
   const startTime = Date.now();
 
   let lastSeenLength = 0;
   let stableCount = 0;
-  const STABLE_POLLS_NEEDED = 2; // response must be the same length for 2 consecutive polls
+  const STABLE_POLLS_NEEDED = 2; 
 
   while (Date.now() - startTime < 300000) {
     const candidate = await page.evaluate((snapshot) => {
-      // Helper: traverse Shadow DOMs
+
       function findElementsDeep(
         selector: string,
         root: any = document,
@@ -286,13 +272,11 @@ export async function automateNotebookLM(
         return elements;
       }
 
-      // Check if NotebookLM is still actively generating
       const isGenerating =
         findElementsDeep(
           '.loading-indicator, [aria-label*="Generating"], .generating, .response-loading',
         ).length > 0;
 
-      // Identify AI responses via action buttons (Copy/Save only appear when done)
       const actionButtons = findElementsDeep(
         'button[aria-label*="Copy"], button[aria-label*="Save"], button[aria-label*="note"]',
       );
@@ -312,7 +296,6 @@ export async function automateNotebookLM(
         ...new Set([...aiResponseContainers, ...bubblesWithButtons]),
       ];
 
-      // Only new responses not in pre-submit snapshot
       const newResponses = candidates.filter((el) => {
         const preview = el.innerText.trim().substring(0, 200);
         return !snapshot.includes(preview);
@@ -337,12 +320,12 @@ export async function automateNotebookLM(
           `Capturing response... (${stableCount}/${STABLE_POLLS_NEEDED})`,
         );
         if (stableCount >= STABLE_POLLS_NEEDED) {
-          // Response is stable — streaming complete
+
           const cleaned = cleanScrapedText(candidate.text);
           return cleaned;
         }
       } else {
-        // Still streaming — reset stability counter
+
         stableCount = 0;
         lastSeenLength = currentLength;
         onStatus?.("Streaming response...");
@@ -355,9 +338,6 @@ export async function automateNotebookLM(
   throw new Error("Analysis timeout (5m)");
 }
 
-/**
- * High-level function to ask NotebookLM a question about a repository.
- */
 export async function askNotebookLM(
   repoName: string,
   prompt: string,
@@ -368,20 +348,16 @@ export async function askNotebookLM(
   let page: Page | null = null;
 
   try {
-    try {
-      browser = await chromium.connectOverCDP(CDP_URL);
-      context = browser.contexts()[0];
-    } catch (e) {
-      browser = await chromium.launch({ headless: false });
-      context = await browser.newContext();
-    }
+    const profilePath = path.join(process.cwd(), ".notebooklm-profile");
+    context = await chromium.launchPersistentContext(profilePath, {
+      headless: false,
+      args: ["--disable-blink-features=AutomationControlled"],
+    });
 
     const pages = context?.pages() || [];
     page = pages.find((p) => p.url().includes("notebooklm.google.com")) || null;
 
-    if (page) {
-      await page.bringToFront();
-    } else {
+    if (!page) {
       page = await context!.newPage();
       await page.goto("https://notebooklm.google.com/", {
         waitUntil: "domcontentloaded",
@@ -399,6 +375,6 @@ export async function askNotebookLM(
 
     return await automateNotebookLM(page, files, prompt, repoName);
   } finally {
-    // if (browser) await browser.close();
+
   }
 }

@@ -283,7 +283,7 @@ export const getRepoData = async (owner: string, repo: string) => {
       `https://api.github.com/repos/${owner}/${repo}/branches?per_page=30`,
       { headers: getHeaders(), ...withCache },
     ),
-    // Exclude PRs from issues — GitHub returns both from /issues by default
+
     fetch(
       `https://api.github.com/repos/${owner}/${repo}/issues?state=open&per_page=30&pulls=false`,
       { headers: getHeaders(), ...withCache },
@@ -336,7 +336,6 @@ export const getRepoData = async (owner: string, repo: string) => {
     ? await readmeValue.text()
     : "No README available.";
 
-  // ── Full commit history per contributor ────────────────────────────────────
   const contributorLogins: string[] = Array.isArray(contributorsData)
     ? contributorsData.map((c: any) => c.login as string)
     : [];
@@ -357,7 +356,6 @@ export const getRepoData = async (owner: string, repo: string) => {
     0,
   );
 
-  // ── Build tree ─────────────────────────────────────────────────────────────
   const rawTree: any[] = treeData.tree ?? [];
   const allPaths = rawTree.map((n: any) => n.path as string);
 
@@ -399,7 +397,6 @@ export const getRepoData = async (owner: string, repo: string) => {
   const latestCommitRaw = Array.isArray(commitsData) ? commitsData[0] : null;
   const releases = Array.isArray(releasesData) ? releasesData : [];
 
-  // ── Shape issues (filter out any PRs GitHub sneaks in) ─────────────────────
   const issues = Array.isArray(issuesData)
     ? issuesData
         .filter((i: any) => !i.pull_request)
@@ -418,7 +415,6 @@ export const getRepoData = async (owner: string, repo: string) => {
         }))
     : [];
 
-  // ── Shape pull requests ────────────────────────────────────────────────────
   const pulls = Array.isArray(pullsData)
     ? pullsData.map((p: any) => ({
         number: p.number,

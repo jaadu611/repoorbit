@@ -11,14 +11,12 @@ export async function GET(req: Request) {
   }
 
   const { owner, repo: repoName } = parseRepoInput(repo);
-  
-  // Real-time fetch directly from GitHub API
+
   const content = await fetchFileContent(owner, repoName, filePath);
   if (content === null) {
     return new Response("File not found on GitHub", { status: 404 });
   }
 
-  // Analyze the file metrics on the fly for the UI
   const filename = filePath.split("/").pop() ?? filePath;
   const analysis = analyzeFile(filename, content);
   const imports = parseImports(content);
@@ -32,7 +30,6 @@ export async function GET(req: Request) {
 
   const commits = await fetchCommitsForPath(owner, repoName, filePath);
 
-  // Derive contributors from commits for this specific file
   const contributorMap = new Map<string, any>();
   commits.forEach((c: CommitDetail) => {
     const key = c.author;

@@ -1,4 +1,3 @@
-
 import { FileNode } from "@/lib/types";
 
 export const transformToTree = (

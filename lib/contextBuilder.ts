@@ -2,30 +2,18 @@ import { mkdirSync } from "fs";
 import { writeFile } from "fs/promises";
 import { join } from "path";
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-
-const IMPORT_DEPTH = 999; // Effectively removed depth cap to cover everything
+const IMPORT_DEPTH = 999; 
 const FILE_CHAR_LIMIT = 100_000;
 const SPLIT_THRESHOLD_CHARS = 3_000;
 const MIN_RELEVANCE_SCORE_GENERIC = 3;
 const MIN_RELEVANCE_SCORE_TARGETED = 15;
 
-/** Hard limits enforced by NotebookLM */
-const MAX_OUTPUT_FILES = 50; // 1 manifest + 49 source buckets
-const MAX_SOURCE_BUCKETS = MAX_OUTPUT_FILES - 1; // 49
+const MAX_OUTPUT_FILES = 50; 
+const MAX_SOURCE_BUCKETS = MAX_OUTPUT_FILES - 1; 
 const WORD_LIMIT_PER_FILE = 450_000;
-/** Total word budget across all buckets */
-const TOTAL_WORD_BUDGET = MAX_SOURCE_BUCKETS * WORD_LIMIT_PER_FILE; // 22,050,000
 
-/**
- * File priority tiers — controls what gets dropped when total content
- * exceeds the 49-bucket word budget.
- *
- * Tier 1 (critical): always kept — root docs, key root configs
- * Tier 2 (high):     always kept — all source code
- * Tier 3 (medium):   dropped first when over budget — nested docs, yaml, html, json
- * Tier 4 (low):      dropped second — CSS/SCSS/LESS, bulk deeply-nested data JSON
- */
+const TOTAL_WORD_BUDGET = MAX_SOURCE_BUCKETS * WORD_LIMIT_PER_FILE; 
+
 const TIER1_EXTENSIONS = new Set(["md", "mdx", "json", "yaml", "yml", "toml"]);
 const TIER2_EXTENSIONS = new Set([
   "ts",
@@ -55,7 +43,6 @@ const TIER2_EXTENSIONS = new Set([
 const TIER3_EXTENSIONS = new Set(["html", "yaml", "yml", "toml"]);
 const TIER4_EXTENSIONS = new Set(["css", "scss", "sass", "less"]);
 
-/** Root-level config filenames always kept regardless of extension */
 const ROOT_CONFIG_NAMES = new Set([
   "package.json",
   "tsconfig.json",
@@ -101,7 +88,6 @@ const ROOT_CONFIG_NAMES = new Set([
   ".env.sample",
 ]);
 
-// All allowed extensions (superset)
 const SOURCE_EXTENSIONS = new Set([
   ...TIER2_EXTENSIONS,
   ...TIER4_EXTENSIONS,
@@ -185,8 +171,6 @@ const STOP_WORDS = new Set([
   "works",
 ]);
 
-// ── Types ─────────────────────────────────────────────────────────────────────
-
 type ImportRole = "Entry Point" | `Depth ${number}` | "Utility";
 type QueryIntent =
   | "contributors"
@@ -222,8 +206,6 @@ export interface ExpertPlan {
   intents?: QueryIntent[];
   focus?: CodeFocus;
 }
-
-// ── Intent & Focus Detection ──────────────────────────────────────────────────
 
 export function detectIntent(query: string): QueryIntent[] {
   const intents = new Set<QueryIntent>();
@@ -516,7 +498,6 @@ function importRoleLabel(depth: number | undefined): ImportRole {
   return `Depth ${depth}`;
 }
 
-/** Returns 1-4 (tier) or 0 (exclude). Lower = higher priority. */
 function fileTier(filePath: string): number {
   if (EXCLUDE_PATTERNS.some((re) => re.test(filePath))) return 0;
 
@@ -526,17 +507,14 @@ function fileTier(filePath: string): number {
 
   if (!SOURCE_EXTENSIONS.has(ext)) return 0;
 
-  // Tier 1: root-level readme/docs, key root configs
   const isRoot = parts.length === 1;
   const isShallowDoc = parts.length <= 2 && (ext === "md" || ext === "mdx");
   const isKeyConfig = isRoot && ROOT_CONFIG_NAMES.has(fileName);
-  const isGitHubWorkflow = /^\.github\/workflows\//i.test(filePath);
+  const isGitHubWorkflow = /^\.github\/workflows\//.test(filePath);
   if (isRoot || isShallowDoc || isKeyConfig || isGitHubWorkflow) return 1;
 
-  // Tier 2: all code files
   if (TIER2_EXTENSIONS.has(ext)) return 2;
 
-  // Tier 3: nested docs, yaml, html, json (informative but lower priority than code)
   if (
     ext === "md" ||
     ext === "mdx" ||
@@ -548,7 +526,6 @@ function fileTier(filePath: string): number {
   )
     return 3;
 
-  // Tier 4: CSS/SCSS/LESS (styling — rarely asked about in detail)
   if (TIER4_EXTENSIONS.has(ext)) return 4;
 
   return 0;
@@ -558,11 +535,6 @@ function shouldInclude(filePath: string): boolean {
   return fileTier(filePath) > 0;
 }
 
-/**
- * Selects which files to include given the total word budget.
- * Always keeps Tier 1 + Tier 2. Drops Tier 4 then Tier 3 if over budget.
- * Returns files with their tier attached for logging.
- */
 function selectFilesByBudget(
   candidates: any[],
   estimateWords: (f: any) => number,
@@ -571,7 +543,6 @@ function selectFilesByBudget(
     .map((f) => ({ file: f, tier: fileTier(f.path) }))
     .filter((x) => x.tier > 0);
 
-  // Always include tier 1 + 2
   const mustInclude = withTier.filter((x) => x.tier <= 2).map((x) => x.file);
   const tier3 = withTier.filter((x) => x.tier === 3).map((x) => x.file);
   const tier4 = withTier.filter((x) => x.tier === 4).map((x) => x.file);
@@ -583,12 +554,12 @@ function selectFilesByBudget(
 
   let selected = [...mustInclude, ...tier3, ...tier4];
   if (wordsOf(selected) > TOTAL_WORD_BUDGET) {
-    // Drop tier 4 first
+
     selected = [...mustInclude, ...tier3];
     droppedTiers.push(4);
   }
   if (wordsOf(selected) > TOTAL_WORD_BUDGET) {
-    // Drop tier 3 as well
+
     selected = [...mustInclude];
     droppedTiers.push(3);
   }
@@ -599,7 +570,7 @@ function selectFilesByBudget(
 function isDocFile(filePath: string): boolean {
   const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
   if (ext !== "md" && ext !== "mdx") return false;
-  return !/node_modules|CHANGELOG|CHANGES|HISTORY|\.github\/|dist\//i.test(
+  return !/node_modules|CHANGELOG|CHANGES|HISTORY|\.github\/|dist\//.test(
     filePath,
   );
 }
@@ -617,8 +588,6 @@ function safeContent(file: any): string {
   if (c === null || c === undefined) return "";
   return String(c);
 }
-
-// ── Section Builders ──────────────────────────────────────────────────────────
 
 export function getDirectoryStructure(
   filesMetadata: any[],
@@ -689,7 +658,7 @@ function docSortKey(filePath: string): string {
   const lower = filePath.toLowerCase();
   if (lower === "readme.md" || lower === "readme.mdx") return "0-root-readme";
   if (!filePath.includes("/")) return `1-root-${lower}`;
-  if (/^(docs?|wiki|documentation)\//i.test(filePath))
+  if (/^(docs?|wiki|documentation)\//.test(lower))
     return `2-docsfolder-${lower}`;
   return `3-other-${lower}`;
 }
@@ -1050,35 +1019,26 @@ export function getFileContext(
   return parts.join("\n");
 }
 
-// ── Two-Pass Packer ───────────────────────────────────────────────────────────
-
 function countWords(text: string): number {
   return text.split(/\s+/).filter(Boolean).length;
 }
 
-/**
- * Packs an ordered list of text blocks into at most MAX_SOURCE_BUCKETS (49) files.
- * Each file is capped at WORD_LIMIT_PER_FILE words. No new files are created after
- * the 49th bucket — remaining content is appended to the last bucket with a notice.
- */
 async function packAndFlush(
   blocks: Block[],
   outDir: string,
 ): Promise<string[]> {
   mkdirSync(outDir, { recursive: true });
 
-  // Combine all text in insertion order
   const allText = blocks.map((b) => b.text);
 
-  // Calculate a target words-per-bucket based on total content
   const totalWords = allText.reduce((s, t) => s + countWords(t), 0);
-  // Never exceed the NotebookLM per-file word cap
+
   const targetWordsPerBucket = Math.min(
     Math.ceil(totalWords / MAX_SOURCE_BUCKETS),
     WORD_LIMIT_PER_FILE,
   );
 
-  const buckets: string[][] = [[]]; // each bucket is an array of text chunks
+  const buckets: string[][] = [[]]; 
   const bucketWords: number[] = [0];
 
   for (const text of allText) {
@@ -1089,24 +1049,23 @@ async function packAndFlush(
       buckets.length < MAX_SOURCE_BUCKETS &&
       bucketWords[curr] + wc > targetWordsPerBucket
     ) {
-      // Open a new bucket
+
       buckets.push([text]);
       bucketWords.push(wc);
     } else {
-      // Append to current bucket (or overflow into last if at cap)
+
       if (
         buckets.length === MAX_SOURCE_BUCKETS &&
         bucketWords[curr] === 0 &&
         curr === 0
       ) {
-        // Edge case: still on first bucket, just append
+
       }
       buckets[curr].push(text);
       bucketWords[curr] += wc;
     }
   }
 
-  // Write buckets
   const written: string[] = [];
   for (let i = 0; i < buckets.length; i++) {
     const paddedNum = String(i + 1).padStart(2, "0");
@@ -1119,8 +1078,6 @@ async function packAndFlush(
 
   return written;
 }
-
-// ── Manifest Builder ──────────────────────────────────────────────────────────
 
 function buildManifest(
   fileCount: number,
@@ -1146,8 +1103,6 @@ function buildManifest(
     "END OF MANIFEST",
   ].join("\n");
 }
-
-// ── Main Export ───────────────────────────────────────────────────────────────
 
 export async function buildMasterContext(
   query: string,
@@ -1185,15 +1140,10 @@ export async function buildMasterContext(
     : (expertPlan?.focus ??
       (needsCode ? detectCodeFocus(safeQuery) : "generic"));
 
-  // ── Select files using tiered budget system ──────────────────────────────────
-  // Always keeps: Tier 1 (root docs + key configs) + Tier 2 (code).
-  // Drops Tier 4 (CSS) then Tier 3 (nested docs, yaml, json) only if needed to
-  // fit within the 49-bucket × 450 000-word budget.
   const allCandidates = filesMetadata.filter(
     (f) => f && typeof f.path === "string" && shouldInclude(f.path),
   );
 
-  // Estimate word count from char count (avg ~5 chars/word)
   const estimateWords = (f: any) =>
     Math.ceil((f.metrics?.charCount ?? f.content?.length ?? 0) / 5);
 
@@ -1212,14 +1162,12 @@ export async function buildMasterContext(
   const docFiles = allIncluded.filter((f) => isDocFile(f.path));
   const sourceFiles = allIncluded.filter((f) => !isDocFile(f.path));
 
-  // ── Pass 1: Collect all text blocks ─────────────────────────────────────────
   const blocks: Block[] = [];
 
   const push = (group: string, text: string) => {
     if (text.trim()) blocks.push({ group, text });
   };
 
-  // Meta section
   const metaLines: string[] = [];
   metaLines.push(
     `# ${repoContext?.meta?.fullName ?? "Unknown"} — Codebase Context`,
@@ -1278,7 +1226,6 @@ export async function buildMasterContext(
 
   push("_meta", metaLines.join("\n\n"));
 
-  // Code section
   if (needsCode) {
     const allGraphPaths = new Set([
       ...Object.keys(importGraph),
@@ -1365,10 +1312,8 @@ export async function buildMasterContext(
     `## End of Context\n\nSource files: ${needsCode ? "included" : "not included (meta-only query)"}.`,
   );
 
-  // ── Pass 2: Pack into ≤ 49 numbered files ────────────────────────────────────
   const writtenPaths = await packAndFlush(blocks, outputDir);
 
-  // ── Write manifest ────────────────────────────────────────────────────────────
   const manifestText = buildManifest(
     writtenPaths.length,
     repoName,

@@ -55,7 +55,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
       abortControllerRef.current = controller;
 
       try {
-        // 1. Start the Job
+
         const startResponse = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -77,7 +77,6 @@ const AiChat = ({ repoData }: AiChatProps) => {
 
         const { taskId } = await startResponse.json();
 
-        // 2. Poll for Completion
         pollIntervalRef.current = setInterval(async () => {
           if (controller.signal.aborted) {
             clearInterval(pollIntervalRef.current!);
@@ -91,7 +90,6 @@ const AiChat = ({ repoData }: AiChatProps) => {
             });
             const job = await pollResponse.json();
 
-            // Show real automator milestone if available
             if (job.statusText) {
               setCurrentStatus(job.statusText);
             }
@@ -119,7 +117,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
                 const updated = [...prev];
                 updated[updated.length - 1] = {
                   role: "assistant",
-                  content: `⚠️ Error: ${errMsg}`,
+                  content: ` Error: ${errMsg}`,
                 };
                 return updated;
               });
@@ -145,7 +143,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
             const updated = [...prev];
             updated[updated.length - 1] = {
               role: "assistant",
-              content: `⚠️ Error: ${err.message}`,
+              content: ` Error: ${err.message}`,
             };
             return updated;
           });
