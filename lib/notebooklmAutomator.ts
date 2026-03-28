@@ -67,7 +67,7 @@ export async function automateNotebookLM(
   files: string[],
   query: string,
   repoName: string,
-  onStatus?: (msg: string, partial?: string) => void,
+  onStatus?: (msg: string, partial?: string, progress?: number) => void,
 ): Promise<string> {
   const notebookTitle = `@RepoOrbit: ${repoName}`;
   let url = page.url();
@@ -76,7 +76,7 @@ export async function automateNotebookLM(
     await page.waitForTimeout(1000);
     const currentTitle = await page.title();
     if (!currentTitle.includes(notebookTitle)) {
-      onStatus?.("Switching to different repo notebook...");
+      onStatus?.("Switching notebooks...");
       await page.goto("https://notebooklm.google.com/", {
         waitUntil: "domcontentloaded",
         timeout: 45000,
@@ -149,13 +149,13 @@ export async function automateNotebookLM(
 
   if (filesToUpload.length > 0) {
     onStatus?.(
-      `Syncing ${filesToUpload.length} missing context file${filesToUpload.length !== 1 ? "s" : ""}...`,
+      `Syncing ${filesToUpload.length} context file${filesToUpload.length !== 1 ? "s" : ""}...`,
     );
     const uploadIconBtnSelector =
       'button.drop-zone-icon-button, button:has-text("Upload files"), [aria-label*="Upload files"]';
 
-    const BATCH_SIZE = 15;
-    const MAX_BATCH_SIZE_BYTES = 45 * 1024 * 1024; // 45 MB Playwright limit
+    const BATCH_SIZE = 50;
+    const MAX_BATCH_SIZE_BYTES = 45 * 1024 * 1024;
 
     const batches: string[][] = [];
     let currentBatch: string[] = [];
@@ -166,9 +166,7 @@ export async function automateNotebookLM(
       try {
         const stats = fs.statSync(file);
         fileSize = stats.size;
-      } catch (e) {
-        // file unmeasurable, assume 0 for batch math
-      }
+      } catch (e) {}
 
       if (
         currentBatch.length > 0 &&
@@ -190,15 +188,19 @@ export async function automateNotebookLM(
     let uploadedCount = 0;
     for (const batch of batches) {
       if (batch.length === 0) continue;
-      
+
       const uploadIconBtn = page.locator(uploadIconBtnSelector).first();
       let isModalOpen = await uploadIconBtn.isVisible().catch(() => false);
 
       if (!isModalOpen) {
         const addSourceBtn = page
-          .locator('.add-source-button, [aria-label="Add source"], button:has-text("Add source")')
+          .locator(
+            '.add-source-button, [aria-label="Add source"], button:has-text("Add source")',
+          )
           .first();
-        if (await addSourceBtn.isVisible({ timeout: 10000 }).catch(() => false)) {
+        if (
+          await addSourceBtn.isVisible({ timeout: 10000 }).catch(() => false)
+        ) {
           await addSourceBtn.click({ force: true });
           await page.waitForTimeout(2000);
         }
@@ -218,12 +220,18 @@ export async function automateNotebookLM(
         } catch (err) {
           retries--;
           await page.waitForTimeout(3000);
-          console.warn(`[NotebookLM automator] fileChooser attempt failed, retrying... (${retries} left)`);
-          
+          console.warn(
+            `[NotebookLM automator] fileChooser attempt failed, retrying... (${retries} left)`,
+          );
+
           // Try clicking 'Add source' again if modal was closed
           isModalOpen = await uploadIconBtn.isVisible().catch(() => false);
           if (!isModalOpen) {
-            const addSourceBtn = page.locator('.add-source-button, [aria-label="Add source"], button:has-text("Add source")').first();
+            const addSourceBtn = page
+              .locator(
+                '.add-source-button, [aria-label="Add source"], button:has-text("Add source")',
+              )
+              .first();
             if (await addSourceBtn.isVisible().catch(() => false)) {
               await addSourceBtn.click({ force: true });
               await page.waitForTimeout(2000);
@@ -231,16 +239,26 @@ export async function automateNotebookLM(
           }
         }
       }
-      
+
       if (!fileChooserSuccess) {
-        console.warn("[NotebookLM automator] Unable to trigger file upload dialog after multiple attempts. Likely hit NotebookLM's 50-source limit. Proceeding with currently uploaded sources...");
-        onStatus?.(`Hit source limit. Proceeding with ${uploadedCount} uploaded files...`);
+        console.warn(
+          "[NotebookLM automator] Unable to trigger file upload dialog after multiple attempts. Likely hit NotebookLM's 50-source limit. Proceeding with currently uploaded sources...",
+        );
+        onStatus?.(
+          `Hit source limit. Proceeding with ${uploadedCount} files...`,
+          undefined,
+          Math.round((uploadedCount / filesToUpload.length) * 100)
+        );
         break; // Break the batch loop gracefully
       }
 
       uploadedCount += batch.length;
-      onStatus?.(`Uploading context files... (${uploadedCount}/${filesToUpload.length})`);
-      
+      onStatus?.(
+        `Ingesting files... (${uploadedCount}/${filesToUpload.length})`,
+        undefined,
+        Math.round((uploadedCount / filesToUpload.length) * 100)
+      );
+
       // longer wait for large batches
       await page.waitForTimeout(5000);
     }
@@ -255,7 +273,7 @@ export async function automateNotebookLM(
     await page.waitForTimeout(4000);
   }
 
-  onStatus?.("Submitting your query...");
+  onStatus?.("Dispatching query...");
   const architectPrompt = getArchitectPrompt(query);
 
   const existingResponseSnapshotSnippet: string[] = await page.evaluate(`
@@ -290,7 +308,10 @@ export async function automateNotebookLM(
   const STABLE_POLLS_NEEDED = 2;
 
   while (Date.now() - startTime < 300000) {
-    const candidate = await page.evaluate<{ text: string; isGenerating: boolean } | null>(`
+    const candidate = await page.evaluate<{
+      text: string;
+      isGenerating: boolean;
+    } | null>(`
       ((snapshot) => {
         function findElementsDeep(selector, root = document) {
           let elements = Array.from(root.querySelectorAll(selector));
@@ -344,7 +365,7 @@ export async function automateNotebookLM(
       if (partial) {
         onStatus?.("Generating...", partial);
       } else {
-        onStatus?.("Generating...");
+        onStatus?.("Synthesizing response...");
       }
 
       const currentLength = rawText.length;

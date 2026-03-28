@@ -91,6 +91,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [currentStatus, setCurrentStatus] = useState<string | null>(null);
+  const [progress, setProgress] = useState<number | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -115,6 +116,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
     abortControllerRef.current = null;
     setIsLoading(false);
     setCurrentStatus(null);
+    setProgress(null);
     setMessages((prev) =>
       prev.map((m, i) =>
         i === prev.length - 1 && m.streaming ? { ...m, streaming: false } : m,
@@ -135,7 +137,8 @@ const AiChat = ({ repoData }: AiChatProps) => {
         { role: "assistant", content: "", streaming: true },
       ]);
       setIsLoading(true);
-      setCurrentStatus("Starting architect engine...");
+      setCurrentStatus("Init Architect Engine...");
+      setProgress(null);
 
       const controller = new AbortController();
       abortControllerRef.current = controller;
@@ -178,6 +181,11 @@ const AiChat = ({ repoData }: AiChatProps) => {
             if (job.statusText) {
               setCurrentStatus(job.statusText);
             }
+            if (job.progress !== undefined) {
+              setProgress(job.progress);
+            } else {
+              setProgress(null);
+            }
 
             if (job.partialResult) {
               setMessages((prev) => {
@@ -206,6 +214,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
               });
               setIsLoading(false);
               setCurrentStatus(null);
+              setProgress(null);
             } else if (job.status === "error") {
               clearInterval(pollIntervalRef.current!);
               pollIntervalRef.current = null;
@@ -221,6 +230,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
               });
               setIsLoading(false);
               setCurrentStatus(null);
+              setProgress(null);
             }
           } catch (pollErr: any) {
             if (pollErr.name !== "AbortError") {
@@ -230,6 +240,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
               abortControllerRef.current = null;
               setIsLoading(false);
               setCurrentStatus(null);
+              setProgress(null);
             }
           }
         }, 1000);
@@ -247,6 +258,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
           });
           setIsLoading(false);
           setCurrentStatus(null);
+          setProgress(null);
         }
       }
     },
@@ -263,7 +275,6 @@ const AiChat = ({ repoData }: AiChatProps) => {
 
   return (
     <div className="w-72 shrink-0 flex flex-col bg-gray-900 border border-gray-700 rounded-xl overflow-hidden h-full shadow-2xl">
-      {/* Header */}
       <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between bg-gray-950/50">
         <div className="flex items-center gap-1.5">
           <Cpu size={12} className="text-blue-500" />
@@ -277,7 +288,6 @@ const AiChat = ({ repoData }: AiChatProps) => {
         </span>
       </div>
 
-      {/* Messages */}
       <div className="flex-1 overflow-y-auto p-3 space-y-3">
         {messages.length === 0 && (
           <p className="text-[10px] font-mono text-slate-600 text-center mt-6 leading-relaxed">
@@ -299,32 +309,49 @@ const AiChat = ({ repoData }: AiChatProps) => {
             >
               {msg.role === "assistant" ? (
                 <div className="flex flex-col gap-1">
-                  {/* Empty + loading = show spinner */}
                   {msg.content === "" && msg.streaming ? (
-                    <div className="flex items-center gap-2 text-slate-400">
-                      <Loader2
-                        size={11}
-                        className="animate-spin text-blue-500"
-                      />
-                      <span className="animate-pulse">
-                        {currentStatus || "Thinking..."}
-                      </span>
+                    <div className="flex flex-col gap-1.5 mt-1 pt-1.5 w-full">
+                      <div className="flex items-center gap-1.5 text-slate-500">
+                        <Loader2
+                          size={10}
+                          className="animate-spin text-blue-500/70 shrink-0"
+                        />
+                        <span className="text-[9px] animate-pulse truncate">
+                          {currentStatus || "Init Architect..."}
+                        </span>
+                      </div>
+                      {progress !== null && (
+                        <div className="h-1 w-full bg-slate-800 rounded-full overflow-hidden mt-0.5">
+                          <div
+                            className="h-full bg-blue-500 transition-all duration-300 ease-out"
+                            style={{ width: `${progress}%` }}
+                          />
+                        </div>
+                      )}
                     </div>
                   ) : (
                     <>
-                      {/* Live markdown render — updates as partialResult grows */}
                       <MarkdownRenderer content={msg.content} />
 
-                      {/* Status bar shown while streaming */}
                       {msg.streaming && (
-                        <div className="flex items-center gap-1.5 text-slate-500 mt-1 border-t border-slate-800/50 pt-1.5">
-                          <Loader2
-                            size={10}
-                            className="animate-spin text-blue-500/70 shrink-0"
-                          />
-                          <span className="text-[9px] animate-pulse truncate">
-                            {currentStatus || "Generating..."}
-                          </span>
+                        <div className="flex flex-col gap-1.5 mt-1 border-t border-slate-800/50 pt-1.5">
+                          <div className="flex items-center gap-1.5 text-slate-500">
+                            <Loader2
+                              size={10}
+                              className="animate-spin text-blue-500/70 shrink-0"
+                            />
+                            <span className="text-[9px] animate-pulse truncate">
+                              {currentStatus || "Generating..."}
+                            </span>
+                          </div>
+                          {progress !== null && (
+                            <div className="h-1 w-full bg-slate-800 rounded-full overflow-hidden">
+                              <div
+                                className="h-full bg-blue-500 transition-all duration-300 ease-out"
+                                style={{ width: `${progress}%` }}
+                              />
+                            </div>
+                          )}
                         </div>
                       )}
                     </>
@@ -340,7 +367,6 @@ const AiChat = ({ repoData }: AiChatProps) => {
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Input */}
       <form
         onSubmit={handleSend}
         className="p-2.5 bg-gray-950 border-t border-gray-700 flex items-center gap-2"

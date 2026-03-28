@@ -18,6 +18,7 @@ const activeJobs: Map<
     partialResult?: string;
     error?: string;
     statusText?: string;
+    progress?: number;
   }
 > = (global as any)[GLOBAL_JOBS_KEY] || new Map();
 (global as any)[GLOBAL_JOBS_KEY] = activeJobs;
@@ -63,11 +64,11 @@ async function fetchFileContents(
   repo: string,
   files: any[],
   ref: string,
-  onStatus?: (msg: string) => void,
+  onStatus?: (msg: string, partial?: string, progress?: number) => void,
 ) {
   const result = new Map<string, string>();
-  const CHUNK_SIZE = 50;
-  const CONCURRENCY = 5;
+  const CHUNK_SIZE = 100; // Increased to 100 GraphQL paths per single query body
+  const CONCURRENCY = 50; // Increased to 50 concurrent network requests
 
   let token = process.env.GITHUB_TOKEN || process.env.NEXT_PUBLIC_GITHUB_TOKEN;
 
@@ -83,12 +84,15 @@ async function fetchFileContents(
   ) {
     const batchedChunks = allChunks.slice(blockIndex, blockIndex + CONCURRENCY);
     const upperLimit = Math.min(blockIndex + CONCURRENCY, allChunks.length);
+    const filesFetched = Math.min(upperLimit * CHUNK_SIZE, files.length);
 
     console.log(
       `[GitHub API] Fetching chunks ${blockIndex + 1} to ${upperLimit} of ${allChunks.length}...`,
     );
     onStatus?.(
-      `Downloading repo logic (${upperLimit}/${allChunks.length} chunks)`,
+      `Syncing source... (${filesFetched}/${files.length})`,
+      undefined,
+      Math.round((filesFetched / files.length) * 100)
     );
 
     await Promise.all(
@@ -199,19 +203,20 @@ export async function POST(req: Request) {
 
     const processJob = async () => {
       try {
-        const setStatus = (msg: string, partial?: string) => {
+        const setStatus = (msg: string, partial?: string, overrideProgress?: number) => {
           const job = activeJobs.get(taskId);
           if (job)
             activeJobs.set(taskId, {
               ...job,
               statusText: msg,
               partialResult: partial,
+              progress: overrideProgress,
             });
         };
 
         if (!fs.existsSync(outDir)) {
           fs.mkdirSync(outDir, { recursive: true });
-          setStatus("Generating build manifest...");
+          setStatus("Resolving repository tree...");
 
           const coreFiles = tree.filter((f: any) => {
             const p = f.path;
@@ -274,7 +279,7 @@ export async function POST(req: Request) {
             setStatus,
           );
 
-          setStatus("Running static code analysis...");
+          setStatus("Building context graphs...");
           const metadata = Array.from(contents.entries()).map(([p, c]) => ({
             path: p,
             content: c,
@@ -293,7 +298,7 @@ export async function POST(req: Request) {
           );
         }
 
-        setStatus("Bootstrapping Playwright engine...");
+        setStatus("Booting headless LLM...");
         const files = fs
           .readdirSync(outDir)
           .filter((f) => f.endsWith(".txt"))
