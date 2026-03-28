@@ -93,6 +93,7 @@ export interface RepoContext {
     htmlUrl: string;
     prerelease: boolean;
     draft: boolean;
+    body: string | null;
   }[];
 
   latestRelease: {
@@ -102,6 +103,7 @@ export interface RepoContext {
     htmlUrl: string;
     prerelease: boolean;
     draft: boolean;
+    body: string | null;
   } | null;
 
   branches: {
@@ -121,6 +123,11 @@ export interface RepoContext {
     comments: number;
     htmlUrl: string;
     body: string | null;
+    commentThread: {
+      author: string;
+      body: string;
+      createdAt: string;
+    }[];
   }[];
 
   pulls: {
@@ -139,6 +146,12 @@ export interface RepoContext {
     comments: number;
     htmlUrl: string;
     body: string | null;
+    reviewCommentThread: {
+      author: string;
+      body: string;
+      path: string;
+      createdAt: string;
+    }[];
   }[];
 
   tree: RepoTreeEntry[];

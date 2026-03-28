@@ -5,6 +5,7 @@ import path from "path";
 import fs from "fs";
 import { analyzeFile } from "@/lib/github";
 import { automateNotebookLM } from "@/lib/notebooklmAutomator";
+import { runGeminiRouter } from "@/lib/Geminiautomator";
 
 const CONTEXT_DIR_PATH = "/tmp/notebooklm_sources";
 const NOTEBOOKLM_URL = "https://notebooklm.google.com/";
@@ -67,12 +68,13 @@ async function fetchFileContents(
   onStatus?: (msg: string, partial?: string, progress?: number) => void,
 ) {
   const result = new Map<string, string>();
-  const CHUNK_SIZE = 100; // Increased to 100 GraphQL paths per single query body
-  const CONCURRENCY = 50; // Increased to 50 concurrent network requests
+  const CHUNK_SIZE = 100;
+  const CONCURRENCY = 50;
 
-  let token = process.env.GITHUB_TOKEN || process.env.NEXT_PUBLIC_GITHUB_TOKEN;
+  const token =
+    process.env.GITHUB_TOKEN || process.env.NEXT_PUBLIC_GITHUB_TOKEN;
 
-  const allChunks = [];
+  const allChunks: any[][] = [];
   for (let i = 0; i < files.length; i += CHUNK_SIZE) {
     allChunks.push(files.slice(i, i + CHUNK_SIZE));
   }
@@ -92,11 +94,11 @@ async function fetchFileContents(
     onStatus?.(
       `Syncing source... (${filesFetched}/${files.length})`,
       undefined,
-      Math.round((filesFetched / files.length) * 100)
+      Math.round((filesFetched / files.length) * 100),
     );
 
     await Promise.all(
-      batchedChunks.map(async (chunk, chunkOffset) => {
+      batchedChunks.map(async (chunk) => {
         const fields = chunk
           .map(
             (f, idx) =>
@@ -139,49 +141,124 @@ async function fetchFileContents(
   return result;
 }
 
+// ─── Per-notebook progress tracker ───────────────────────────────────────────
+// Keeps the last known progress for each notebook so that averaging never
+// pulls a live notebook down to 0 just because another notebook hasn't
+// reported yet.
+
+class NotebookProgressTracker {
+  private statuses = new Map<number, { text: string; progress: number }>();
+
+  update(nb: number, text: string, progress?: number) {
+    const prev = this.statuses.get(nb);
+    this.statuses.set(nb, {
+      text,
+      // Keep previous progress value if the new call doesn't supply one
+      progress: progress ?? prev?.progress ?? 0,
+    });
+  }
+
+  combinedStatusText(): string {
+    return Array.from(this.statuses.entries())
+      .sort(([a], [b]) => a - b)
+      .map(([nb, s]) => `NB${nb}: ${s.text} (${s.progress}%)`)
+      .join(" | ");
+  }
+
+  averageProgress(): number {
+    if (this.statuses.size === 0) return 0;
+    const total = Array.from(this.statuses.values()).reduce(
+      (acc, s) => acc + s.progress,
+      0,
+    );
+    return Math.round(total / this.statuses.size);
+  }
+}
+
 async function uploadAndGetResult(
   context: BrowserContext,
-  files: string[],
+  outputDir: string,
   query: string,
   taskId: string,
   repoName: string,
 ) {
   try {
-    const pages = context.pages();
-    let page: Page | undefined = pages.find((p) =>
-      p.url().includes("notebooklm.google.com"),
-    );
+    const tracker = new NotebookProgressTracker();
 
-    if (!page) {
-      page = await context.newPage();
-      await page.goto(NOTEBOOKLM_URL, {
-        waitUntil: "domcontentloaded",
-        timeout: 60000,
-      });
-    }
-
-    if (!page) throw new Error("Could not create or find a NotebookLM page.");
-
-    const onStatus = (msg: string, partial?: string) => {
+    const onStatus = (msg: string, partial?: string, progress?: number) => {
       const job = activeJobs.get(taskId);
-      if (job)
+      if (!job) return;
+
+      const nbMatch = msg.match(/^\[NB(\d+)\] (.*)/);
+      if (nbMatch) {
+        const nbNum = parseInt(nbMatch[1], 10);
+        const rest = nbMatch[2];
+        tracker.update(nbNum, rest, progress);
+
+        activeJobs.set(taskId, {
+          ...job,
+          statusText: tracker.combinedStatusText(),
+          partialResult: partial ?? job.partialResult, // never overwrite with undefined
+          progress: tracker.averageProgress(),
+        });
+      } else {
+        // Global (non-per-notebook) status: preserve current progress unless
+        // a new value is explicitly provided.
         activeJobs.set(taskId, {
           ...job,
           statusText: msg,
-          partialResult: partial,
+          partialResult: partial ?? job.partialResult,
+          ...(progress !== undefined ? { progress } : {}),
         });
+      }
     };
 
-    const result = await automateNotebookLM(
-      page,
-      files,
-      query,
-      repoName,
-      onStatus,
+    // 1. Pre-warm NotebookLM tabs in parallel with Gemini routing
+    console.log(
+      `[AIAgent] Pre-warming 3 NotebookLM tabs for task ${taskId}...`,
     );
-    activeJobs.set(taskId, { status: "done", result });
+    const preWarmTask = Promise.all(
+      [1, 2, 3].map(async () => {
+        const p = await context.newPage();
+        await p.goto(NOTEBOOKLM_URL, {
+          waitUntil: "domcontentloaded",
+          timeout: 60000,
+        });
+        return p;
+      }),
+    );
+
+    // 2. Run Gemini Router
+    const routerPage = await context.newPage();
+    const routerIndexPath = path.join(outputDir, "router_index.json");
+
+    const geminiRoute = await runGeminiRouter(routerPage, {
+      routerIndexPath,
+      userQuery: query,
+      onStatus: (msg) => onStatus(msg),
+    });
+
+    await routerPage.close().catch(() => {});
+
+    // 3. Wait for pre-warming to complete
+    const preWarmedPages = await preWarmTask;
+
+    // 4. Run NotebookLM Automator
+    const result = await automateNotebookLM(
+      context,
+      null,
+      {},
+      geminiRoute,
+      repoName,
+      outputDir,
+      onStatus,
+      preWarmedPages,
+    );
+
+    onStatus("Done", undefined, 100);
+    activeJobs.set(taskId, { status: "done", result, progress: 100 });
   } catch (err: any) {
-    console.error(`[NotebookLM] Error in automateNotebookLM: ${err.message}`);
+    console.error(`[AIAgent] Error in automation pipeline: ${err.message}`);
     activeJobs.set(taskId, { status: "error", error: err.message });
   }
 }
@@ -197,26 +274,34 @@ export async function POST(req: Request) {
     const { query, repoContext, owner, repo, tree, defaultBranch } =
       await req.json();
     const taskId = Math.random().toString(36).substring(7);
-    activeJobs.set(taskId, { status: "pending" });
+    activeJobs.set(taskId, { status: "pending", progress: 0 });
 
     const outDir = path.join(CONTEXT_DIR_PATH, owner, repo);
 
     const processJob = async () => {
       try {
-        const setStatus = (msg: string, partial?: string, overrideProgress?: number) => {
+        // updateStatus never touches progress unless explicitly given one,
+        // so the bar never jumps backwards to 0.
+        const updateStatus = (
+          msg: string,
+          partial?: string,
+          explicitProgress?: number,
+        ) => {
           const job = activeJobs.get(taskId);
-          if (job)
-            activeJobs.set(taskId, {
-              ...job,
-              statusText: msg,
-              partialResult: partial,
-              progress: overrideProgress,
-            });
+          if (!job) return;
+          activeJobs.set(taskId, {
+            ...job,
+            statusText: msg,
+            ...(partial !== undefined ? { partialResult: partial } : {}),
+            ...(explicitProgress !== undefined
+              ? { progress: explicitProgress }
+              : {}),
+          });
         };
 
         if (!fs.existsSync(outDir)) {
           fs.mkdirSync(outDir, { recursive: true });
-          setStatus("Resolving repository tree...");
+          updateStatus("Resolving repository tree...", undefined, 0);
 
           const coreFiles = tree.filter((f: any) => {
             const p = f.path;
@@ -230,7 +315,6 @@ export async function POST(req: Request) {
               pLower.includes("out/")
             )
               return false;
-
             if (
               pLower.includes("__snapshots__") ||
               pLower.includes("fixtures/") ||
@@ -264,7 +348,6 @@ export async function POST(req: Request) {
               "yarn.lock",
               "pnpm-lock.yaml",
             ];
-
             if (ignoredExtensions.some((ext) => pLower.endsWith(ext)))
               return false;
 
@@ -276,17 +359,17 @@ export async function POST(req: Request) {
             repo,
             coreFiles,
             defaultBranch || "main",
-            setStatus,
+            updateStatus,
           );
 
-          setStatus("Building context graphs...");
+          updateStatus("Building context graphs...");
           const metadata = Array.from(contents.entries()).map(([p, c]) => ({
             path: p,
             content: c,
             analysis: analyzeFile(p, c),
           }));
 
-          setStatus("Chunking and structuring contexts...");
+          updateStatus("Chunking and structuring contexts...");
           await buildMasterContext(
             query,
             metadata,
@@ -298,15 +381,9 @@ export async function POST(req: Request) {
           );
         }
 
-        setStatus("Booting headless LLM...");
-        const files = fs
-          .readdirSync(outDir)
-          .filter((f) => f.endsWith(".txt"))
-          .map((f) => path.join(outDir, f))
-          .sort();
-
+        updateStatus("Booting headless LLM...");
         const context = await getOrCreateContext();
-        await uploadAndGetResult(context, files, query, taskId, repo);
+        await uploadAndGetResult(context, outDir, query, taskId, repo);
       } catch (err: any) {
         console.error(`[Background Job Error]: ${err.message}`);
         activeJobs.set(taskId, { status: "error", error: err.message });

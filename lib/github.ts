@@ -238,6 +238,55 @@ export function analyzeFile(filename: string, content: string) {
   };
 }
 
+// ─── NEW: Fetch comments for a single issue or PR ────────────────────────────
+// Capped at 10 comments per item to avoid hammering rate limits.
+async function fetchIssueComments(
+  owner: string,
+  repo: string,
+  issueNumber: number,
+): Promise<Array<{ author: string; body: string; createdAt: string }>> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/issues/${issueNumber}/comments?per_page=10`;
+  try {
+    const res = await fetch(url, { headers: getHeaders(), ...withCache });
+    if (!res.ok) return [];
+    const data = await res.json().catch(() => null);
+    if (!Array.isArray(data)) return [];
+    return data.map((c: any) => ({
+      author: c.user?.login ?? "unknown",
+      body: typeof c.body === "string" ? c.body.slice(0, 300) : "",
+      createdAt: c.created_at ?? "",
+    }));
+  } catch {
+    return [];
+  }
+}
+
+// ─── NEW: Fetch PR review comments (code-level comments) ─────────────────────
+// These are the inline diff comments, separate from regular PR comments.
+async function fetchPRReviewComments(
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<
+  Array<{ author: string; body: string; path: string; createdAt: string }>
+> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/comments?per_page=10`;
+  try {
+    const res = await fetch(url, { headers: getHeaders(), ...withCache });
+    if (!res.ok) return [];
+    const data = await res.json().catch(() => null);
+    if (!Array.isArray(data)) return [];
+    return data.map((c: any) => ({
+      author: c.user?.login ?? "unknown",
+      body: typeof c.body === "string" ? c.body.slice(0, 300) : "",
+      path: c.path ?? "",
+      createdAt: c.created_at ?? "",
+    }));
+  } catch {
+    return [];
+  }
+}
+
 export const getRepoData = async (owner: string, repo: string) => {
   const url = `https://api.github.com/repos/${owner}/${repo}`;
   const headers = getHeaders();
@@ -294,21 +343,26 @@ export const getRepoData = async (owner: string, repo: string) => {
       headers: getHeaders(),
       ...withCache,
     }),
-    fetch(`https://api.github.com/repos/${owner}/${repo}/releases?per_page=5`, {
-      headers: getHeaders(),
-      ...withCache,
-    }),
+    // CHANGED: per_page=10 so we can afford to also fetch release bodies
+    fetch(
+      `https://api.github.com/repos/${owner}/${repo}/releases?per_page=10`,
+      {
+        headers: getHeaders(),
+        ...withCache,
+      },
+    ),
     fetch(
       `https://api.github.com/repos/${owner}/${repo}/branches?per_page=30`,
       { headers: getHeaders(), ...withCache },
     ),
-
+    // CHANGED: bump issues to 50 and include closed ones too
     fetch(
-      `https://api.github.com/repos/${owner}/${repo}/issues?state=open&per_page=30&pulls=false`,
+      `https://api.github.com/repos/${owner}/${repo}/issues?state=all&per_page=50&pulls=false`,
       { headers: getHeaders(), ...withCache },
     ),
+    // CHANGED: bump PRs to 50
     fetch(
-      `https://api.github.com/repos/${owner}/${repo}/pulls?state=all&per_page=30`,
+      `https://api.github.com/repos/${owner}/${repo}/pulls?state=all&per_page=50`,
       { headers: getHeaders(), ...withCache },
     ),
   ]);
@@ -375,6 +429,42 @@ export const getRepoData = async (owner: string, repo: string) => {
     0,
   );
 
+  // ─── NEW: Fetch issue comments in parallel (cap at 20 issues to save quota)
+  const rawIssues: any[] = Array.isArray(issuesData)
+    ? issuesData.filter((i: any) => !i.pull_request)
+    : [];
+
+  const issueCommentsMap = new Map<
+    number,
+    Array<{ author: string; body: string; createdAt: string }>
+  >();
+
+  await Promise.all(
+    rawIssues.slice(0, 20).map(async (i: any) => {
+      if (i.comments > 0) {
+        const comments = await fetchIssueComments(owner, repo, i.number);
+        issueCommentsMap.set(i.number, comments);
+      }
+    }),
+  );
+
+  // ─── NEW: Fetch PR review comments in parallel (cap at 20 PRs)
+  const rawPulls: any[] = Array.isArray(pullsData) ? pullsData : [];
+
+  const prReviewCommentsMap = new Map<
+    number,
+    Array<{ author: string; body: string; path: string; createdAt: string }>
+  >();
+
+  await Promise.all(
+    rawPulls.slice(0, 20).map(async (p: any) => {
+      if ((p.review_comments ?? 0) > 0) {
+        const comments = await fetchPRReviewComments(owner, repo, p.number);
+        prReviewCommentsMap.set(p.number, comments);
+      }
+    }),
+  );
+
   const rawTree: any[] = treeData.tree ?? [];
   const allPaths = rawTree.map((n: any) => n.path as string);
 
@@ -416,43 +506,43 @@ export const getRepoData = async (owner: string, repo: string) => {
   const latestCommitRaw = Array.isArray(commitsData) ? commitsData[0] : null;
   const releases = Array.isArray(releasesData) ? releasesData : [];
 
-  const issues = Array.isArray(issuesData)
-    ? issuesData
-        .filter((i: any) => !i.pull_request)
-        .map((i: any) => ({
-          number: i.number,
-          title: i.title,
-          state: i.state as "open" | "closed",
-          author: i.user?.login ?? null,
-          createdAt: i.created_at,
-          updatedAt: i.updated_at,
-          closedAt: i.closed_at ?? null,
-          labels: (i.labels ?? []).map((l: any) => l.name as string),
-          comments: i.comments,
-          htmlUrl: i.html_url,
-          body: i.body ? (i.body as string).slice(0, 500) : null,
-        }))
-    : [];
+  const issues = rawIssues.map((i: any) => ({
+    number: i.number,
+    title: i.title,
+    state: i.state as "open" | "closed",
+    author: i.user?.login ?? null,
+    createdAt: i.created_at,
+    updatedAt: i.updated_at,
+    closedAt: i.closed_at ?? null,
+    labels: (i.labels ?? []).map((l: any) => l.name as string),
+    comments: i.comments,
+    htmlUrl: i.html_url,
+    // CHANGED: body kept at 500 chars (single truncation — contextBuilder no longer re-truncates)
+    body: i.body ? (i.body as string).slice(0, 500) : null,
+    // NEW: actual comment thread
+    commentThread: issueCommentsMap.get(i.number) ?? [],
+  }));
 
-  const pulls = Array.isArray(pullsData)
-    ? pullsData.map((p: any) => ({
-        number: p.number,
-        title: p.title,
-        state: p.state as "open" | "closed",
-        merged: p.merged_at !== null,
-        author: p.user?.login ?? null,
-        createdAt: p.created_at,
-        updatedAt: p.updated_at,
-        mergedAt: p.merged_at ?? null,
-        closedAt: p.closed_at ?? null,
-        baseBranch: p.base?.ref ?? null,
-        headBranch: p.head?.ref ?? null,
-        labels: (p.labels ?? []).map((l: any) => l.name as string),
-        comments: p.comments,
-        htmlUrl: p.html_url,
-        body: p.body ? (p.body as string).slice(0, 500) : null,
-      }))
-    : [];
+  const pulls = rawPulls.map((p: any) => ({
+    number: p.number,
+    title: p.title,
+    state: p.state as "open" | "closed",
+    merged: p.merged_at !== null,
+    author: p.user?.login ?? null,
+    createdAt: p.created_at,
+    updatedAt: p.updated_at,
+    mergedAt: p.merged_at ?? null,
+    closedAt: p.closed_at ?? null,
+    baseBranch: p.base?.ref ?? null,
+    headBranch: p.head?.ref ?? null,
+    labels: (p.labels ?? []).map((l: any) => l.name as string),
+    comments: p.comments,
+    reviewComments: p.review_comments ?? 0,
+    htmlUrl: p.html_url,
+    body: p.body ? (p.body as string).slice(0, 500) : null,
+    // NEW: inline code review comments
+    reviewCommentThread: prReviewCommentsMap.get(p.number) ?? [],
+  }));
 
   const repoContext: RepoContext = {
     meta: {
@@ -523,21 +613,26 @@ export const getRepoData = async (owner: string, repo: string) => {
 
     releases: releases.map((r: any) => ({
       tagName: r.tag_name,
-      name: r.name,
+      name: r.name ?? r.tag_name,
       publishedAt: r.published_at,
       htmlUrl: r.html_url,
       prerelease: r.prerelease,
       draft: r.draft,
+      // NEW: release body (changelog text), capped at 1000 chars
+      body: r.body ? (r.body as string).slice(0, 1000) : null,
     })),
 
     latestRelease: releases[0]
       ? {
           tagName: releases[0].tag_name,
-          name: releases[0].name,
+          name: releases[0].name ?? releases[0].tag_name,
           publishedAt: releases[0].published_at,
           htmlUrl: releases[0].html_url,
           prerelease: releases[0].prerelease,
           draft: releases[0].draft,
+          body: releases[0].body
+            ? (releases[0].body as string).slice(0, 1000)
+            : null,
         }
       : null,
 

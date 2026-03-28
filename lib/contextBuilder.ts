@@ -2,16 +2,23 @@ import { mkdirSync } from "fs";
 import { writeFile } from "fs/promises";
 import { join } from "path";
 
+// ─── Tunables ────────────────────────────────────────────────────────────────
+
 const IMPORT_DEPTH = 99999;
 const FILE_CHAR_LIMIT = 100_000;
 const SPLIT_THRESHOLD_CHARS = 3_000;
 const MIN_RELEVANCE_SCORE_GENERIC = 3;
 const MIN_RELEVANCE_SCORE_TARGETED = 15;
 
-const MAX_OUTPUT_FILES = 50;
-const MAX_SOURCE_BUCKETS = MAX_OUTPUT_FILES - 1;
+// ── 3-notebook architecture ───────────────────────────────────────────────────
+const NOTEBOOKS = 3;
+const FILES_PER_NOTEBOOK = 50;
+const DATA_BUCKETS_PER_NOTEBOOK = FILES_PER_NOTEBOOK - 1; // 49 data slots
+const TOTAL_DATA_BUCKETS = NOTEBOOKS * DATA_BUCKETS_PER_NOTEBOOK; // 147
 const WORD_LIMIT_PER_FILE = 450_000;
-const TOTAL_WORD_BUDGET = MAX_SOURCE_BUCKETS * WORD_LIMIT_PER_FILE;
+const TOTAL_WORD_BUDGET = TOTAL_DATA_BUCKETS * WORD_LIMIT_PER_FILE;
+
+// ─── Language detection ───────────────────────────────────────────────────────
 
 type RepoLanguage = "c" | "web" | "go" | "rust" | "python" | "java" | "mixed";
 
@@ -23,7 +30,6 @@ function detectRepoLanguage(filesMetadata: any[]): RepoLanguage {
   }
   const total = filesMetadata.length || 1;
   const pct = (ext: string) => ((extCounts[ext] ?? 0) / total) * 100;
-
   if (pct("c") + pct("h") > 20) return "c";
   if (pct("rs") > 15) return "rust";
   if (pct("go") > 15) return "go";
@@ -32,6 +38,8 @@ function detectRepoLanguage(filesMetadata: any[]): RepoLanguage {
   if (pct("ts") + pct("tsx") + pct("js") + pct("jsx") > 15) return "web";
   return "mixed";
 }
+
+// ─── File classification ──────────────────────────────────────────────────────
 
 const TIER2_WEB = new Set([
   "ts",
@@ -43,6 +51,7 @@ const TIER2_WEB = new Set([
   "svelte",
   "vue",
 ]);
+
 const TIER2_SYSTEMS = new Set([
   "c",
   "h",
@@ -63,9 +72,10 @@ const TIER2_SYSTEMS = new Set([
   "bash",
   "zsh",
   "sql",
-  "S",
-  "ld",
+  "S", // assembly
+  "ld", // linker scripts
 ]);
+
 const KERNEL_CONFIG_EXTENSIONS = new Set(["Kconfig", "Makefile", "makefile"]);
 
 const TIER3_EXTENSIONS = new Set([
@@ -117,7 +127,6 @@ const ROOT_CONFIG_NAMES = new Set([
   "jest.config.ts",
   "jest.config.js",
   "vitest.config.ts",
-  "vitest.config.ts",
   "tailwind.config.ts",
   "tailwind.config.js",
   "turbo.json",
@@ -161,6 +170,8 @@ const EXCLUDE_PATTERNS: RegExp[] = [
   /tags$/,
   /TAGS$/,
 ];
+
+// ─── Stop words ───────────────────────────────────────────────────────────────
 
 const STOP_WORDS = new Set([
   "what",
@@ -255,9 +266,42 @@ export interface ExpertPlan {
   focus?: CodeFocus;
 }
 
-// ─── Subsystem map (Linux kernel) ─────────────────────────────────────────────
-// Maps top-level directory prefix → human-readable subsystem name.
-// Used to group files into subsystem-coherent buckets instead of word-count splits.
+// ─── Cross-notebook bridge types ──────────────────────────────────────────────
+
+interface CrossBoundaryCall {
+  callerFile: string;
+  callerSubsystem: string;
+  calleeName: string;
+  calleeFile: string;
+  calleeSubsystem: string;
+  calleeSignature: string;
+}
+
+// ─── Router index types ───────────────────────────────────────────────────────
+
+interface NotebookEntry {
+  notebook: number;
+  dir: string;
+  label: string;
+  subsystems: string[];
+  files: string[];
+  keywords: string[];
+  wordEstimate: number;
+  bridgeCount: number;
+}
+
+export interface RouterIndex {
+  repo: string;
+  lang: RepoLanguage;
+  generatedAt: string;
+  mode: string;
+  totalSourceFiles: number;
+  totalOutputFiles: number;
+  notebooks: NotebookEntry[];
+  crossBoundaryMap: Record<string, string[]>;
+}
+
+// ─── Subsystem map ────────────────────────────────────────────────────────────
 
 const LINUX_SUBSYSTEMS: Record<string, string> = {
   arch: "arch",
@@ -372,9 +416,8 @@ function detectIntent(query: string): QueryIntent[] {
     hasSnakeSymbol ||
     hasQuotedSymbol ||
     hasFilePath
-  ) {
+  )
     intents.add("code");
-  }
 
   return [...intents];
 }
@@ -415,16 +458,10 @@ function detectCodeFocus(query: string): CodeFocus {
 
 function extractQueryTokens(query: string): string[] {
   const tokens = new Set<string>();
-
-  // Quoted symbols
   for (const q of query.match(/['"`]([a-zA-Z_$][a-zA-Z0-9_$]{2,})['"`]/g) ?? [])
     tokens.add(q.replace(/['"`]/g, ""));
-
-  // File paths
   for (const p of query.match(/\b[\w-]+\/[\w-]+(\.[a-z]{1,5})?\b/g) ?? [])
     tokens.add(p);
-
-  // Dot-chains
   for (const chain of query.match(/\b[a-zA-Z_$][a-zA-Z0-9_$.]{3,}\b/g) ?? []) {
     if (chain.includes(".")) {
       tokens.add(chain);
@@ -432,31 +469,22 @@ function extractQueryTokens(query: string): string[] {
         if (part.length > 2) tokens.add(part);
     }
   }
-
-  // camelCase and snake_case
   for (const c of query.match(/\b[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*\b/g) ?? [])
     tokens.add(c);
   for (const s of query.match(/\b[a-z][a-z0-9]*(_[a-z0-9]+){1,}\b/g) ?? [])
     tokens.add(s);
-
-  // Plain words
   for (const w of query
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, " ")
     .split(/\s+/))
     if (w.length >= 2 && !STOP_WORDS.has(w)) tokens.add(w);
-
   return [...tokens];
 }
 
-// ─── C-aware symbol extraction ────────────────────────────────────────────────
-// Extracts function names, macro names, struct/typedef names from C source.
-// Used to enrich scoring when importGraph is empty (all C repos).
+// ─── C symbol extraction ──────────────────────────────────────────────────────
 
 function extractCSymbols(content: string): string[] {
   const syms = new Set<string>();
-
-  // Function definitions: return_type function_name(
   for (const m of content.matchAll(/^[\w\s\*]+?\b(\w+)\s*\(/gm)) {
     const name = m[1];
     if (
@@ -466,25 +494,45 @@ function extractCSymbols(content: string): string[] {
     )
       syms.add(name);
   }
-
-  // #define MACRO_NAME
   for (const m of content.matchAll(/^#\s*define\s+(\w+)/gm))
     if (m[1]) syms.add(m[1]);
-
-  // struct/union/typedef names
   for (const m of content.matchAll(/(?:struct|union|typedef)\s+(\w+)/g))
     if (m[1]) syms.add(m[1]);
-
-  // EXPORT_SYMBOL / EXPORT_SYMBOL_GPL — these are the kernel's "exports"
   for (const m of content.matchAll(/EXPORT_SYMBOL(?:_GPL)?\s*\(\s*(\w+)\s*\)/g))
     if (m[1]) syms.add(m[1]);
-
   return [...syms];
 }
 
-// ─── C call-graph extraction ──────────────────────────────────────────────────
-// Builds a lightweight include-graph for C files since importGraph is JS-only.
-// Returns a map: filePath → list of #included local paths (best-effort).
+// ─── C signature extraction ───────────────────────────────────────────────────
+
+function extractCSignatures(content: string): Map<string, string> {
+  const sigs = new Map<string, string>();
+  const lines = content.split("\n");
+  const defRe = /^([a-zA-Z_][\w\s\*]*?\b(\w+))\s*\([^;{]*\)/;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith(" ") || lines[i].startsWith("\t")) continue;
+    const m = defRe.exec(lines[i]);
+    if (!m) continue;
+    const name = m[2];
+    if (
+      !name ||
+      ["if", "for", "while", "switch", "else", "do", "return"].includes(name)
+    )
+      continue;
+    let sig = lines[i].trim();
+    let j = i + 1;
+    while (!sig.includes(")") && j < Math.min(i + 5, lines.length)) {
+      sig += " " + lines[j].trim();
+      j++;
+    }
+    const end = sig.indexOf(")");
+    if (end !== -1) sig = sig.slice(0, end + 1);
+    sigs.set(name, sig);
+  }
+  return sigs;
+}
+
+// ─── C include graph ──────────────────────────────────────────────────────────
 
 function buildCIncludeGraph(filesMetadata: any[]): Record<string, string[]> {
   const pathIndex = new Map<string, string>();
@@ -492,20 +540,131 @@ function buildCIncludeGraph(filesMetadata: any[]): Record<string, string[]> {
     const base = (f.path as string).split("/").pop() ?? "";
     pathIndex.set(base, f.path);
   }
-
   const graph: Record<string, string[]> = {};
   for (const f of filesMetadata) {
     const content = safeContent(f);
     const deps: string[] = [];
     for (const m of content.matchAll(/^#\s*include\s+"([^"]+)"/gm)) {
-      const inc = m[1];
-      const base = inc.split("/").pop() ?? "";
+      const base = m[1].split("/").pop() ?? "";
       const resolved = pathIndex.get(base);
       if (resolved && resolved !== f.path) deps.push(resolved);
     }
     if (deps.length) graph[f.path] = deps;
   }
   return graph;
+}
+
+// ─── Cross-boundary call detection ────────────────────────────────────────────
+
+function detectCrossBoundaryCalls(filesMetadata: any[]): CrossBoundaryCall[] {
+  const symbolIndex = new Map<
+    string,
+    { file: string; subsystem: string; signature: string }
+  >();
+
+  for (const f of filesMetadata) {
+    const sub = subsystemKey(f.path);
+    const content = safeContent(f);
+    const sigs = extractCSignatures(content);
+    for (const [name, sig] of sigs) {
+      if (!symbolIndex.has(name))
+        symbolIndex.set(name, { file: f.path, subsystem: sub, signature: sig });
+    }
+    for (const m of content.matchAll(
+      /EXPORT_SYMBOL(?:_GPL)?\s*\(\s*(\w+)\s*\)/g,
+    )) {
+      const name = m[1];
+      if (name) {
+        const sig = sigs.get(name) ?? `${name}(...)`;
+        symbolIndex.set(name, { file: f.path, subsystem: sub, signature: sig });
+      }
+    }
+  }
+
+  const crosses: CrossBoundaryCall[] = [];
+  const callRe = /\b([a-z_][a-z0-9_]{3,})\s*\(/g;
+
+  for (const f of filesMetadata) {
+    const callerSub = subsystemKey(f.path);
+    const content = safeContent(f);
+    const seen = new Set<string>();
+    for (const m of content.matchAll(callRe)) {
+      const callee = m[1];
+      if (seen.has(callee)) continue;
+      seen.add(callee);
+      const def = symbolIndex.get(callee);
+      if (
+        !def ||
+        def.subsystem === callerSub ||
+        def.subsystem === "_meta" ||
+        callerSub === "_meta"
+      )
+        continue;
+      crosses.push({
+        callerFile: f.path,
+        callerSubsystem: callerSub,
+        calleeName: callee,
+        calleeFile: def.file,
+        calleeSubsystem: def.subsystem,
+        calleeSignature: def.signature,
+      });
+    }
+  }
+
+  return crosses;
+}
+
+// ─── Bridge block generation ──────────────────────────────────────────────────
+
+function buildBridgeBlock(
+  call: CrossBoundaryCall,
+  callerSide: boolean,
+  targetNotebook: number,
+): string {
+  const bar = "═".repeat(68);
+  if (callerSide) {
+    return [
+      ``,
+      `╔${bar}╗`,
+      `║  CROSS-NOTEBOOK BRIDGE — OUTGOING CALL`,
+      `╚${bar}╝`,
+      ``,
+      `  Caller file   : ${call.callerFile}  [this notebook]`,
+      `  Callee name   : ${call.calleeName}`,
+      `  Callee file   : ${call.calleeFile}  [Notebook ${targetNotebook}]`,
+      `  Signature     : ${call.calleeSignature}`,
+      ``,
+      `  The full IMPLEMENTATION of ${call.calleeName}() lives in Notebook ${targetNotebook}.`,
+      `  To trace this call: ask this notebook about the call site,`,
+      `  then ask Notebook ${targetNotebook} about the implementation.`,
+      ``,
+      `╔${bar}╗`,
+      `║  END BRIDGE`,
+      `╚${bar}╝`,
+      ``,
+    ].join("\n");
+  } else {
+    return [
+      ``,
+      `╔${bar}╗`,
+      `║  CROSS-NOTEBOOK BRIDGE — INCOMING CALL`,
+      `╚${bar}╝`,
+      ``,
+      `  Defined in     : ${call.calleeFile}  [this notebook]`,
+      `  Called from    : ${call.callerFile}  [Notebook ${targetNotebook}]`,
+      `  Callee name    : ${call.calleeName}`,
+      `  Signature      : ${call.calleeSignature}`,
+      ``,
+      `  ${call.calleeName}() is defined HERE and called from Notebook ${targetNotebook}.`,
+      `  To trace this call: ask Notebook ${targetNotebook} about the call site,`,
+      `  then ask this notebook about the implementation.`,
+      ``,
+      `╔${bar}╗`,
+      `║  END BRIDGE`,
+      `╚${bar}╝`,
+      ``,
+    ].join("\n");
+  }
 }
 
 // ─── Scoring ──────────────────────────────────────────────────────────────────
@@ -520,7 +679,6 @@ function scoreFile(
   lang: RepoLanguage,
 ): number {
   if (!tokens.length) return 0;
-
   let score = 0;
   const filePath = (file.path as string).toLowerCase();
   const exports: string[] = file.analysis?.exports ?? [];
@@ -535,8 +693,6 @@ function scoreFile(
 
   const content = safeContent(file);
   const fullContent = content.toLowerCase();
-
-  // C-specific: extract symbols for richer matching
   const cSymbols =
     lang === "c" || lang === "mixed"
       ? extractCSymbols(content).map((s) => s.toLowerCase())
@@ -549,55 +705,37 @@ function scoreFile(
         .split("/")
         .pop()
         ?.replace(/\.[^.]+$/, "") ?? "";
-
-    // Filename match
     if (pathBase === t) score += 30;
     else if (filePath.includes(t)) score += 5;
-
-    // JS/TS exports
     if (exports.some((e) => e.toLowerCase() === t)) score += 20;
     else if (exports.some((e) => e.toLowerCase().includes(t))) score += 8;
-
-    // JS/TS imports
     if (imports.some((i) => i.toLowerCase().includes(t))) score += 3;
-
-    // C symbol match (EXPORT_SYMBOL, function defs, macros, structs)
     if (cSymbols.includes(t)) score += 20;
     else if (cSymbols.some((s) => s.includes(t))) score += 8;
-
-    // Raw content occurrences (capped to prevent giant files dominating)
-    const occurrences = (
+    const occ = (
       fullContent.match(new RegExp(`\\b${escapeRegex(t)}\\b`, "g")) ?? []
     ).length;
-    score += Math.min(occurrences * 2, 30);
-
-    // Exact file path token
+    score += Math.min(occ * 2, 30);
     if (token.includes("/") && filePath.includes(t)) score += 50;
   }
 
-  // Graph centrality bonus
   if (isImportQuery) {
-    // JS/TS import graph
-    const jsImporterCount = Object.values(importGraph).filter((deps) =>
+    const jsCount = Object.values(importGraph).filter((deps) =>
       deps.some((d) => d.includes(file.path) || file.path.includes(d)),
     ).length;
-    score += jsImporterCount * 4;
-
-    // C include graph
-    const cIncluderCount = Object.values(cIncludeGraph).filter((deps) =>
+    score += jsCount * 4;
+    const cCount = Object.values(cIncludeGraph).filter((deps) =>
       deps.includes(file.path),
     ).length;
-    score += cIncluderCount * 4;
+    score += cCount * 4;
   }
 
-  // Penalise near-empty files
   if ((file.metrics?.codeLines ?? 0) < 5) score = Math.floor(score * 0.4);
 
-  // Boost kernel-critical file types
   const fileName = file.path.split("/").pop() ?? "";
   if (fileName.startsWith("Kconfig")) score += 10;
   if (fileName === "Makefile" || fileName === "makefile") score += 5;
-  if (file.path.endsWith(".S")) score += 8; // assembly entry points
+  if (file.path.endsWith(".S")) score += 8;
 
   return score;
 }
@@ -618,9 +756,8 @@ function selectFilesForQuery(
   intents: QueryIntent[],
   lang: RepoLanguage,
 ): { files: any[]; omittedCount: number; omittedPaths: string[] } {
-  if (focus === "generic" && !intents.includes("code")) {
+  if (focus === "generic" && !intents.includes("code"))
     return { files: [], omittedCount: sourceFiles.length, omittedPaths: [] };
-  }
 
   const tokens = extractQueryTokens(query);
   if (tokens.length === 0 && focus === "targeted") focus = "generic";
@@ -643,15 +780,15 @@ function selectFilesForQuery(
       lang,
     ),
   }));
-
   scored.sort((a, b) => b.score - a.score);
 
   const threshold =
     focus === "targeted"
       ? MIN_RELEVANCE_SCORE_TARGETED
       : MIN_RELEVANCE_SCORE_GENERIC;
-  const relevant = scored.filter((s) => s.score >= threshold);
-  const selected = relevant.map((s) => s.file);
+  const selected = scored
+    .filter((s) => s.score >= threshold)
+    .map((s) => s.file);
   const omitted = scored
     .filter((s) => !selected.includes(s.file))
     .map((s) => s.file);
@@ -673,7 +810,6 @@ function resolveImportDepths(
   const depths = new Map<string, number>();
   for (const seed of seedPaths) depths.set(seed, 0);
   let frontier = [...seedPaths];
-
   for (let depth = 1; depth <= maxDepth; depth++) {
     const next: string[] = [];
     for (const p of frontier) {
@@ -700,25 +836,19 @@ function importRoleLabel(depth: number | undefined): ImportRole {
 
 function fileTier(filePath: string, lang: RepoLanguage = "web"): number {
   if (EXCLUDE_PATTERNS.some((re) => re.test(filePath))) return 0;
-
   const parts = filePath.split("/");
   const fileName = parts[parts.length - 1];
   const fileNameLower = fileName.toLowerCase();
   const ext = fileName.split(".").pop() ?? "";
   const extLower = ext.toLowerCase();
 
-  // Kernel-specific: Kconfig files have no extension but are critical Tier 1
   if (
     fileName === "Kconfig" ||
     fileName.startsWith("Kconfig.") ||
     KERNEL_CONFIG_EXTENSIONS.has(fileName)
   )
     return 1;
-
-  // Linker scripts
   if (extLower === "ld" || extLower === "lds") return 2;
-
-  // Assembly entry points (arch/**/*.S)
   if (ext === "S") return 2;
 
   const isRoot = parts.length === 1;
@@ -735,21 +865,13 @@ function fileTier(filePath: string, lang: RepoLanguage = "web"): number {
     TIER2_SYSTEMS.has(extLower)
   )
     return 2;
-
   if (
-    extLower === "md" ||
-    extLower === "mdx" ||
-    extLower === "rst" ||
-    extLower === "html" ||
-    extLower === "yaml" ||
-    extLower === "yml" ||
-    extLower === "toml" ||
-    extLower === "json"
+    ["md", "mdx", "rst", "html", "yaml", "yml", "toml", "json"].includes(
+      extLower,
+    )
   )
     return 3;
-
   if (TIER4_EXTENSIONS.has(extLower)) return 4;
-
   return 0;
 }
 
@@ -767,15 +889,12 @@ function selectFilesByBudget(
   const withTier = candidates
     .map((f) => ({ file: f, tier: fileTier(f.path, lang) }))
     .filter((x) => x.tier > 0);
-
   const mustInclude = withTier.filter((x) => x.tier <= 2).map((x) => x.file);
   const tier3 = withTier.filter((x) => x.tier === 3).map((x) => x.file);
   const tier4 = withTier.filter((x) => x.tier === 4).map((x) => x.file);
-
   const wordsOf = (files: any[]) =>
     files.reduce((s, f) => s + estimateWords(f), 0);
   const droppedTiers: number[] = [];
-
   let selected = [...mustInclude, ...tier3, ...tier4];
   if (wordsOf(selected) > TOTAL_WORD_BUDGET) {
     selected = [...mustInclude, ...tier3];
@@ -785,7 +904,6 @@ function selectFilesByBudget(
     selected = [...mustInclude];
     droppedTiers.push(3);
   }
-
   return { files: selected, droppedTiers };
 }
 
@@ -793,7 +911,6 @@ function selectFilesByBudget(
 
 function isDocFile(filePath: string): boolean {
   const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
-  // Support .rst for kernel Documentation/
   if (ext !== "md" && ext !== "mdx" && ext !== "rst") return false;
   return !/node_modules|CHANGELOG|CHANGES|HISTORY|\.github\/|dist\//.test(
     filePath,
@@ -823,10 +940,8 @@ function getDirectoryStructure(
   maxLines = 400,
 ): string {
   const included = filesMetadata.filter((f) => shouldInclude(f.path, lang));
-
   type TreeNode = { files: string[]; children: Map<string, TreeNode> };
   const root: TreeNode = { files: [], children: new Map() };
-
   for (const file of included) {
     const parts = (file.path as string).split("/");
     let node = root;
@@ -838,18 +953,15 @@ function getDirectoryStructure(
     }
     node.files.push(parts[parts.length - 1]);
   }
-
   const lines: string[] = [];
-  let lineCount = 0;
-  let truncated = false;
-
+  let lineCount = 0,
+    truncated = false;
   function countFiles(node: TreeNode): number {
     return (
       node.files.length +
       [...node.children.values()].reduce((s, c) => s + countFiles(c), 0)
     );
   }
-
   function render(node: TreeNode, indent: number) {
     if (lineCount >= maxLines) {
       truncated = true;
@@ -876,7 +988,6 @@ function getDirectoryStructure(
       render(child, indent + 2);
     }
   }
-
   render(root, 0);
   if (truncated)
     lines.push(`\n[TRUNCATED: Directory listing exceeds ${maxLines} lines.]`);
@@ -902,7 +1013,6 @@ function getReadme(docFiles: any[], maxFiles = 5): string {
   );
   const limited = sorted.slice(0, maxFiles);
   const omitted = sorted.length - limited.length;
-
   const parts: string[] = [
     `## Project Documentation\n\nIncluding ${limited.length} documentation file${limited.length !== 1 ? "s" : ""}.${omitted > 0 ? ` Omitted ${omitted} secondary doc files.` : ""}`,
   ];
@@ -924,7 +1034,6 @@ function getRepoMeta(repoContext: any, lang: RepoLanguage): string {
   const github = repoContext?.github ?? {};
   const stats = repoContext?.stats ?? {};
   const languages = repoContext?.languages ?? [];
-
   const topLangs =
     languages
       .slice(0, 5)
@@ -939,21 +1048,22 @@ function getRepoMeta(repoContext: any, lang: RepoLanguage): string {
     ]
       .filter(Boolean)
       .join(", ") || "no detected tooling";
-
   const langNote =
     lang === "c"
       ? `\n\nThis is a C/systems codebase. Import graph is built from #include directives. Symbol extraction uses EXPORT_SYMBOL, struct, typedef, and function definition patterns.`
       : "";
 
-  return `## Repository Overview
+  // ADDED: surface latestCommit and latestRelease in the meta block
+  const latestCommit = repoContext?.latestCommit;
+  const latestRelease = repoContext?.latestRelease;
+  const commitLine = latestCommit
+    ? `\n\nLatest commit: "${latestCommit.message.split("\n")[0]}" by ${latestCommit.author} on ${latestCommit.date} [${latestCommit.shortSha}].`
+    : "";
+  const releaseLine = latestRelease
+    ? `\n\nLatest release: ${latestRelease.name ?? latestRelease.tagName} (${latestRelease.prerelease ? "pre-release" : "stable"}), published ${latestRelease.publishedAt}.${latestRelease.body ? " Changelog: " + latestRelease.body.slice(0, 300) : ""}`
+    : "";
 
-${meta.fullName ?? "Unknown repo"} is a ${stack.architecture ?? "unknown"} project. ${github.description ?? ""}
-
-It has ${meta.stars ?? 0} stars, ${meta.forks ?? 0} forks, and ${meta.openIssues ?? 0} open issues. The license is ${meta.license ?? "unknown"}. The default branch is ${meta.defaultBranch ?? "unknown"}, last pushed on ${meta.pushedAt ?? "unknown"}.
-
-Topics: ${github.topics?.join(", ") || "none listed"}. Primary languages: ${topLangs}. The stack includes: ${stackItems}.
-
-The repository contains ${stats.totalFiles ?? "?"} files across ${stats.totalFolders ?? "?"} folders with a maximum directory depth of ${stats.maxDepth ?? "?"}.${langNote}`;
+  return `## Repository Overview\n\n${meta.fullName ?? "Unknown repo"} is a ${stack.architecture ?? "unknown"} project. ${github.description ?? ""}\n\nIt has ${meta.stars ?? 0} stars, ${meta.forks ?? 0} forks, and ${meta.openIssues ?? 0} open issues. The license is ${meta.license ?? "unknown"}. The default branch is ${meta.defaultBranch ?? "unknown"}, last pushed on ${meta.pushedAt ?? "unknown"}.\n\nTopics: ${github.topics?.join(", ") || "none listed"}. Primary languages: ${topLangs}. The stack includes: ${stackItems}.\n\nThe repository contains ${stats.totalFiles ?? "?"} files across ${stats.totalFolders ?? "?"} folders with a maximum directory depth of ${stats.maxDepth ?? "?"}.${commitLine}${releaseLine}${langNote}`;
 }
 
 function getContributorsNames(repoContext: any): string {
@@ -962,13 +1072,7 @@ function getContributorsNames(repoContext: any): string {
   const sorted = [...contributors].sort(
     (a: any, b: any) => b.contributions - a.contributions,
   );
-  const list = sorted
-    .map(
-      (c: any, i: number) =>
-        `${i + 1}. ${c.login} with ${c.contributions} commits`,
-    )
-    .join("\n");
-  return `## Contributors\n\nTop contributor: ${sorted[0].login} with ${sorted[0].contributions} commits.\n\n${list}`;
+  return `## Contributors\n\nTop contributor: ${sorted[0].login} with ${sorted[0].contributions} commits.\n\n${sorted.map((c: any, i: number) => `${i + 1}. ${c.login} with ${c.contributions} commits`).join("\n")}`;
 }
 
 function getCommitHistory(repoContext: any): string {
@@ -976,11 +1080,7 @@ function getCommitHistory(repoContext: any): string {
     repoContext?.commitsByAuthor ?? {};
   if (!Object.keys(commitsByAuthor).length) {
     if (!repoContext?.recentCommits?.length) return "";
-    const lines = repoContext.recentCommits.map(
-      (c: any) =>
-        `- ${c.message.split("\n")[0]} by ${c.author} on ${c.date} [${c.shortSha}]`,
-    );
-    return `## Recent Commits\n\n${lines.join("\n")}`;
+    return `## Recent Commits\n\n${repoContext.recentCommits.map((c: any) => `- ${c.message.split("\n")[0]} by ${c.author} on ${c.date} [${c.shortSha}]`).join("\n")}`;
   }
   const parts: string[] = ["## Commit History"];
   for (const [author, commits] of Object.entries(commitsByAuthor).sort(
@@ -1007,6 +1107,8 @@ function getBranches(repoContext: any): string {
   return `## Branches\n\n${branches.map((b: any) => `- ${b.name}${b.protected ? " (protected)" : ""}`).join("\n")}`;
 }
 
+// CHANGED: renders issue comment threads; removed internal 400-char re-truncation
+// (body is already capped at 500 in github.ts — single source of truth)
 function getIssues(repoContext: any): string {
   const issues = repoContext?.issues ?? [];
   if (!issues.length) return "";
@@ -1014,19 +1116,23 @@ function getIssues(repoContext: any): string {
   const closed = issues.filter((i: any) => i.state === "closed").length;
   const lines: string[] = [`## Issues (${open} open, ${closed} closed)\n`];
   for (const i of issues) {
-    const labels = i.labels?.length ? ` Labels: ${i.labels.join(", ")}.` : "";
     lines.push(`### Issue #${i.number}: ${i.title} (${i.state})\n`);
     lines.push(
-      `Opened by ${i.author ?? "unknown"} on ${i.createdAt}. ${i.comments} comment(s).${labels}`,
+      `Opened by ${i.author ?? "unknown"} on ${i.createdAt}. ${i.comments} comment(s).${i.labels?.length ? ` Labels: ${i.labels.join(", ")}.` : ""}`,
     );
-    if (i.body)
-      lines.push(
-        `\n${i.body.slice(0, 400)}${i.body.length > 400 ? "..." : ""}`,
-      );
+    if (i.body) lines.push(`\n${i.body}`);
+    // NEW: render fetched comment thread
+    if (Array.isArray(i.commentThread) && i.commentThread.length > 0) {
+      lines.push(`\n**Comments:**`);
+      for (const c of i.commentThread) {
+        lines.push(`\n- **${c.author}** (${c.createdAt}): ${c.body}`);
+      }
+    }
   }
   return lines.join("\n");
 }
 
+// CHANGED: renders PR review comment threads
 function getPulls(repoContext: any): string {
   const pulls = repoContext?.pulls ?? [];
   if (!pulls.length) return "";
@@ -1040,19 +1146,40 @@ function getPulls(repoContext: any): string {
       `### PR #${p.number}: ${p.title} (${p.merged ? "merged" : p.state})\n`,
     );
     lines.push(
-      `Author: ${p.author ?? "unknown"}. Branch: ${p.headBranch} into ${p.baseBranch}. Opened: ${p.createdAt}.${p.mergedAt ? ` Merged: ${p.mergedAt}.` : ""}`,
+      `Author: ${p.author ?? "unknown"}. Branch: ${p.headBranch} into ${p.baseBranch}. Opened: ${p.createdAt}.${p.mergedAt ? ` Merged: ${p.mergedAt}.` : ""} Review comments: ${p.reviewComments ?? 0}.`,
     );
-    if (p.body)
-      lines.push(
-        `\n${p.body.slice(0, 400)}${p.body.length > 400 ? "..." : ""}`,
-      );
+    if (p.body) lines.push(`\n${p.body}`);
+    // NEW: render inline code review comments
+    if (
+      Array.isArray(p.reviewCommentThread) &&
+      p.reviewCommentThread.length > 0
+    ) {
+      lines.push(`\n**Code review comments:**`);
+      for (const c of p.reviewCommentThread) {
+        lines.push(
+          `\n- **${c.author}** on \`${c.path}\` (${c.createdAt}): ${c.body}`,
+        );
+      }
+    }
+  }
+  return lines.join("\n");
+}
+
+// NEW: Renders releases with tag, date, prerelease status, and changelog body
+function getReleases(repoContext: any): string {
+  const releases = repoContext?.releases ?? [];
+  if (!releases.length) return "";
+  const lines: string[] = [`## Releases (${releases.length} shown)\n`];
+  for (const r of releases) {
+    const status = r.draft ? "draft" : r.prerelease ? "pre-release" : "stable";
+    lines.push(`### ${r.name ?? r.tagName} [${status}] — ${r.publishedAt}`);
+    if (r.body) lines.push(`\n${r.body}`);
+    lines.push(`\nURL: ${r.htmlUrl}`);
   }
   return lines.join("\n");
 }
 
 // ─── C include graph summary ──────────────────────────────────────────────────
-// Emits a human-readable cross-reference block for NotebookLLM.
-// Equivalent to what cscope/ctags would give for the selected files.
 
 function getCIncludeGraphSummary(
   cIncludeGraph: Record<string, string[]>,
@@ -1061,19 +1188,15 @@ function getCIncludeGraphSummary(
   const entries = Object.entries(cIncludeGraph)
     .filter(([from]) => selectedFilePaths.has(from))
     .map(([from, deps]) => {
-      const relevantDeps = deps.filter((d) => selectedFilePaths.has(d));
-      return relevantDeps.length
-        ? `- ${from} includes: ${relevantDeps.join(", ")}`
-        : null;
+      const rel = deps.filter((d) => selectedFilePaths.has(d));
+      return rel.length ? `- ${from} includes: ${rel.join(", ")}` : null;
     })
     .filter(Boolean);
-
   if (!entries.length) return "";
   return `## C Include Graph (selected files)\n\nLocal #include relationships among included files:\n\n${entries.join("\n")}`;
 }
 
-// ─── Function block parsing ───────────────────────────────────────────────────
-// JS/TS parser (unchanged from original)
+// ─── JS/TS function block parsing ────────────────────────────────────────────
 
 function parseFunctionBlocks(content: string): FunctionBlock[] {
   const lines = content.split("\n");
@@ -1081,7 +1204,6 @@ function parseFunctionBlocks(content: string): FunctionBlock[] {
   const startRe =
     /^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s*\*?\s*(\w+)|class\s+(\w+)|const\s+(\w+)\s*=|let\s+(\w+)\s*=|var\s+(\w+)\s*=)/;
   const decoratorRe = /^@\w+/;
-
   let i = 0;
   while (i < lines.length) {
     let decoratorStart: number | null = null;
@@ -1094,15 +1216,13 @@ function parseFunctionBlocks(content: string): FunctionBlock[] {
       i++;
       continue;
     }
-
     const name = m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5] ?? "anonymous";
     const blockStart = decoratorStart ?? i;
     let depth = 0,
       hasOpenedBrace = false;
-    let inString: string | null = null;
-    let inTemplateBraceDepth = 0;
+    let inString: string | null = null,
+      inTemplateBraceDepth = 0;
     let j = i;
-
     outer: while (j < lines.length) {
       const line = lines[j];
       let k = 0;
@@ -1167,37 +1287,28 @@ function parseFunctionBlocks(content: string): FunctionBlock[] {
       j++;
       if (!hasOpenedBrace && j > i + 3) break;
     }
-
     const endLine = j - 1;
-    if (endLine > blockStart) {
+    if (endLine > blockStart)
       blocks.push({
         name,
         startLine: blockStart,
         endLine,
         text: lines.slice(blockStart, endLine + 1).join("\n"),
       });
-    }
     i = j;
   }
   return blocks;
 }
 
 // ─── C function block parsing ─────────────────────────────────────────────────
-// Splits a C file into per-function blocks for structured context.
 
 function parseCFunctionBlocks(content: string): FunctionBlock[] {
   const lines = content.split("\n");
   const blocks: FunctionBlock[] = [];
-
-  // Match C function definitions: lines that look like `type name(` not inside a struct/enum
-  // Heuristic: function def = a non-indented line ending in `)` or starting a `{` on next line.
   const defRe = /^[a-zA-Z_][\w\s\*]*\b(\w+)\s*\([^;]*$/;
-
   let i = 0;
   while (i < lines.length) {
     const line = lines[i].trim();
-
-    // Skip preprocessor, comments, empty
     if (
       !line ||
       line.startsWith("#") ||
@@ -1208,13 +1319,11 @@ function parseCFunctionBlocks(content: string): FunctionBlock[] {
       i++;
       continue;
     }
-
-    const m = defRe.exec(lines[i]); // test original (unstripped) for indentation guard
+    const m = defRe.exec(lines[i]);
     if (!m || lines[i].startsWith(" ") || lines[i].startsWith("\t")) {
       i++;
       continue;
     }
-
     const name = m[1];
     if (
       !name ||
@@ -1223,8 +1332,6 @@ function parseCFunctionBlocks(content: string): FunctionBlock[] {
       i++;
       continue;
     }
-
-    // Scan for opening brace
     let braceStart = i;
     while (
       braceStart < Math.min(i + 6, lines.length) &&
@@ -1235,8 +1342,6 @@ function parseCFunctionBlocks(content: string): FunctionBlock[] {
       i++;
       continue;
     }
-
-    // Count braces to find closing
     let depth = 0,
       j = braceStart,
       found = false;
@@ -1254,16 +1359,16 @@ function parseCFunctionBlocks(content: string): FunctionBlock[] {
       if (found) break;
       j++;
     }
-
     if (found && j > i) {
-      const text = lines.slice(i, j + 1).join("\n");
-      // Only keep blocks of reasonable size (skip 1-line stubs, extremely huge functions)
-      const lineCount = j - i + 1;
-      if (lineCount >= 3 && lineCount <= 500) {
-        blocks.push({ name, startLine: i, endLine: j, text });
-      }
+      const lc = j - i + 1;
+      if (lc >= 3 && lc <= 500)
+        blocks.push({
+          name,
+          startLine: i,
+          endLine: j,
+          text: lines.slice(i, j + 1).join("\n"),
+        });
     }
-
     i = found ? j + 1 : i + 1;
   }
   return blocks;
@@ -1290,7 +1395,6 @@ function getFileContext(
   ]
     .filter(Boolean)
     .join(", ");
-
   const isCFile = [
     "c",
     "h",
@@ -1318,12 +1422,10 @@ function getFileContext(
   const importsStr = imports.length
     ? `It imports from: ${imports.slice(0, 12).join(", ")}${imports.length > 12 ? ` and ${imports.length - 12} more` : ""}.`
     : isCFile
-      ? "" // C imports shown in include graph section
+      ? ""
       : "It has no imports.";
-
   const todosStr = todos.length ? ` TODOs: ${todos.join(" | ")}.` : "";
   const flagsStr = flags ? ` (${flags})` : "";
-
   const prose =
     `This file is a **${role}** in the ${repoName} ${isCFile ? "include" : "import"} graph${flagsStr}. ` +
     `Logic type: ${logicType}. ${lineCount} lines (${codeLines} code lines). ` +
@@ -1351,25 +1453,19 @@ function getFileContext(
     "mdx",
     "rst",
   ].includes(ext);
-
-  if (content.length <= SPLIT_THRESHOLD_CHARS || isNonCodeFile) {
+  if (content.length <= SPLIT_THRESHOLD_CHARS || isNonCodeFile)
     return [heading, "", prose, "", `\`\`\`${ext}`, content, "```"].join("\n");
-  }
 
-  // Choose parser based on language
   const blocks = isCFile
     ? parseCFunctionBlocks(content)
     : parseFunctionBlocks(content);
-
-  if (!blocks.length) {
+  if (!blocks.length)
     return [heading, "", prose, "", `\`\`\`${ext}`, content, "```"].join("\n");
-  }
 
   const fileLines = content.split("\n");
   const headerText = fileLines.slice(0, blocks[0].startLine).join("\n").trim();
   const parts: string[] = [heading, "", prose];
-
-  if (headerText) {
+  if (headerText)
     parts.push(
       "",
       `#### ${file.path} — module header`,
@@ -1378,8 +1474,6 @@ function getFileContext(
       headerText,
       "```",
     );
-  }
-
   for (const block of blocks) {
     parts.push(
       "",
@@ -1392,7 +1486,6 @@ function getFileContext(
       "```",
     );
   }
-
   return parts.join("\n");
 }
 
@@ -1402,162 +1495,324 @@ function countWords(text: string): number {
   return text.split(/\s+/).filter(Boolean).length;
 }
 
-// ─── Subsystem-aware packing ──────────────────────────────────────────────────
-// For C repos: group files by subsystem, then fill buckets by subsystem group.
-// This keeps fs/ together, mm/ together, etc. — critical for NotebookLLM coherence.
-// For web repos: falls back to original word-count greedy packing.
+// ─── 3-notebook packing ────────────────────────────────────────────────────────
 
 async function packAndFlush(
   blocks: Block[],
   outDir: string,
   lang: RepoLanguage,
-): Promise<string[]> {
+  crossBoundaryCalls: CrossBoundaryCall[],
+): Promise<{ writtenPaths: string[]; subsystemNotebook: Map<string, number> }> {
   mkdirSync(outDir, { recursive: true });
 
-  if (lang === "c") {
-    // Group blocks by subsystem, then pack subsystem groups into buckets
-    const subsystemGroups = new Map<string, Block[]>();
-    for (const block of blocks) {
-      const key = block.group === "_meta" ? "_meta" : subsystemKey(block.group);
-      if (!subsystemGroups.has(key)) subsystemGroups.set(key, []);
-      subsystemGroups.get(key)!.push(block);
-    }
-
-    // Order: _meta first, then subsystems alphabetically
-    const orderedGroups = [
-      "_meta",
-      ...[...subsystemGroups.keys()].filter((k) => k !== "_meta").sort(),
-    ].filter((k) => subsystemGroups.has(k));
-
-    const buckets: string[][] = [[]];
-    const bucketWords: number[] = [0];
-
-    for (const groupKey of orderedGroups) {
-      const groupBlocks = subsystemGroups.get(groupKey)!;
-      const groupText = groupBlocks.map((b) => b.text);
-      const groupWords = groupText.reduce((s, t) => s + countWords(t), 0);
-
-      // Try to keep each subsystem in one bucket; split only if over budget
-      const curr = buckets.length - 1;
-      if (
-        buckets.length < MAX_SOURCE_BUCKETS &&
-        bucketWords[curr] + groupWords > WORD_LIMIT_PER_FILE &&
-        bucketWords[curr] > 0
-      ) {
-        // Start a new bucket for this subsystem
-        buckets.push([]);
-        bucketWords.push(0);
-      }
-
-      // If the subsystem itself exceeds one bucket, spill across buckets
-      for (const text of groupText) {
-        const wc = countWords(text);
-        const c = buckets.length - 1;
-        if (
-          buckets.length < MAX_SOURCE_BUCKETS &&
-          bucketWords[c] + wc > WORD_LIMIT_PER_FILE &&
-          bucketWords[c] > 0
-        ) {
-          buckets.push([text]);
-          bucketWords.push(wc);
-        } else {
-          buckets[c].push(text);
-          bucketWords[c] += wc;
-        }
-      }
-    }
-
-    const written: string[] = [];
-    for (let i = 0; i < buckets.length; i++) {
-      const paddedNum = String(i + 1).padStart(2, "0");
-      const fileName = `part_${paddedNum}.txt`;
-      const fullPath = join(outDir, fileName);
-      await writeFile(fullPath, buckets[i].join("\n\n"), "utf-8");
-      written.push(fullPath);
-    }
-    return written;
-  } else {
-    // Original greedy word-count packing for web/other repos
-    const allText = blocks.map((b) => b.text);
-    const totalWords = allText.reduce((s, t) => s + countWords(t), 0);
-    const targetWordsPerBucket = Math.min(
-      Math.ceil(totalWords / MAX_SOURCE_BUCKETS),
-      WORD_LIMIT_PER_FILE,
-    );
-
-    const buckets: string[][] = [[]];
-    const bucketWords: number[] = [0];
-
-    for (const text of allText) {
-      const wc = countWords(text);
-      const curr = buckets.length - 1;
-      if (
-        buckets.length < MAX_SOURCE_BUCKETS &&
-        bucketWords[curr] + wc > targetWordsPerBucket &&
-        bucketWords[curr] > 0
-      ) {
-        buckets.push([text]);
-        bucketWords.push(wc);
-      } else {
-        buckets[curr].push(text);
-        bucketWords[curr] += wc;
-      }
-    }
-
-    const written: string[] = [];
-    for (let i = 0; i < buckets.length; i++) {
-      const paddedNum = String(i + 1).padStart(2, "0");
-      const fileName = `part_${paddedNum}.txt`;
-      const fullPath = join(outDir, fileName);
-      await writeFile(fullPath, buckets[i].join("\n\n"), "utf-8");
-      written.push(fullPath);
-    }
-    return written;
+  const subsystemGroups = new Map<string, Block[]>();
+  for (const block of blocks) {
+    const key = block.group === "_meta" ? "_meta" : subsystemKey(block.group);
+    if (!subsystemGroups.has(key)) subsystemGroups.set(key, []);
+    subsystemGroups.get(key)!.push(block);
   }
+
+  const orderedGroups = [
+    "_meta",
+    ...[...subsystemGroups.keys()].filter((k) => k !== "_meta").sort(),
+  ].filter((k) => subsystemGroups.has(k));
+
+  const notebookBuckets: string[][][] = Array.from(
+    { length: NOTEBOOKS },
+    () => [[]],
+  );
+  const notebookBucketWords: number[][] = Array.from(
+    { length: NOTEBOOKS },
+    () => [0],
+  );
+  const subsystemNotebook = new Map<string, number>();
+  let currentNbIdx = 0;
+
+  const pushText = (nbIdx: number, text: string) => {
+    const wc = countWords(text);
+    const bkts = notebookBuckets[nbIdx];
+    const wds = notebookBucketWords[nbIdx];
+    const curr = bkts.length - 1;
+    if (
+      bkts.length < DATA_BUCKETS_PER_NOTEBOOK &&
+      wds[curr] + wc > WORD_LIMIT_PER_FILE &&
+      wds[curr] > 0
+    ) {
+      bkts.push([text]);
+      wds.push(wc);
+    } else {
+      bkts[curr].push(text);
+      wds[curr] += wc;
+    }
+  };
+
+  for (const groupKey of orderedGroups) {
+    const groupText = subsystemGroups.get(groupKey)!.map((b) => b.text);
+    const groupWords = groupText.reduce((s, t) => s + countWords(t), 0);
+
+    if (groupKey === "_meta") {
+      subsystemNotebook.set("_meta", 1);
+      for (const text of groupText) pushText(0, text);
+      continue;
+    }
+
+    const currUsed = notebookBucketWords[currentNbIdx].reduce(
+      (a, b) => a + b,
+      0,
+    );
+    const currFull =
+      notebookBuckets[currentNbIdx].length >= DATA_BUCKETS_PER_NOTEBOOK;
+    const currOverBudget =
+      currUsed + groupWords > DATA_BUCKETS_PER_NOTEBOOK * WORD_LIMIT_PER_FILE;
+    if ((currFull || currOverBudget) && currentNbIdx < NOTEBOOKS - 1)
+      currentNbIdx++;
+
+    subsystemNotebook.set(groupKey, currentNbIdx + 1);
+    for (const text of groupText) pushText(currentNbIdx, text);
+  }
+
+  for (const call of crossBoundaryCalls) {
+    const callerNb = subsystemNotebook.get(call.callerSubsystem);
+    const calleeNb = subsystemNotebook.get(call.calleeSubsystem);
+    if (!callerNb || !calleeNb || callerNb === calleeNb) continue;
+    pushText(callerNb - 1, buildBridgeBlock(call, true, calleeNb));
+    pushText(calleeNb - 1, buildBridgeBlock(call, false, callerNb));
+  }
+
+  const writtenPaths: string[] = [];
+  for (let nb = 0; nb < NOTEBOOKS; nb++) {
+    const nbDir = join(outDir, `notebook_${nb + 1}`);
+    mkdirSync(nbDir, { recursive: true });
+    const buckets = notebookBuckets[nb];
+    for (let i = 0; i < buckets.length; i++) {
+      if (!buckets[i].length) continue;
+      const fileName = `part_${String(i + 1).padStart(2, "0")}.txt`;
+      const fullPath = join(nbDir, fileName);
+      await writeFile(fullPath, buckets[i].join("\n\n"), "utf-8");
+      writtenPaths.push(fullPath);
+    }
+  }
+
+  return { writtenPaths, subsystemNotebook };
 }
 
-// ─── Manifest ─────────────────────────────────────────────────────────────────
+// ─── Per-notebook manifest ────────────────────────────────────────────────────
 
-function buildManifest(
-  fileCount: number,
+function buildNotebookManifest(
+  notebookNum: number,
   repoName: string,
   repoContext: any,
+  subsystems: string[],
+  dataFileCount: number,
   droppedTiers: number[],
   totalSourceFiles: number,
   lang: RepoLanguage,
+  bridgeCount: number,
 ): string {
   const timestamp = new Date().toISOString();
-  const langNote =
+  const langLines =
     lang === "c"
       ? [
           "",
           "C/SYSTEMS REPO NOTES:",
-          "  - Files sorted and packed by kernel subsystem (arch/, block/, fs/, mm/, net/, etc.)",
-          "  - Kconfig, assembly (.S), and linker script (.ld) files included as Tier 1/2",
-          "  - C symbols extracted from EXPORT_SYMBOL, struct, typedef, and function definitions",
-          "  - C include graph (#include directives) replaces JS import graph for cross-reference",
-          "  - parseCFunctionBlocks() used instead of JS-only parseFunctionBlocks()",
-        ].join("\n")
-      : "";
+          "  - Files packed by kernel subsystem for cross-reference coherence",
+          "  - Kconfig, .S assembly, .ld linker scripts included as Tier 1/2",
+          "  - C symbols extracted from EXPORT_SYMBOL, struct, typedef, function defs",
+          "  - Cross-notebook bridges injected where call chains cross subsystem lines",
+          "  - Each bridge tells you which notebook holds the other side of the call",
+        ]
+      : [];
 
   return [
-    `00_Repo_Manifest.txt — ${repoName}`,
-    `Generated: ${timestamp}`,
-    `Repository: ${repoContext?.meta?.fullName ?? repoName}`,
-    `Description: ${repoContext?.github?.description ?? "N/A"}`,
-    `Detected language profile: ${lang}`,
-    "",
-    `Mode: ${droppedTiers.length > 0 ? "BUDGET-CONSTRAINED (dropped tiers: " + droppedTiers.join(",") + ")" : "FULL (all source files)"}`,
-    `Total files considered: ${totalSourceFiles}`,
-    `Output files produced: ${fileCount} source buckets + this manifest = ${fileCount + 1} total`,
-    langNote,
-    "",
-    `Each part_NN.txt contains source code${lang === "c" ? " grouped by kernel subsystem" : " organized alphabetically by directory"}.`,
-    `Upload all files (including this manifest) to NotebookLM as sources.`,
-    "",
-    "END OF MANIFEST",
+    `notebook_${notebookNum}_manifest.txt — ${repoName}`,
+    `Generated       : ${timestamp}`,
+    `Repository      : ${repoContext?.meta?.fullName ?? repoName}`,
+    `Notebook        : ${notebookNum} of ${NOTEBOOKS}`,
+    `Language profile: ${lang}`,
+    ``,
+    `Subsystems in this notebook : ${subsystems.filter((s) => s !== "_meta").join(", ") || "(meta only)"}`,
+    `Data part files             : ${dataFileCount}  (+ this manifest = ${dataFileCount + 1} total)`,
+    `Cross-notebook bridges      : ${bridgeCount}`,
+    ``,
+    `Mode: ${droppedTiers.length > 0 ? "BUDGET-CONSTRAINED (dropped tiers: " + droppedTiers.join(",") + ")" : "FULL"}`,
+    `Total source files (all notebooks): ${totalSourceFiles}`,
+    ...langLines,
+    ``,
+    `INSTRUCTIONS:`,
+    `  Upload ALL ${dataFileCount + 1} files in this folder to ONE NotebookLM tab.`,
+    `  Use router_index.json (in the parent folder) to route questions to the right notebook.`,
+    `  Bridge blocks inside the data files will tell you when to switch notebooks.`,
+    ``,
+    `END OF MANIFEST`,
   ].join("\n");
 }
+
+// ─── Router index ─────────────────────────────────────────────────────────────
+
+function buildRouterIndex(
+  repoName: string,
+  lang: RepoLanguage,
+  droppedTiers: number[],
+  totalSourceFiles: number,
+  totalOutputFiles: number,
+  subsystemNotebook: Map<string, number>,
+  notebookDataPaths: string[][],
+  crossBoundaryCalls: CrossBoundaryCall[],
+): RouterIndex {
+  const notebookSubsystems = new Map<number, string[]>();
+  for (const [sub, nb] of subsystemNotebook) {
+    if (!notebookSubsystems.has(nb)) notebookSubsystems.set(nb, []);
+    notebookSubsystems.get(nb)!.push(sub);
+  }
+
+  const crossBoundaryMap: Record<string, string[]> = {};
+  for (const call of crossBoundaryCalls) {
+    const key = `${call.callerSubsystem}→${call.calleeSubsystem}`;
+    if (!crossBoundaryMap[key]) crossBoundaryMap[key] = [];
+    if (!crossBoundaryMap[key].includes(call.calleeName))
+      crossBoundaryMap[key].push(call.calleeName);
+  }
+
+  const SUBSYSTEM_KEYWORDS: Record<string, string[]> = {
+    mm: [
+      "memory",
+      "page",
+      "folio",
+      "filemap",
+      "readahead",
+      "mmap",
+      "vmalloc",
+      "pagecache",
+      "swap",
+    ],
+    fs: [
+      "vfs",
+      "inode",
+      "dentry",
+      "ext4",
+      "file",
+      "read",
+      "write",
+      "superblock",
+      "mount",
+      "open",
+    ],
+    block: [
+      "bio",
+      "blkdev",
+      "request",
+      "queue",
+      "iosched",
+      "bfq",
+      "nvme",
+      "scsi",
+      "submit_bio",
+    ],
+    net: [
+      "socket",
+      "tcp",
+      "udp",
+      "skb",
+      "netdev",
+      "ipv4",
+      "ipv6",
+      "packet",
+      "recv",
+      "send",
+    ],
+    arch: [
+      "syscall",
+      "entry",
+      "interrupt",
+      "asm",
+      "x86",
+      "arm64",
+      "trap",
+      "exception",
+      "irq",
+    ],
+    drivers: [
+      "pci",
+      "usb",
+      "platform",
+      "dma",
+      "device",
+      "probe",
+      "remove",
+      "module_init",
+    ],
+    kernel: [
+      "sched",
+      "scheduler",
+      "timer",
+      "workqueue",
+      "rcu",
+      "spinlock",
+      "mutex",
+      "kthread",
+    ],
+    security: [
+      "lsm",
+      "selinux",
+      "apparmor",
+      "seccomp",
+      "capability",
+      "audit",
+      "bpf",
+    ],
+    crypto: ["cipher", "hash", "digest", "aead", "skcipher", "tfm", "shash"],
+    include: ["header", "uapi", "asm", "linux", "types", "ioctl"],
+    init: ["start_kernel", "boot", "setup", "initcall", "early_param"],
+    ipc: ["semaphore", "shm", "message", "pipe", "signal", "mqueue"],
+    lib: ["string", "sort", "bitmap", "list", "rbtree", "hashtable"],
+    sound: ["alsa", "codec", "pcm", "mixer", "asoc"],
+    virt: ["kvm", "virtio", "hypervisor", "vmx", "svm"],
+  };
+
+  const notebooks: NotebookEntry[] = [];
+  for (let nb = 1; nb <= NOTEBOOKS; nb++) {
+    const subs = notebookSubsystems.get(nb) ?? [];
+    const dataFiles = notebookDataPaths[nb - 1].map((p) => p.split("/").pop()!);
+    const allFiles = [`notebook_${nb}_manifest.txt`, ...dataFiles];
+    const keywords = [
+      ...new Set(
+        subs.flatMap((s) => [
+          s,
+          ...(SUBSYSTEM_KEYWORDS[s] ?? []),
+          ...s.split("_"),
+        ]),
+      ),
+    ];
+    const bridgeCount = crossBoundaryCalls.filter(
+      (c) =>
+        subsystemNotebook.get(c.callerSubsystem) === nb ||
+        subsystemNotebook.get(c.calleeSubsystem) === nb,
+    ).length;
+    notebooks.push({
+      notebook: nb,
+      dir: `notebook_${nb}`,
+      label: `Notebook ${nb} — ${subs.filter((s) => s !== "_meta").join(", ")}`,
+      subsystems: subs,
+      files: allFiles,
+      keywords,
+      wordEstimate: 0,
+      bridgeCount,
+    });
+  }
+
+  return {
+    repo: repoName,
+    lang,
+    generatedAt: new Date().toISOString(),
+    mode: droppedTiers.length > 0 ? "budget-constrained" : "full",
+    totalSourceFiles,
+    totalOutputFiles,
+    notebooks,
+    crossBoundaryMap,
+  };
+}
+
+// ─── Main entry point ─────────────────────────────────────────────────────────
 
 export async function buildMasterContext(
   query: string,
@@ -1567,7 +1822,7 @@ export async function buildMasterContext(
   expertPlan?: ExpertPlan,
   outputDir = "/tmp/notebooklm_sources",
   dumpAll = true,
-): Promise<string> {
+): Promise<RouterIndex> {
   const repoName = repoContext?.meta?.fullName?.split("/").pop() ?? "repo";
   const safeQuery = query ? String(query) : "";
 
@@ -1577,8 +1832,11 @@ export async function buildMasterContext(
     lang === "c" || lang === "mixed"
       ? buildCIncludeGraph(filesMetadata)
       : ({} as Record<string, string[]>);
-
   const mergedImportGraph = { ...importGraph, ...cIncludeGraph };
+  const crossBoundaryCalls =
+    lang === "c" || lang === "mixed"
+      ? detectCrossBoundaryCalls(filesMetadata)
+      : ([] as CrossBoundaryCall[]);
 
   const intents = dumpAll
     ? ([
@@ -1607,7 +1865,6 @@ export async function buildMasterContext(
   const allCandidates = filesMetadata.filter(
     (f) => f && typeof f.path === "string" && shouldInclude(f.path, lang),
   );
-
   const estimateWords = (f: any) =>
     Math.ceil((f.metrics?.charCount ?? f.content?.length ?? 0) / 5);
 
@@ -1616,7 +1873,6 @@ export async function buildMasterContext(
     estimateWords,
     lang,
   );
-
   const docFiles = allIncluded.filter((f) => isDocFile(f.path));
   const sourceFiles = allIncluded.filter((f) => !isDocFile(f.path));
 
@@ -1630,12 +1886,13 @@ export async function buildMasterContext(
     `# ${repoContext?.meta?.fullName ?? "Unknown"} — Codebase Context`,
   );
   metaLines.push(
-    `Generated: ${new Date().toISOString()}. Language profile: ${lang}. Mode: ${droppedTiers.length > 0 ? "budget-constrained" : "full"}.`,
+    `Generated: ${new Date().toISOString()}. Language: ${lang}. ` +
+      `Mode: ${droppedTiers.length > 0 ? "budget-constrained" : "full"}. ` +
+      `Notebooks: ${NOTEBOOKS}. Cross-boundary calls detected: ${crossBoundaryCalls.length}.`,
   );
 
-  if (dumpAll || focus === "generic" || intents.includes("repo_meta")) {
+  if (dumpAll || focus === "generic" || intents.includes("repo_meta"))
     metaLines.push(getRepoMeta(repoContext, lang));
-  }
   if (dumpAll || intents.includes("repo_meta") || focus === "generic") {
     const docsSection = getReadme(docFiles, dumpAll ? 5 : 3);
     if (docsSection) metaLines.push(docsSection);
@@ -1660,6 +1917,11 @@ export async function buildMasterContext(
     const s = getPulls(repoContext);
     if (s) metaLines.push(s);
   }
+  // ADDED: releases are now always included when dumping all or in repo_meta intent
+  if (dumpAll || intents.includes("repo_meta")) {
+    const s = getReleases(repoContext);
+    if (s) metaLines.push(s);
+  }
 
   if (
     dumpAll ||
@@ -1672,7 +1934,6 @@ export async function buildMasterContext(
       .slice(0, 10)
       .map(([ext, count]) => `.${ext}: ${count} files`)
       .join(", ");
-
     metaLines.push(
       `## Directory Structure\n\n${sourceFiles.length} source files${droppedTiers.length > 0 ? " (filtered by budget)" : ""}. Types: ${extSummary}.\n\n` +
         getDirectoryStructure(filesMetadata, lang, dumpAll ? 10000 : 200),
@@ -1700,21 +1961,17 @@ export async function buildMasterContext(
     );
 
     let sortedFiles: any[];
-
     if (dumpAll) {
-      if (lang === "c") {
-        // Sort by subsystem, then by path within subsystem — keeps related files together in buckets
-        sortedFiles = [...sourceFiles].sort((a, b) => {
-          const sa = subsystemKey(a.path);
-          const sb = subsystemKey(b.path);
-          if (sa !== sb) return sa.localeCompare(sb);
-          return a.path.localeCompare(b.path);
-        });
-      } else {
-        sortedFiles = [...sourceFiles].sort((a, b) =>
-          a.path.localeCompare(b.path),
-        );
-      }
+      sortedFiles =
+        lang === "c"
+          ? [...sourceFiles].sort((a, b) => {
+              const sa = subsystemKey(a.path),
+                sb = subsystemKey(b.path);
+              return sa !== sb
+                ? sa.localeCompare(sb)
+                : a.path.localeCompare(b.path);
+            })
+          : [...sourceFiles].sort((a, b) => a.path.localeCompare(b.path));
     } else {
       const {
         files: selectedFiles,
@@ -1730,7 +1987,6 @@ export async function buildMasterContext(
         intents,
         lang,
       );
-
       if (expertPlan?.files) {
         for (const f of expertPlan.files) {
           const found = sourceFiles.find(
@@ -1740,38 +1996,30 @@ export async function buildMasterContext(
             selectedFiles.push(found);
         }
       }
-
       sortedFiles = [...selectedFiles].sort((a, b) => {
-        const da = depthMap.get(a.path) ?? 999;
-        const db = depthMap.get(b.path) ?? 999;
+        const da = depthMap.get(a.path) ?? 999,
+          db = depthMap.get(b.path) ?? 999;
         return da !== db ? da - db : a.path.localeCompare(b.path);
       });
-
-      if (omittedCount > 0) {
+      if (omittedCount > 0)
         push(
           "_meta",
-          `## File Selection\n\n${sortedFiles.length} files included, ${omittedCount} files omitted as irrelevant.\nSample omitted: ${omittedPaths.join(", ")}`,
+          `## File Selection\n\n${sortedFiles.length} files included, ${omittedCount} omitted.\nSample omitted: ${omittedPaths.join(", ")}`,
         );
-      }
     }
 
-    // C include graph summary — acts as a lightweight cscope substitute
     if (lang === "c" || lang === "mixed") {
       const selectedPaths = new Set(sortedFiles.map((f) => f.path));
-      const includeGraphSummary = getCIncludeGraphSummary(
-        cIncludeGraph,
-        selectedPaths,
-      );
-      if (includeGraphSummary) push("_meta", includeGraphSummary);
+      const inc = getCIncludeGraphSummary(cIncludeGraph, selectedPaths);
+      if (inc) push("_meta", inc);
     }
 
     const graphHeader =
       `## ${lang === "c" ? "Include" : "Import"} Graph and File Roles\n\n` +
       `- **Entry Point**: not ${lang === "c" ? "included by" : "imported by"} any other file.\n` +
       `- **Depth N**: N hops from an entry point.\n` +
-      `- **Utility**: not in the ${lang === "c" ? "include" : "import"} graph.\n\n` +
+      `- **Utility**: not in the graph.\n\n` +
       `Entry points: ${entryPoints.slice(0, 20).join(", ") || "none detected"}.`;
-
     if (sortedFiles.length > 0) push("_meta", graphHeader);
 
     for (const file of sortedFiles) {
@@ -1791,21 +2039,71 @@ export async function buildMasterContext(
 
   push(
     "_meta",
-    `## End of Context\n\nLanguage profile: ${lang}. Source files: ${needsCode ? "included" : "not included (meta-only query)"}.`,
+    `## End of Context\n\nLanguage: ${lang}. Notebooks: ${NOTEBOOKS}. Bridges: ${crossBoundaryCalls.length}. Source files: ${needsCode ? "included" : "not included"}.`,
   );
 
-  const writtenPaths = await packAndFlush(blocks, outputDir, lang);
+  const { writtenPaths, subsystemNotebook } = await packAndFlush(
+    blocks,
+    outputDir,
+    lang,
+    crossBoundaryCalls,
+  );
 
-  const manifestText = buildManifest(
-    writtenPaths.length,
+  const notebookDataPaths: string[][] = Array.from(
+    { length: NOTEBOOKS },
+    () => [],
+  );
+  for (const p of writtenPaths) {
+    const match = p.match(/notebook_(\d+)/);
+    if (match) notebookDataPaths[parseInt(match[1], 10) - 1].push(p);
+  }
+
+  const notebookSubsystems = new Map<number, string[]>();
+  for (const [sub, nb] of subsystemNotebook) {
+    if (!notebookSubsystems.has(nb)) notebookSubsystems.set(nb, []);
+    notebookSubsystems.get(nb)!.push(sub);
+  }
+
+  for (let nb = 1; nb <= NOTEBOOKS; nb++) {
+    const subs = notebookSubsystems.get(nb) ?? [];
+    const bridgeCount = crossBoundaryCalls.filter(
+      (c) =>
+        subsystemNotebook.get(c.callerSubsystem) === nb ||
+        subsystemNotebook.get(c.calleeSubsystem) === nb,
+    ).length;
+    const manifestText = buildNotebookManifest(
+      nb,
+      repoName,
+      repoContext,
+      subs,
+      notebookDataPaths[nb - 1].length,
+      droppedTiers,
+      allCandidates.length,
+      lang,
+      bridgeCount,
+    );
+    await writeFile(
+      join(outputDir, `notebook_${nb}`, `notebook_${nb}_manifest.txt`),
+      manifestText,
+      "utf-8",
+    );
+  }
+
+  const routerIndex = buildRouterIndex(
     repoName,
-    repoContext,
+    lang,
     droppedTiers,
     allCandidates.length,
-    lang,
+    writtenPaths.length + NOTEBOOKS,
+    subsystemNotebook,
+    notebookDataPaths,
+    crossBoundaryCalls,
   );
-  const manifestPath = join(outputDir, "00_Repo_Manifest.txt");
-  await writeFile(manifestPath, manifestText, "utf-8");
+  await writeFile(
+    join(outputDir, "router_index.json"),
+    JSON.stringify(routerIndex, null, 2),
+    "utf-8",
+  );
 
-  return manifestText;
+  return routerIndex;
 }
