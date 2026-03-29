@@ -1,4 +1,4 @@
-import { mkdirSync } from "fs";
+import { mkdirSync, createWriteStream } from "fs";
 import { writeFile } from "fs/promises";
 import { join } from "path";
 
@@ -13,7 +13,7 @@ const MAX_SOURCE_BUCKETS = MAX_OUTPUT_FILES - 1;
 const WORD_LIMIT_PER_FILE = 450_000;
 const TOTAL_WORD_BUDGET = MAX_SOURCE_BUCKETS * WORD_LIMIT_PER_FILE;
 
-type RepoLanguage = "c" | "web" | "go" | "rust" | "python" | "java" | "mixed";
+type RepoLanguage = "c" | "web" | "go" | "rust" | "python" | "java" | "kotlin" | "swift" | "ruby" | "php" | "scala" | "elixir" | "mixed";
 
 function detectRepoLanguage(filesMetadata: any[]): RepoLanguage {
   const extCounts: Record<string, number> = {};
@@ -259,34 +259,28 @@ export interface ExpertPlan {
 // Maps top-level directory prefix → human-readable subsystem name.
 // Used to group files into subsystem-coherent buckets instead of word-count splits.
 
-const LINUX_SUBSYSTEMS: Record<string, string> = {
-  arch: "arch",
-  block: "block",
-  certs: "certs",
-  crypto: "crypto",
-  Documentation: "docs",
-  drivers: "drivers",
-  fs: "fs",
-  include: "include",
-  init: "init",
-  io_uring: "io_uring",
-  ipc: "ipc",
-  kernel: "kernel",
-  lib: "lib",
-  mm: "mm",
-  net: "net",
-  samples: "samples",
-  scripts: "scripts",
-  security: "security",
-  sound: "sound",
-  tools: "tools",
-  usr: "usr",
-  virt: "virt",
-};
+// ─── Heuristic Importance Ranking (repo-agnostic) ─────────────────────────────
+// Replaces hardcoded Linux subsystem maps. Works for any codebase language.
+
+export function rankFileImportance(
+  filePath: string,
+  exports: string[],
+  refsCount: number,
+): number {
+  let rank = 0;
+  const parts = filePath.split("/");
+  if (parts.length === 1) rank += 60;
+  else if (parts.length === 2) rank += 30;
+  if (parts[0] === "include" || parts[0] === "src") rank += 20;
+  const name = parts[parts.length - 1].toLowerCase().replace(/\..*$/, "");
+  if (/^(main|index|app|init|entry|server|mod|lib)$/.test(name)) rank += 80;
+  rank += Math.min((exports?.length || 0) * 3, 60);
+  rank += Math.min((refsCount || 0) * 2, 40);
+  return rank;
+}
 
 function subsystemKey(filePath: string): string {
-  const first = filePath.split("/")[0];
-  return LINUX_SUBSYSTEMS[first] ?? first ?? "_root";
+  return filePath.split("/")[0] || "_root";
 }
 
 // ─── Intent / focus detection ─────────────────────────────────────────────────
@@ -809,10 +803,15 @@ function safeFileExt(file: any): string {
   return raw.toLowerCase();
 }
 
+// ─── Binary/Poison Shield ──────────────────────────────────────────────────────
+// Strips null bytes and non-printable chars that crash NotebookLM uploads.
+// Preserves valid UTF-8 including scientific and international text.
 function safeContent(file: any): string {
   const c = file.content;
   if (c === null || c === undefined) return "";
-  return String(c);
+  let str = Buffer.isBuffer(c) ? c.toString("utf-8") : String(c);
+  str = str.replace(/[\x00\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+  return str;
 }
 
 // ─── Directory structure ──────────────────────────────────────────────────────
@@ -1330,11 +1329,36 @@ function getFileContext(
     `${exportsStr}${importsStr ? " " + importsStr : ""}${todosStr}`;
 
   let content = safeContent(file);
-  if (content.length > FILE_CHAR_LIMIT) {
+
+  // ─── Token-Density Smart Windowing ───────────────────────────────────────────
+  // Dense files (ASM, minified, generated headers) get head+tail+exported symbols.
+  // All other oversized files get a clean tail-truncation.
+  const _words = content.split(/\s+/).filter(Boolean);
+  if (_words.length > 1500) {
+    const _syms = content.match(/[a-zA-Z_][a-zA-Z0-9_]*/g) || [];
+    const _density = new Set(_syms).size / _words.length;
+    if (_density > 0.38) {
+      const _lines = content.split("\n");
+      const _head = _lines.slice(0, 80).join("\n");
+      const _tail = _lines.slice(-60).join("\n");
+      const _kept: string[] = [];
+      for (let _i = 80; _i < _lines.length - 60; _i++) {
+        if (/\b(export|struct|class|fn |interface|type |EXPORT_SYMBOL|pub |module\.exports|def |func )/.test(_lines[_i]))
+          _kept.push(_lines[_i]);
+      }
+      content = _head
+        + "\n\n[SMART WINDOWING: " + (_lines.length - 140 - _kept.length) + " dense lines stripped.]\n"
+        + (_kept.length ? "\n// === Exported Symbols ===\n" + _kept.join("\n") + "\n" : "")
+        + "\n" + _tail;
+    } else if (content.length > FILE_CHAR_LIMIT) {
+      const cut = content.lastIndexOf("\n", FILE_CHAR_LIMIT);
+      content = content.slice(0, cut > 0 ? cut : FILE_CHAR_LIMIT)
+        + `\n\n[TRUNCATED: file exceeds ${FILE_CHAR_LIMIT.toLocaleString()} characters.]`;
+    }
+  } else if (content.length > FILE_CHAR_LIMIT) {
     const cut = content.lastIndexOf("\n", FILE_CHAR_LIMIT);
-    content =
-      content.slice(0, cut > 0 ? cut : FILE_CHAR_LIMIT) +
-      `\n\n[TRUNCATED: file exceeds ${FILE_CHAR_LIMIT.toLocaleString()} characters.]`;
+    content = content.slice(0, cut > 0 ? cut : FILE_CHAR_LIMIT)
+      + `\n\n[TRUNCATED: file exceeds ${FILE_CHAR_LIMIT.toLocaleString()} characters.]`;
   }
 
   const heading = `### ${file.path} (${role})`;
@@ -1402,119 +1426,68 @@ function countWords(text: string): number {
   return text.split(/\s+/).filter(Boolean).length;
 }
 
-// ─── Subsystem-aware packing ──────────────────────────────────────────────────
-// For C repos: group files by subsystem, then fill buckets by subsystem group.
-// This keeps fs/ together, mm/ together, etc. — critical for NotebookLLM coherence.
-// For web repos: falls back to original word-count greedy packing.
+// ─── Directory-Aware Stream Packer ────────────────────────────────────────────
+// Groups blocks by top-level directory so neighboring files stay together.
+// Streams directly to disk: never holds full content in RAM (OOM-safe).
 
-async function packAndFlush(
+const STREAM_PART_BYTES = 45 * 1024 * 1024; // 45 MB per part
+
+async function streamPack(
   blocks: Block[],
   outDir: string,
   lang: RepoLanguage,
 ): Promise<string[]> {
   mkdirSync(outDir, { recursive: true });
 
-  if (lang === "c") {
-    // Group blocks by subsystem, then pack subsystem groups into buckets
-    const subsystemGroups = new Map<string, Block[]>();
-    for (const block of blocks) {
-      const key = block.group === "_meta" ? "_meta" : subsystemKey(block.group);
-      if (!subsystemGroups.has(key)) subsystemGroups.set(key, []);
-      subsystemGroups.get(key)!.push(block);
-    }
-
-    // Order: _meta first, then subsystems alphabetically
-    const orderedGroups = [
-      "_meta",
-      ...[...subsystemGroups.keys()].filter((k) => k !== "_meta").sort(),
-    ].filter((k) => subsystemGroups.has(k));
-
-    const buckets: string[][] = [[]];
-    const bucketWords: number[] = [0];
-
-    for (const groupKey of orderedGroups) {
-      const groupBlocks = subsystemGroups.get(groupKey)!;
-      const groupText = groupBlocks.map((b) => b.text);
-      const groupWords = groupText.reduce((s, t) => s + countWords(t), 0);
-
-      // Try to keep each subsystem in one bucket; split only if over budget
-      const curr = buckets.length - 1;
-      if (
-        buckets.length < MAX_SOURCE_BUCKETS &&
-        bucketWords[curr] + groupWords > WORD_LIMIT_PER_FILE &&
-        bucketWords[curr] > 0
-      ) {
-        // Start a new bucket for this subsystem
-        buckets.push([]);
-        bucketWords.push(0);
-      }
-
-      // If the subsystem itself exceeds one bucket, spill across buckets
-      for (const text of groupText) {
-        const wc = countWords(text);
-        const c = buckets.length - 1;
-        if (
-          buckets.length < MAX_SOURCE_BUCKETS &&
-          bucketWords[c] + wc > WORD_LIMIT_PER_FILE &&
-          bucketWords[c] > 0
-        ) {
-          buckets.push([text]);
-          bucketWords.push(wc);
-        } else {
-          buckets[c].push(text);
-          bucketWords[c] += wc;
-        }
-      }
-    }
-
-    const written: string[] = [];
-    for (let i = 0; i < buckets.length; i++) {
-      const paddedNum = String(i + 1).padStart(2, "0");
-      const fileName = `part_${paddedNum}.txt`;
-      const fullPath = join(outDir, fileName);
-      await writeFile(fullPath, buckets[i].join("\n\n"), "utf-8");
-      written.push(fullPath);
-    }
-    return written;
-  } else {
-    // Original greedy word-count packing for web/other repos
-    const allText = blocks.map((b) => b.text);
-    const totalWords = allText.reduce((s, t) => s + countWords(t), 0);
-    const targetWordsPerBucket = Math.min(
-      Math.ceil(totalWords / MAX_SOURCE_BUCKETS),
-      WORD_LIMIT_PER_FILE,
-    );
-
-    const buckets: string[][] = [[]];
-    const bucketWords: number[] = [0];
-
-    for (const text of allText) {
-      const wc = countWords(text);
-      const curr = buckets.length - 1;
-      if (
-        buckets.length < MAX_SOURCE_BUCKETS &&
-        bucketWords[curr] + wc > targetWordsPerBucket &&
-        bucketWords[curr] > 0
-      ) {
-        buckets.push([text]);
-        bucketWords.push(wc);
-      } else {
-        buckets[curr].push(text);
-        bucketWords[curr] += wc;
-      }
-    }
-
-    const written: string[] = [];
-    for (let i = 0; i < buckets.length; i++) {
-      const paddedNum = String(i + 1).padStart(2, "0");
-      const fileName = `part_${paddedNum}.txt`;
-      const fullPath = join(outDir, fileName);
-      await writeFile(fullPath, buckets[i].join("\n\n"), "utf-8");
-      written.push(fullPath);
-    }
-    return written;
+  // Semantic grouping: _meta first, then by top-level directory
+  const dirGroups = new Map<string, Block[]>();
+  for (const block of blocks) {
+    const dir = block.group === "_meta" ? "_meta" : (block.group.split("/")[0] || "_root");
+    if (!dirGroups.has(dir)) dirGroups.set(dir, []);
+    dirGroups.get(dir)!.push(block);
   }
+  const orderedDirs = [
+    "_meta",
+    ...[...dirGroups.keys()]
+      .filter((k) => k !== "_meta")
+      .sort((a, b) => dirGroups.get(b)!.length - dirGroups.get(a)!.length),
+  ].filter((k) => dirGroups.has(k));
+
+  type WriteStream = ReturnType<typeof createWriteStream>;
+  const writtenPaths: string[] = [];
+  let fileIdx = 0;
+  let currentBytes = 0;
+  let currentStream: WriteStream | undefined;
+
+  const openPart = (): boolean => {
+    currentStream?.end();
+    if (fileIdx >= MAX_SOURCE_BUCKETS) { currentStream = undefined; return false; }
+    const fullPath = join(outDir, `part_${String(fileIdx + 1).padStart(2, "0")}.txt`);
+    writtenPaths.push(fullPath);
+    currentStream = createWriteStream(fullPath, { encoding: "utf-8" });
+    currentBytes = 0;
+    fileIdx++;
+    return true;
+  };
+
+  if (!openPart()) return writtenPaths;
+
+  for (const dir of orderedDirs) {
+    for (const block of dirGroups.get(dir)!) {
+      if (fileIdx > MAX_SOURCE_BUCKETS) break;
+      const chunkBytes = Buffer.byteLength(block.text, "utf-8") + 4;
+      if (currentBytes > 0 && currentBytes + chunkBytes > STREAM_PART_BYTES) {
+        if (!openPart()) break;
+      }
+      currentStream?.write(block.text + "\n\n");
+      currentBytes += chunkBytes;
+    }
+  }
+
+  currentStream?.end();
+  return writtenPaths;
 }
+
 
 // ─── Manifest ─────────────────────────────────────────────────────────────────
 
@@ -1794,7 +1767,7 @@ export async function buildMasterContext(
     `## End of Context\n\nLanguage profile: ${lang}. Source files: ${needsCode ? "included" : "not included (meta-only query)"}.`,
   );
 
-  const writtenPaths = await packAndFlush(blocks, outputDir, lang);
+  const writtenPaths = await streamPack(blocks, outputDir, lang);
 
   const manifestText = buildManifest(
     writtenPaths.length,
