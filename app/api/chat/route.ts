@@ -39,7 +39,9 @@ async function getOrCreateContext(): Promise<BrowserContext> {
       sharedContext = null;
     }
   }
+
   try {
+    console.log("[Playwright] Attempting to connect to Brave on 9222...");
     const browser = await chromium.connectOverCDP("http://localhost:9222");
     sharedContext = browser.contexts()[0];
     (global as any)[GLOBAL_CONTEXT_KEY] = sharedContext;
@@ -67,8 +69,8 @@ async function fetchFileContents(
   onStatus?: (msg: string, partial?: string, progress?: number) => void,
 ) {
   const result = new Map<string, string>();
-  const CHUNK_SIZE = 100; // Increased to 100 GraphQL paths per single query body
-  const CONCURRENCY = 50; // Increased to 50 concurrent network requests
+  const CHUNK_SIZE = 100;
+  const CONCURRENCY = 50;
 
   let token = process.env.GITHUB_TOKEN || process.env.NEXT_PUBLIC_GITHUB_TOKEN;
 
@@ -92,7 +94,7 @@ async function fetchFileContents(
     onStatus?.(
       `Syncing source... (${filesFetched}/${files.length})`,
       undefined,
-      Math.round((filesFetched / files.length) * 100)
+      Math.round((filesFetched / files.length) * 100),
     );
 
     await Promise.all(
@@ -203,7 +205,11 @@ export async function POST(req: Request) {
 
     const processJob = async () => {
       try {
-        const setStatus = (msg: string, partial?: string, overrideProgress?: number) => {
+        const setStatus = (
+          msg: string,
+          partial?: string,
+          overrideProgress?: number,
+        ) => {
           const job = activeJobs.get(taskId);
           if (job)
             activeJobs.set(taskId, {
@@ -239,33 +245,20 @@ export async function POST(req: Request) {
               return false;
 
             const ignoredExtensions = [
-              ".png",
-              ".jpg",
-              ".jpeg",
-              ".gif",
-              ".ico",
-              ".svg",
-              ".bmp",
-              ".webp",
-              ".mp4",
-              ".mp3",
-              ".wav",
-              ".zip",
-              ".tar",
-              ".gz",
-              ".pdf",
-              ".ttf",
-              ".woff",
-              ".woff2",
-              ".lock",
-              ".log",
-              "-lock.yaml",
-              "package-lock.json",
-              "yarn.lock",
-              "pnpm-lock.yaml",
+              ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".bmp", ".webp",
+              ".mp4", ".mp3", ".wav", ".zip", ".tar", ".gz", ".pdf",
+              ".ttf", ".woff", ".woff2", ".lock", ".log", ".DS_Store",
+              ".eslintcache", ".playwright-auth.json", "auth.json",
+              ".gitignore", ".gitattributes", ".gitmodules"
+            ];
+            const ignoredNames = [
+              "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+              "composer.lock", "Cargo.lock", "poetry.lock", "Gemfile.lock"
             ];
 
             if (ignoredExtensions.some((ext) => pLower.endsWith(ext)))
+              return false;
+            if (ignoredNames.some((name) => pLower.endsWith(name)))
               return false;
 
             return true;

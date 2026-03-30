@@ -3,17 +3,25 @@ import { writeFile } from "fs/promises";
 import { join } from "path";
 
 const IMPORT_DEPTH = 99999;
-const FILE_CHAR_LIMIT = 100_000;
 const SPLIT_THRESHOLD_CHARS = 3_000;
-const MIN_RELEVANCE_SCORE_GENERIC = 3;
-const MIN_RELEVANCE_SCORE_TARGETED = 15;
 
-const MAX_OUTPUT_FILES = 50;
-const MAX_SOURCE_BUCKETS = MAX_OUTPUT_FILES - 1;
-const WORD_LIMIT_PER_FILE = 450_000;
-const TOTAL_WORD_BUDGET = MAX_SOURCE_BUCKETS * WORD_LIMIT_PER_FILE;
+const STREAM_PART_BYTES = 100_000_000; // Let NotebookLM handle larger chunks instead of us splitting them.
+const MAX_SOURCE_BUCKETS = 49;
 
-type RepoLanguage = "c" | "web" | "go" | "rust" | "python" | "java" | "kotlin" | "swift" | "ruby" | "php" | "scala" | "elixir" | "mixed";
+type RepoLanguage =
+  | "c"
+  | "web"
+  | "go"
+  | "rust"
+  | "python"
+  | "java"
+  | "kotlin"
+  | "swift"
+  | "ruby"
+  | "php"
+  | "scala"
+  | "elixir"
+  | "mixed";
 
 function detectRepoLanguage(filesMetadata: any[]): RepoLanguage {
   const extCounts: Record<string, number> = {};
@@ -33,189 +41,28 @@ function detectRepoLanguage(filesMetadata: any[]): RepoLanguage {
   return "mixed";
 }
 
-const TIER2_WEB = new Set([
-  "ts",
-  "tsx",
-  "js",
-  "jsx",
-  "mjs",
-  "cjs",
-  "svelte",
-  "vue",
-]);
-const TIER2_SYSTEMS = new Set([
-  "c",
-  "h",
-  "cpp",
-  "cc",
-  "cxx",
-  "hpp",
-  "hxx",
-  "rs",
-  "go",
-  "py",
-  "rb",
-  "java",
-  "kt",
-  "swift",
-  "cs",
-  "sh",
-  "bash",
-  "zsh",
-  "sql",
-  "S",
-  "ld",
-]);
-const KERNEL_CONFIG_EXTENSIONS = new Set(["Kconfig", "Makefile", "makefile"]);
-
-const TIER3_EXTENSIONS = new Set([
-  "md",
-  "mdx",
-  "rst",
-  "html",
-  "yaml",
-  "yml",
-  "toml",
-]);
-const TIER4_EXTENSIONS = new Set(["css", "scss", "sass", "less"]);
-
-const ROOT_CONFIG_NAMES = new Set([
-  "package.json",
-  "tsconfig.json",
-  "tsconfig.base.json",
-  "jsconfig.json",
-  "go.mod",
-  "go.sum",
-  "cargo.toml",
-  "cargo.lock",
-  "pyproject.toml",
-  "setup.py",
-  "setup.cfg",
-  "requirements.txt",
-  "gemfile",
-  "gemfile.lock",
-  "composer.json",
-  "makefile",
-  "dockerfile",
-  "docker-compose.yml",
-  "docker-compose.yaml",
-  ".eslintrc.json",
-  ".eslintrc.js",
-  "eslint.config.js",
-  "eslint.config.mjs",
-  ".prettierrc",
-  ".prettierrc.json",
-  "prettier.config.js",
-  "vite.config.ts",
-  "vite.config.js",
-  "next.config.ts",
-  "next.config.js",
-  "rollup.config.js",
-  "webpack.config.js",
-  "babel.config.js",
-  "babel.config.json",
-  "jest.config.ts",
-  "jest.config.js",
-  "vitest.config.ts",
-  "vitest.config.ts",
-  "tailwind.config.ts",
-  "tailwind.config.js",
-  "turbo.json",
-  ".env.example",
-  ".env.sample",
-  "kconfig",
-  "configure.ac",
-  "configure",
-  "cmakelists.txt",
-  "meson.build",
-  "build.ninja",
-]);
-
-const SOURCE_EXTENSIONS = new Set([
-  ...TIER2_WEB,
-  ...TIER2_SYSTEMS,
-  ...TIER3_EXTENSIONS,
-  ...TIER4_EXTENSIONS,
-  "json",
-  "toml",
-]);
-
 const EXCLUDE_PATTERNS: RegExp[] = [
+  /\.(png|jpe?g|gif|svg|ico|webp|avif|tiff|bmp|woff2?|ttf|eot|otf)$/i,
   /node_modules/,
-  /\.git\//,
-  /dist\//,
-  /\.next\//,
-  /\.nuxt\//,
-  /build\//,
-  /coverage\//,
-  /\.turbo\//,
-  /\.cache\//,
+  /^\.git\//,
+  /^\.next\//,
+  /^\.nuxt\//,
+  /^\.venv\//,
+  /\.DS_Store$/,
+  /\.playwright-auth\.json$/,
+  /auth\.json$/,
+  /\.eslintcache$/,
   /package-lock\.json$/,
   /yarn\.lock$/,
   /pnpm-lock\.yaml$/,
-  /\.d\.(ts|mts|cts)$/,
-  /vmlinux/,
-  /\.ko$/,
-  /\.o$/,
-  /\.a$/,
-  /tags$/,
-  /TAGS$/,
+  /composer\.lock$/,
+  /Cargo\.lock$/,
+  /poetry\.lock$/,
+  /Gemfile\.lock$/,
+  /\.gitignore$/,
+  /\.gitattributes$/,
+  /\.gitmodules$/,
 ];
-
-const STOP_WORDS = new Set([
-  "what",
-  "does",
-  "this",
-  "that",
-  "the",
-  "how",
-  "many",
-  "times",
-  "which",
-  "file",
-  "files",
-  "where",
-  "find",
-  "show",
-  "list",
-  "have",
-  "been",
-  "there",
-  "into",
-  "from",
-  "with",
-  "about",
-  "used",
-  "called",
-  "imported",
-  "exported",
-  "defined",
-  "function",
-  "method",
-  "class",
-  "module",
-  "every",
-  "each",
-  "all",
-  "any",
-  "some",
-  "repo",
-  "code",
-  "project",
-  "codebase",
-  "library",
-  "package",
-  "tell",
-  "give",
-  "return",
-  "returns",
-  "takes",
-  "accepts",
-  "throws",
-  "emits",
-  "renders",
-  "works",
-]);
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -237,11 +84,6 @@ interface FunctionBlock {
   startLine: number;
   endLine: number;
   text: string;
-}
-
-interface ScoredFile {
-  file: any;
-  score: number;
 }
 
 interface Block {
@@ -273,7 +115,11 @@ export function rankFileImportance(
   else if (parts.length === 2) rank += 30;
   if (parts[0] === "include" || parts[0] === "src") rank += 20;
   const name = parts[parts.length - 1].toLowerCase().replace(/\..*$/, "");
-  if (/^(main|index|app|init|entry|server|mod|lib)$/.test(name)) rank += 80;
+  if (
+    /^(main|index|app|init|entry|server|mod|lib|readme|readme_.*)$/.test(name)
+  )
+    rank += 100;
+  if (isDocFile(filePath)) rank += 50;
   rank += Math.min((exports?.length || 0) * 3, 60);
   rank += Math.min((refsCount || 0) * 2, 40);
   return rank;
@@ -407,42 +253,6 @@ function detectCodeFocus(query: string): CodeFocus {
 
 // ─── Token extraction ─────────────────────────────────────────────────────────
 
-function extractQueryTokens(query: string): string[] {
-  const tokens = new Set<string>();
-
-  // Quoted symbols
-  for (const q of query.match(/['"`]([a-zA-Z_$][a-zA-Z0-9_$]{2,})['"`]/g) ?? [])
-    tokens.add(q.replace(/['"`]/g, ""));
-
-  // File paths
-  for (const p of query.match(/\b[\w-]+\/[\w-]+(\.[a-z]{1,5})?\b/g) ?? [])
-    tokens.add(p);
-
-  // Dot-chains
-  for (const chain of query.match(/\b[a-zA-Z_$][a-zA-Z0-9_$.]{3,}\b/g) ?? []) {
-    if (chain.includes(".")) {
-      tokens.add(chain);
-      for (const part of chain.split("."))
-        if (part.length > 2) tokens.add(part);
-    }
-  }
-
-  // camelCase and snake_case
-  for (const c of query.match(/\b[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*\b/g) ?? [])
-    tokens.add(c);
-  for (const s of query.match(/\b[a-z][a-z0-9]*(_[a-z0-9]+){1,}\b/g) ?? [])
-    tokens.add(s);
-
-  // Plain words
-  for (const w of query
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .split(/\s+/))
-    if (w.length >= 2 && !STOP_WORDS.has(w)) tokens.add(w);
-
-  return [...tokens];
-}
-
 // ─── C-aware symbol extraction ────────────────────────────────────────────────
 // Extracts function names, macro names, struct/typedef names from C source.
 // Used to enrich scoring when importGraph is empty (all C repos).
@@ -504,158 +314,7 @@ function buildCIncludeGraph(filesMetadata: any[]): Record<string, string[]> {
 
 // ─── Scoring ──────────────────────────────────────────────────────────────────
 
-function scoreFile(
-  file: any,
-  tokens: string[],
-  importGraph: Record<string, string[]>,
-  cIncludeGraph: Record<string, string[]>,
-  isImportQuery: boolean,
-  isTestQuery: boolean,
-  lang: RepoLanguage,
-): number {
-  if (!tokens.length) return 0;
-
-  let score = 0;
-  const filePath = (file.path as string).toLowerCase();
-  const exports: string[] = file.analysis?.exports ?? [];
-  const imports: string[] = file.imports ?? [];
-  const isTestFile =
-    /\.(test|spec)\.[a-z]+$/.test(file.path) ||
-    /__tests__/.test(file.path) ||
-    /\/tests?\//.test(file.path);
-
-  if (isTestFile && !isTestQuery) score -= 15;
-  if (!isTestFile && isTestQuery) score -= 5;
-
-  const content = safeContent(file);
-  const fullContent = content.toLowerCase();
-
-  // C-specific: extract symbols for richer matching
-  const cSymbols =
-    lang === "c" || lang === "mixed"
-      ? extractCSymbols(content).map((s) => s.toLowerCase())
-      : [];
-
-  for (const token of tokens) {
-    const t = token.toLowerCase();
-    const pathBase =
-      filePath
-        .split("/")
-        .pop()
-        ?.replace(/\.[^.]+$/, "") ?? "";
-
-    // Filename match
-    if (pathBase === t) score += 30;
-    else if (filePath.includes(t)) score += 5;
-
-    // JS/TS exports
-    if (exports.some((e) => e.toLowerCase() === t)) score += 20;
-    else if (exports.some((e) => e.toLowerCase().includes(t))) score += 8;
-
-    // JS/TS imports
-    if (imports.some((i) => i.toLowerCase().includes(t))) score += 3;
-
-    // C symbol match (EXPORT_SYMBOL, function defs, macros, structs)
-    if (cSymbols.includes(t)) score += 20;
-    else if (cSymbols.some((s) => s.includes(t))) score += 8;
-
-    // Raw content occurrences (capped to prevent giant files dominating)
-    const occurrences = (
-      fullContent.match(new RegExp(`\\b${escapeRegex(t)}\\b`, "g")) ?? []
-    ).length;
-    score += Math.min(occurrences * 2, 30);
-
-    // Exact file path token
-    if (token.includes("/") && filePath.includes(t)) score += 50;
-  }
-
-  // Graph centrality bonus
-  if (isImportQuery) {
-    // JS/TS import graph
-    const jsImporterCount = Object.values(importGraph).filter((deps) =>
-      deps.some((d) => d.includes(file.path) || file.path.includes(d)),
-    ).length;
-    score += jsImporterCount * 4;
-
-    // C include graph
-    const cIncluderCount = Object.values(cIncludeGraph).filter((deps) =>
-      deps.includes(file.path),
-    ).length;
-    score += cIncluderCount * 4;
-  }
-
-  // Penalise near-empty files
-  if ((file.metrics?.codeLines ?? 0) < 5) score = Math.floor(score * 0.4);
-
-  // Boost kernel-critical file types
-  const fileName = file.path.split("/").pop() ?? "";
-  if (fileName.startsWith("Kconfig")) score += 10;
-  if (fileName === "Makefile" || fileName === "makefile") score += 5;
-  if (file.path.endsWith(".S")) score += 8; // assembly entry points
-
-  return score;
-}
-
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 // ─── File selection ───────────────────────────────────────────────────────────
-
-function selectFilesForQuery(
-  sourceFiles: any[],
-  query: string,
-  focus: CodeFocus,
-  importGraph: Record<string, string[]>,
-  cIncludeGraph: Record<string, string[]>,
-  depthMap: Map<string, number>,
-  intents: QueryIntent[],
-  lang: RepoLanguage,
-): { files: any[]; omittedCount: number; omittedPaths: string[] } {
-  if (focus === "generic" && !intents.includes("code")) {
-    return { files: [], omittedCount: sourceFiles.length, omittedPaths: [] };
-  }
-
-  const tokens = extractQueryTokens(query);
-  if (tokens.length === 0 && focus === "targeted") focus = "generic";
-
-  const isImportQuery =
-    /how many times|import(ed)?|usage|reference|occurrence|depend|include/i.test(
-      query,
-    );
-  const isTestQuery = intents.includes("test");
-
-  const scored: ScoredFile[] = sourceFiles.map((file) => ({
-    file,
-    score: scoreFile(
-      file,
-      tokens,
-      importGraph,
-      cIncludeGraph,
-      isImportQuery,
-      isTestQuery,
-      lang,
-    ),
-  }));
-
-  scored.sort((a, b) => b.score - a.score);
-
-  const threshold =
-    focus === "targeted"
-      ? MIN_RELEVANCE_SCORE_TARGETED
-      : MIN_RELEVANCE_SCORE_GENERIC;
-  const relevant = scored.filter((s) => s.score >= threshold);
-  const selected = relevant.map((s) => s.file);
-  const omitted = scored
-    .filter((s) => !selected.includes(s.file))
-    .map((s) => s.file);
-
-  return {
-    files: selected,
-    omittedCount: omitted.length,
-    omittedPaths: omitted.slice(0, 20).map((f) => f.path),
-  };
-}
 
 // ─── Import depth resolution ──────────────────────────────────────────────────
 
@@ -692,59 +351,9 @@ function importRoleLabel(depth: number | undefined): ImportRole {
 
 // ─── File tier ────────────────────────────────────────────────────────────────
 
-function fileTier(filePath: string, lang: RepoLanguage = "web"): number {
+function fileTier(filePath: string, _lang: RepoLanguage = "web"): number {
   if (EXCLUDE_PATTERNS.some((re) => re.test(filePath))) return 0;
-
-  const parts = filePath.split("/");
-  const fileName = parts[parts.length - 1];
-  const fileNameLower = fileName.toLowerCase();
-  const ext = fileName.split(".").pop() ?? "";
-  const extLower = ext.toLowerCase();
-
-  // Kernel-specific: Kconfig files have no extension but are critical Tier 1
-  if (
-    fileName === "Kconfig" ||
-    fileName.startsWith("Kconfig.") ||
-    KERNEL_CONFIG_EXTENSIONS.has(fileName)
-  )
-    return 1;
-
-  // Linker scripts
-  if (extLower === "ld" || extLower === "lds") return 2;
-
-  // Assembly entry points (arch/**/*.S)
-  if (ext === "S") return 2;
-
-  const isRoot = parts.length === 1;
-  const isShallowDoc =
-    parts.length <= 2 &&
-    (extLower === "md" || extLower === "mdx" || extLower === "rst");
-  const isKeyConfig = isRoot && ROOT_CONFIG_NAMES.has(fileNameLower);
-  const isGitHubWorkflow = /^\.github\/workflows\//.test(filePath);
-  if (isRoot || isShallowDoc || isKeyConfig || isGitHubWorkflow) return 1;
-
-  if (
-    TIER2_WEB.has(extLower) ||
-    TIER2_SYSTEMS.has(ext) ||
-    TIER2_SYSTEMS.has(extLower)
-  )
-    return 2;
-
-  if (
-    extLower === "md" ||
-    extLower === "mdx" ||
-    extLower === "rst" ||
-    extLower === "html" ||
-    extLower === "yaml" ||
-    extLower === "yml" ||
-    extLower === "toml" ||
-    extLower === "json"
-  )
-    return 3;
-
-  if (TIER4_EXTENSIONS.has(extLower)) return 4;
-
-  return 0;
+  return 1;
 }
 
 function shouldInclude(filePath: string, lang: RepoLanguage = "web"): boolean {
@@ -752,36 +361,6 @@ function shouldInclude(filePath: string, lang: RepoLanguage = "web"): boolean {
 }
 
 // ─── Budget-aware file selection ──────────────────────────────────────────────
-
-function selectFilesByBudget(
-  candidates: any[],
-  estimateWords: (f: any) => number,
-  lang: RepoLanguage,
-): { files: any[]; droppedTiers: number[] } {
-  const withTier = candidates
-    .map((f) => ({ file: f, tier: fileTier(f.path, lang) }))
-    .filter((x) => x.tier > 0);
-
-  const mustInclude = withTier.filter((x) => x.tier <= 2).map((x) => x.file);
-  const tier3 = withTier.filter((x) => x.tier === 3).map((x) => x.file);
-  const tier4 = withTier.filter((x) => x.tier === 4).map((x) => x.file);
-
-  const wordsOf = (files: any[]) =>
-    files.reduce((s, f) => s + estimateWords(f), 0);
-  const droppedTiers: number[] = [];
-
-  let selected = [...mustInclude, ...tier3, ...tier4];
-  if (wordsOf(selected) > TOTAL_WORD_BUDGET) {
-    selected = [...mustInclude, ...tier3];
-    droppedTiers.push(4);
-  }
-  if (wordsOf(selected) > TOTAL_WORD_BUDGET) {
-    selected = [...mustInclude];
-    droppedTiers.push(3);
-  }
-
-  return { files: selected, droppedTiers };
-}
 
 // ─── Doc detection ────────────────────────────────────────────────────────────
 
@@ -812,6 +391,40 @@ function safeContent(file: any): string {
   let str = Buffer.isBuffer(c) ? c.toString("utf-8") : String(c);
   str = str.replace(/[\x00\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
   return str;
+}
+
+/**
+ * Strips AI-redundant content (comments, blank lines) to fit more code into context. 
+ * Preserves logic and structure.
+ */
+function shrinkCodeForAI(content: string, ext: string): string {
+  if (!content) return "";
+  const isDoc = ["md", "mdx", "rst", "txt"].includes(ext);
+  if (isDoc) return content.trim();
+
+  let lines = content.replace(/\r\n/g, "\n").split("\n");
+  const isJS = ["js", "jsx", "ts", "tsx", "c", "cpp", "h", "hpp", "java", "kt", "scala", "swift", "php", "go"].includes(ext);
+  const isPython = ["py", "rb", "pl", "sh", "yml", "yaml", "toml"].includes(ext);
+
+  const result: string[] = [];
+  for (let line of lines) {
+    const t = line.trim();
+    if (!t) {
+      if (result.length > 0 && result[result.length - 1] !== "") result.push("");
+      continue;
+    }
+    // Skip full-line comments
+    if (isJS && (t.startsWith("//") || (t.startsWith("/*") && t.endsWith("*/")))) continue;
+    if (isPython && t.startsWith("#")) continue;
+    
+    // Remove trailing comments if they have space before them
+    let cleanLine = line;
+    if (isJS && cleanLine.includes(" //")) cleanLine = cleanLine.split(" //")[0];
+    if (isPython && cleanLine.includes(" #")) cleanLine = cleanLine.split(" #")[0];
+
+    result.push(cleanLine.trimEnd());
+  }
+  return result.join("\n").trim();
 }
 
 // ─── Directory structure ──────────────────────────────────────────────────────
@@ -894,7 +507,7 @@ function docSortKey(filePath: string): string {
   return `3-other-${lower}`;
 }
 
-function getReadme(docFiles: any[], maxFiles = 5): string {
+function getReadme(docFiles: any[], maxFiles = 5, charLimit = 100_000): string {
   if (!docFiles.length) return "";
   const sorted = [...docFiles].sort((a, b) =>
     docSortKey(a.path).localeCompare(docSortKey(b.path)),
@@ -907,10 +520,9 @@ function getReadme(docFiles: any[], maxFiles = 5): string {
   ];
   for (const doc of limited) {
     let content = safeContent(doc);
-    if (content.length > FILE_CHAR_LIMIT) {
-      const cut = content.lastIndexOf("\n", FILE_CHAR_LIMIT);
-      content =
-        content.slice(0, cut > 0 ? cut : FILE_CHAR_LIMIT) + `\n\n[TRUNCATED]`;
+    if (content.length > charLimit) {
+      const cut = content.lastIndexOf("\n", charLimit);
+      content = content.slice(0, cut > 0 ? cut : charLimit);
     }
     parts.push(`### ${doc.path}\n\n${content}`);
   }
@@ -1274,7 +886,8 @@ function getFileContext(
   file: any,
   role: ImportRole,
   repoName: string,
-  lang: RepoLanguage,
+  _lang: RepoLanguage,
+  charLimit = 100_000,
 ): string {
   const ext = safeFileExt(file);
   const exports: string[] = file.analysis?.exports ?? [];
@@ -1328,37 +941,11 @@ function getFileContext(
     `Logic type: ${logicType}. ${lineCount} lines (${codeLines} code lines). ` +
     `${exportsStr}${importsStr ? " " + importsStr : ""}${todosStr}`;
 
-  let content = safeContent(file);
+  let content = shrinkCodeForAI(safeContent(file), ext);
 
-  // ─── Token-Density Smart Windowing ───────────────────────────────────────────
-  // Dense files (ASM, minified, generated headers) get head+tail+exported symbols.
-  // All other oversized files get a clean tail-truncation.
-  const _words = content.split(/\s+/).filter(Boolean);
-  if (_words.length > 1500) {
-    const _syms = content.match(/[a-zA-Z_][a-zA-Z0-9_]*/g) || [];
-    const _density = new Set(_syms).size / _words.length;
-    if (_density > 0.38) {
-      const _lines = content.split("\n");
-      const _head = _lines.slice(0, 80).join("\n");
-      const _tail = _lines.slice(-60).join("\n");
-      const _kept: string[] = [];
-      for (let _i = 80; _i < _lines.length - 60; _i++) {
-        if (/\b(export|struct|class|fn |interface|type |EXPORT_SYMBOL|pub |module\.exports|def |func )/.test(_lines[_i]))
-          _kept.push(_lines[_i]);
-      }
-      content = _head
-        + "\n\n[SMART WINDOWING: " + (_lines.length - 140 - _kept.length) + " dense lines stripped.]\n"
-        + (_kept.length ? "\n// === Exported Symbols ===\n" + _kept.join("\n") + "\n" : "")
-        + "\n" + _tail;
-    } else if (content.length > FILE_CHAR_LIMIT) {
-      const cut = content.lastIndexOf("\n", FILE_CHAR_LIMIT);
-      content = content.slice(0, cut > 0 ? cut : FILE_CHAR_LIMIT)
-        + `\n\n[TRUNCATED: file exceeds ${FILE_CHAR_LIMIT.toLocaleString()} characters.]`;
-    }
-  } else if (content.length > FILE_CHAR_LIMIT) {
-    const cut = content.lastIndexOf("\n", FILE_CHAR_LIMIT);
-    content = content.slice(0, cut > 0 ? cut : FILE_CHAR_LIMIT)
-      + `\n\n[TRUNCATED: file exceeds ${FILE_CHAR_LIMIT.toLocaleString()} characters.]`;
+  if (content.length > charLimit) {
+    const cut = content.lastIndexOf("\n", charLimit);
+    content = content.slice(0, cut > 0 ? cut : charLimit);
   }
 
   const heading = `### ${file.path} (${role})`;
@@ -1422,36 +1009,28 @@ function getFileContext(
 
 // ─── Word counting ────────────────────────────────────────────────────────────
 
-function countWords(text: string): number {
-  return text.split(/\s+/).filter(Boolean).length;
-}
-
 // ─── Directory-Aware Stream Packer ────────────────────────────────────────────
 // Groups blocks by top-level directory so neighboring files stay together.
 // Streams directly to disk: never holds full content in RAM (OOM-safe).
 
-const STREAM_PART_BYTES = 45 * 1024 * 1024; // 45 MB per part
-
 async function streamPack(
   blocks: Block[],
   outDir: string,
-  lang: RepoLanguage,
+  _lang: RepoLanguage,
 ): Promise<string[]> {
   mkdirSync(outDir, { recursive: true });
 
-  // Semantic grouping: _meta first, then by top-level directory
-  const dirGroups = new Map<string, Block[]>();
-  for (const block of blocks) {
-    const dir = block.group === "_meta" ? "_meta" : (block.group.split("/")[0] || "_root");
-    if (!dirGroups.has(dir)) dirGroups.set(dir, []);
-    dirGroups.get(dir)!.push(block);
-  }
-  const orderedDirs = [
-    "_meta",
-    ...[...dirGroups.keys()]
-      .filter((k) => k !== "_meta")
-      .sort((a, b) => dirGroups.get(b)!.length - dirGroups.get(a)!.length),
-  ].filter((k) => dirGroups.has(k));
+  // Dynamically calculate part size to hit MAX_SOURCE_BUCKETS (49)
+  const totalBytes = blocks.reduce(
+    (acc, b) => acc + Buffer.byteLength(b.text, "utf-8") + 4,
+    0,
+  );
+  // Target roughly MAX_SOURCE_BUCKETS files.
+  // Use a minimum target size of 1 byte to ensure we split as much as possible if user insists on 50.
+  const targetPartSize = Math.max(
+    1,
+    Math.ceil(totalBytes / MAX_SOURCE_BUCKETS),
+  );
 
   type WriteStream = ReturnType<typeof createWriteStream>;
   const writtenPaths: string[] = [];
@@ -1461,8 +1040,14 @@ async function streamPack(
 
   const openPart = (): boolean => {
     currentStream?.end();
-    if (fileIdx >= MAX_SOURCE_BUCKETS) { currentStream = undefined; return false; }
-    const fullPath = join(outDir, `part_${String(fileIdx + 1).padStart(2, "0")}.txt`);
+    if (fileIdx >= MAX_SOURCE_BUCKETS) {
+      currentStream = undefined;
+      return false;
+    }
+    const fullPath = join(
+      outDir,
+      `part_${String(fileIdx + 1).padStart(2, "0")}.txt`,
+    );
     writtenPaths.push(fullPath);
     currentStream = createWriteStream(fullPath, { encoding: "utf-8" });
     currentBytes = 0;
@@ -1472,22 +1057,24 @@ async function streamPack(
 
   if (!openPart()) return writtenPaths;
 
-  for (const dir of orderedDirs) {
-    for (const block of dirGroups.get(dir)!) {
-      if (fileIdx > MAX_SOURCE_BUCKETS) break;
-      const chunkBytes = Buffer.byteLength(block.text, "utf-8") + 4;
-      if (currentBytes > 0 && currentBytes + chunkBytes > STREAM_PART_BYTES) {
-        if (!openPart()) break;
-      }
-      currentStream?.write(block.text + "\n\n");
-      currentBytes += chunkBytes;
+  for (const block of blocks) {
+    if (fileIdx > MAX_SOURCE_BUCKETS && currentBytes > 0) break;
+    const chunkBytes = Buffer.byteLength(block.text, "utf-8") + 4;
+
+    // If the next block would exceed the dynamic target size, start a new part.
+    // However, also respect the absolute 10MB limit if the dynamic size was larger.
+    const limit = Math.min(STREAM_PART_BYTES, targetPartSize);
+
+    if (currentBytes > 0 && currentBytes + chunkBytes > limit) {
+      if (!openPart()) break;
     }
+    currentStream?.write(block.text + "\n\n");
+    currentBytes += chunkBytes;
   }
 
   currentStream?.end();
   return writtenPaths;
 }
-
 
 // ─── Manifest ─────────────────────────────────────────────────────────────────
 
@@ -1581,17 +1168,27 @@ export async function buildMasterContext(
     (f) => f && typeof f.path === "string" && shouldInclude(f.path, lang),
   );
 
-  const estimateWords = (f: any) =>
-    Math.ceil((f.metrics?.charCount ?? f.content?.length ?? 0) / 5);
-
-  const { files: allIncluded, droppedTiers } = selectFilesByBudget(
-    allCandidates,
-    estimateWords,
-    lang,
+  // DYNAMIC COMPRESSION: ensure massive repos fit in 50 parts by truncating each file.
+  const TOTAL_CAPACITY = MAX_SOURCE_BUCKETS * STREAM_PART_BYTES; // e.g. 49 * 25MB = 1.225 GB
+  const rawTotalBytes = allCandidates.reduce(
+    (s, f) => s + (f.metrics?.charCount ?? f.content?.length ?? 0),
+    0,
   );
 
+  let dynamicCharLimit = 100_000_000; // Default 100MB
+  if (rawTotalBytes > TOTAL_CAPACITY) {
+    // If repo is > capacity, calculate a sustainable limit per file to ensure breadth.
+    const avgPerFile = Math.floor(TOTAL_CAPACITY / allCandidates.length);
+    // Allow at least 2KB even for huge repos, but try to fit everything.
+    dynamicCharLimit = Math.max(2000, avgPerFile);
+  }
+
+  const allIncluded = allCandidates;
+  const droppedTiers: number[] = [];
+
   const docFiles = allIncluded.filter((f) => isDocFile(f.path));
-  const sourceFiles = allIncluded.filter((f) => !isDocFile(f.path));
+  // Include everything as source files so README, etc. are processed as full context docs.
+  const sourceFiles = allIncluded;
 
   const blocks: Block[] = [];
   const push = (group: string, text: string) => {
@@ -1610,7 +1207,11 @@ export async function buildMasterContext(
     metaLines.push(getRepoMeta(repoContext, lang));
   }
   if (dumpAll || intents.includes("repo_meta") || focus === "generic") {
-    const docsSection = getReadme(docFiles, dumpAll ? 5 : 3);
+    const docsSection = getReadme(
+      docFiles,
+      dumpAll ? 1000 : 3,
+      dynamicCharLimit,
+    );
     if (docsSection) metaLines.push(docsSection);
   }
   if (intents.includes("contributors")) {
@@ -1672,61 +1273,21 @@ export async function buildMasterContext(
       IMPORT_DEPTH,
     );
 
-    let sortedFiles: any[];
-
-    if (dumpAll) {
-      if (lang === "c") {
-        // Sort by subsystem, then by path within subsystem — keeps related files together in buckets
-        sortedFiles = [...sourceFiles].sort((a, b) => {
-          const sa = subsystemKey(a.path);
-          const sb = subsystemKey(b.path);
-          if (sa !== sb) return sa.localeCompare(sb);
-          return a.path.localeCompare(b.path);
-        });
-      } else {
-        sortedFiles = [...sourceFiles].sort((a, b) =>
-          a.path.localeCompare(b.path),
-        );
-      }
-    } else {
-      const {
-        files: selectedFiles,
-        omittedCount,
-        omittedPaths,
-      } = selectFilesForQuery(
-        sourceFiles,
-        query,
-        focus,
-        mergedImportGraph,
-        cIncludeGraph,
-        depthMap,
-        intents,
-        lang,
+    // Sort all files by heuristic importance
+    const sortedFiles = [...sourceFiles].sort((a, b) => {
+      const scoreA = rankFileImportance(
+        a.path,
+        a.analysis?.exports ?? [],
+        a.refsCount ?? 0,
       );
-
-      if (expertPlan?.files) {
-        for (const f of expertPlan.files) {
-          const found = sourceFiles.find(
-            (sf) => sf.path === f || sf.path.endsWith(f),
-          );
-          if (found && !selectedFiles.includes(found))
-            selectedFiles.push(found);
-        }
-      }
-
-      sortedFiles = [...selectedFiles].sort((a, b) => {
-        const da = depthMap.get(a.path) ?? 999;
-        const db = depthMap.get(b.path) ?? 999;
-        return da !== db ? da - db : a.path.localeCompare(b.path);
-      });
-
-      if (omittedCount > 0) {
-        push(
-          "_meta",
-          `## File Selection\n\n${sortedFiles.length} files included, ${omittedCount} files omitted as irrelevant.\nSample omitted: ${omittedPaths.join(", ")}`,
-        );
-      }
-    }
+      const scoreB = rankFileImportance(
+        b.path,
+        b.analysis?.exports ?? [],
+        b.refsCount ?? 0,
+      );
+      if (scoreA !== scoreB) return scoreB - scoreA;
+      return a.path.localeCompare(b.path);
+    });
 
     // C include graph summary — acts as a lightweight cscope substitute
     if (lang === "c" || lang === "mixed") {
@@ -1753,6 +1314,7 @@ export async function buildMasterContext(
         importRoleLabel(depthMap.get(file.path)),
         repoName,
         lang,
+        dynamicCharLimit,
       );
       const group =
         lang === "c"

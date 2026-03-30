@@ -154,8 +154,8 @@ export async function automateNotebookLM(
     const uploadIconBtnSelector =
       'button.drop-zone-icon-button, button:has-text("Upload files"), [aria-label*="Upload files"]';
 
-    const BATCH_SIZE = 50;
-    const MAX_BATCH_SIZE_BYTES = 45 * 1024 * 1024;
+    const BATCH_SIZE = 100;
+    const MAX_BATCH_SIZE_BYTES = 1000 * 1024 * 1024;
 
     const batches: string[][] = [];
     let currentBatch: string[] = [];
@@ -208,25 +208,70 @@ export async function automateNotebookLM(
 
       // Retry file chooser if it times out or fails (NotebookLM processing might block UI)
       let fileChooserSuccess = false;
-      let retries = 10; // Wait up to ~50 seconds total for heavy processing
+      let retries = 15; // Increased retries for heavy processing
       while (!fileChooserSuccess && retries > 0) {
         try {
+          // Ensure button is ready
+          await uploadIconBtn.waitFor({ state: "visible", timeout: 5000 });
+          await uploadIconBtn.scrollIntoViewIfNeeded();
+          await page.waitForTimeout(400); // Wait for animations to settle
+
+          // Attempt to trigger the file chooser
           const [fileChooser] = await Promise.all([
-            page.waitForEvent("filechooser", { timeout: 15000 }),
-            uploadIconBtn.click({ force: true }),
+            page.waitForEvent("filechooser", { timeout: 20000 }),
+            uploadIconBtn.click({ force: true, delay: 100 }),
           ]);
-          await fileChooser.setFiles(batch);
-          fileChooserSuccess = true;
-        } catch (err) {
+
+          await page.waitForTimeout(500);
+
+          try {
+            await fileChooser.setFiles(batch);
+            fileChooserSuccess = true;
+          } catch (err: any) {
+            if (err.message.includes("transfer files larger than 50Mb")) {
+              console.log("[NotebookLM automator] Hit 50MB limit on CDP. Bypassing via native CDP command...");
+              try {
+                // If it's a remote connection over CDP to localhost, we can tell 
+                // the browser to just read the local paths directly using the native CDP protocol.
+                const client = await page.context().newCDPSession(page);
+                const { root } = await client.send("DOM.getDocument");
+                const { nodeId } = await client.send("DOM.querySelector", {
+                  nodeId: root.nodeId,
+                  selector: "input[type=\"file\"]"
+                });
+                if (nodeId) {
+                  await client.send("DOM.setFileInputFiles", {
+                    files: batch,
+                    nodeId
+                  });
+                  fileChooserSuccess = true;
+                  console.log("[NotebookLM automator] Native CDP bypass successful.");
+                } else {
+                  throw new Error("Could not find file input element via native CDP.");
+                }
+              } catch (cdpErr: any) {
+                console.error(`[NotebookLM automator] Native CDP bypass failed: ${cdpErr.message}`);
+                throw err; // Re-throw original upload error
+              }
+            } else {
+              throw err;
+            }
+          }
+        } catch (err: any) {
           retries--;
-          await page.waitForTimeout(3000);
+          await page.waitForTimeout(4000);
           console.warn(
-            `[NotebookLM automator] fileChooser attempt failed, retrying... (${retries} left)`,
+            `[NotebookLM automator] fileChooser attempt failed: ${err.message}. Retrying... (${retries} left)`,
           );
 
-          // Try clicking 'Add source' again if modal was closed
-          isModalOpen = await uploadIconBtn.isVisible().catch(() => false);
-          if (!isModalOpen) {
+          // If button is gone but we didn't succeed, the modal might have closed
+          const stillVisible = await uploadIconBtn
+            .isVisible()
+            .catch(() => false);
+          if (!stillVisible) {
+            console.log(
+              "[NotebookLM automator] Modal closed unexpectedly. Re-opening...",
+            );
             const addSourceBtn = page
               .locator(
                 '.add-source-button, [aria-label="Add source"], button:has-text("Add source")',
@@ -234,7 +279,7 @@ export async function automateNotebookLM(
               .first();
             if (await addSourceBtn.isVisible().catch(() => false)) {
               await addSourceBtn.click({ force: true });
-              await page.waitForTimeout(2000);
+              await page.waitForTimeout(3000);
             }
           }
         }
@@ -247,7 +292,7 @@ export async function automateNotebookLM(
         onStatus?.(
           `Hit source limit. Proceeding with ${uploadedCount} files...`,
           undefined,
-          Math.round((uploadedCount / filesToUpload.length) * 100)
+          Math.round((uploadedCount / filesToUpload.length) * 100),
         );
         break; // Break the batch loop gracefully
       }
@@ -256,11 +301,11 @@ export async function automateNotebookLM(
       onStatus?.(
         `Ingesting files... (${uploadedCount}/${filesToUpload.length})`,
         undefined,
-        Math.round((uploadedCount / filesToUpload.length) * 100)
+        Math.round((uploadedCount / filesToUpload.length) * 100),
       );
 
-      // longer wait for large batches
-      await page.waitForTimeout(5000);
+      // reduced wait for fast batches
+      await page.waitForTimeout(2000);
     }
 
     onStatus?.("Processing uploaded sources...");
