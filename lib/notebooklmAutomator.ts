@@ -1,6 +1,5 @@
 import { Page } from "playwright";
 import path from "path";
-import fs from "fs";
 import { getArchitectPrompt } from "./prompts";
 
 const UI_JUNK_LABELS = [
@@ -151,115 +150,71 @@ export async function automateNotebookLM(
     onStatus?.(
       `Syncing ${filesToUpload.length} context file${filesToUpload.length !== 1 ? "s" : ""}...`,
     );
+
     const uploadIconBtnSelector =
       'button.drop-zone-icon-button, button:has-text("Upload files"), [aria-label*="Upload files"]';
 
-    const BATCH_SIZE = 50;
-    const MAX_BATCH_SIZE_BYTES = 45 * 1024 * 1024;
+    const uploadIconBtn = page.locator(uploadIconBtnSelector).first();
+    let isModalOpen = await uploadIconBtn.isVisible().catch(() => false);
 
-    const batches: string[][] = [];
-    let currentBatch: string[] = [];
-    let currentBatchSizeBytes = 0;
+    if (!isModalOpen) {
+      const addSourceBtn = page
+        .locator(
+          '.add-source-button, [aria-label="Add source"], button:has-text("Add source")',
+        )
+        .first();
+      if (await addSourceBtn.isVisible({ timeout: 10000 }).catch(() => false)) {
+        await addSourceBtn.click({ force: true });
+        await page.waitForTimeout(2000);
+      }
+    }
 
-    for (const file of filesToUpload) {
-      let fileSize = 0;
+    // Retry file chooser if it times out or fails (NotebookLM processing might block UI)
+    let fileChooserSuccess = false;
+    let retries = 10; // Wait up to ~50 seconds total for heavy processing
+    while (!fileChooserSuccess && retries > 0) {
       try {
-        const stats = fs.statSync(file);
-        fileSize = stats.size;
-      } catch (e) {}
+        const [fileChooser] = await Promise.all([
+          page.waitForEvent("filechooser", { timeout: 15000 }),
+          uploadIconBtn.click({ force: true }),
+        ]);
+        await fileChooser.setFiles(filesToUpload);
+        fileChooserSuccess = true;
+      } catch (err) {
+        retries--;
+        await page.waitForTimeout(3000);
+        console.warn(
+          `[NotebookLM automator] fileChooser attempt failed, retrying... (${retries} left)`,
+        );
 
-      if (
-        currentBatch.length > 0 &&
-        (currentBatch.length >= BATCH_SIZE ||
-          currentBatchSizeBytes + fileSize > MAX_BATCH_SIZE_BYTES)
-      ) {
-        batches.push(currentBatch);
-        currentBatch = [];
-        currentBatchSizeBytes = 0;
-      }
-
-      currentBatch.push(file);
-      currentBatchSizeBytes += fileSize;
-    }
-    if (currentBatch.length > 0) {
-      batches.push(currentBatch);
-    }
-
-    let uploadedCount = 0;
-    for (const batch of batches) {
-      if (batch.length === 0) continue;
-
-      const uploadIconBtn = page.locator(uploadIconBtnSelector).first();
-      let isModalOpen = await uploadIconBtn.isVisible().catch(() => false);
-
-      if (!isModalOpen) {
-        const addSourceBtn = page
-          .locator(
-            '.add-source-button, [aria-label="Add source"], button:has-text("Add source")',
-          )
-          .first();
-        if (
-          await addSourceBtn.isVisible({ timeout: 10000 }).catch(() => false)
-        ) {
-          await addSourceBtn.click({ force: true });
-          await page.waitForTimeout(2000);
-        }
-      }
-
-      // Retry file chooser if it times out or fails (NotebookLM processing might block UI)
-      let fileChooserSuccess = false;
-      let retries = 10; // Wait up to ~50 seconds total for heavy processing
-      while (!fileChooserSuccess && retries > 0) {
-        try {
-          const [fileChooser] = await Promise.all([
-            page.waitForEvent("filechooser", { timeout: 15000 }),
-            uploadIconBtn.click({ force: true }),
-          ]);
-          await fileChooser.setFiles(batch);
-          fileChooserSuccess = true;
-        } catch (err) {
-          retries--;
-          await page.waitForTimeout(3000);
-          console.warn(
-            `[NotebookLM automator] fileChooser attempt failed, retrying... (${retries} left)`,
-          );
-
-          // Try clicking 'Add source' again if modal was closed
-          isModalOpen = await uploadIconBtn.isVisible().catch(() => false);
-          if (!isModalOpen) {
-            const addSourceBtn = page
-              .locator(
-                '.add-source-button, [aria-label="Add source"], button:has-text("Add source")',
-              )
-              .first();
-            if (await addSourceBtn.isVisible().catch(() => false)) {
-              await addSourceBtn.click({ force: true });
-              await page.waitForTimeout(2000);
-            }
+        // Try clicking 'Add source' again if modal was closed
+        isModalOpen = await uploadIconBtn.isVisible().catch(() => false);
+        if (!isModalOpen) {
+          const addSourceBtn = page
+            .locator(
+              '.add-source-button, [aria-label="Add source"], button:has-text("Add source")',
+            )
+            .first();
+          if (await addSourceBtn.isVisible().catch(() => false)) {
+            await addSourceBtn.click({ force: true });
+            await page.waitForTimeout(2000);
           }
         }
       }
+    }
 
-      if (!fileChooserSuccess) {
-        console.warn(
-          "[NotebookLM automator] Unable to trigger file upload dialog after multiple attempts. Likely hit NotebookLM's 50-source limit. Proceeding with currently uploaded sources...",
-        );
-        onStatus?.(
-          `Hit source limit. Proceeding with ${uploadedCount} files...`,
-          undefined,
-          Math.round((uploadedCount / filesToUpload.length) * 100)
-        );
-        break; // Break the batch loop gracefully
-      }
-
-      uploadedCount += batch.length;
-      onStatus?.(
-        `Ingesting files... (${uploadedCount}/${filesToUpload.length})`,
-        undefined,
-        Math.round((uploadedCount / filesToUpload.length) * 100)
+    if (!fileChooserSuccess) {
+      console.warn(
+        "[NotebookLM automator] Unable to trigger file upload dialog after multiple attempts. Proceeding with currently uploaded sources...",
       );
-
-      // longer wait for large batches
+      onStatus?.(`Upload failed. Proceeding with existing sources...`);
+    } else {
+      onStatus?.(
+        `Ingesting ${filesToUpload.length} file${filesToUpload.length !== 1 ? "s" : ""}...`,
+        undefined,
+        100,
+      );
+      // Wait for NotebookLM to process all uploaded files
       await page.waitForTimeout(5000);
     }
 

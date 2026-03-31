@@ -8,10 +8,7 @@ const SPLIT_THRESHOLD_CHARS = 3_000;
 const MIN_RELEVANCE_SCORE_GENERIC = 3;
 const MIN_RELEVANCE_SCORE_TARGETED = 15;
 
-const MAX_OUTPUT_FILES = 50;
-const MAX_SOURCE_BUCKETS = MAX_OUTPUT_FILES - 1;
 const WORD_LIMIT_PER_FILE = 450_000;
-const TOTAL_WORD_BUDGET = MAX_SOURCE_BUCKETS * WORD_LIMIT_PER_FILE;
 
 type RepoLanguage = "c" | "web" | "go" | "rust" | "python" | "java" | "mixed";
 
@@ -256,8 +253,6 @@ export interface ExpertPlan {
 }
 
 // ─── Subsystem map (Linux kernel) ─────────────────────────────────────────────
-// Maps top-level directory prefix → human-readable subsystem name.
-// Used to group files into subsystem-coherent buckets instead of word-count splits.
 
 const LINUX_SUBSYSTEMS: Record<string, string> = {
   arch: "arch",
@@ -416,15 +411,12 @@ function detectCodeFocus(query: string): CodeFocus {
 function extractQueryTokens(query: string): string[] {
   const tokens = new Set<string>();
 
-  // Quoted symbols
   for (const q of query.match(/['"`]([a-zA-Z_$][a-zA-Z0-9_$]{2,})['"`]/g) ?? [])
     tokens.add(q.replace(/['"`]/g, ""));
 
-  // File paths
   for (const p of query.match(/\b[\w-]+\/[\w-]+(\.[a-z]{1,5})?\b/g) ?? [])
     tokens.add(p);
 
-  // Dot-chains
   for (const chain of query.match(/\b[a-zA-Z_$][a-zA-Z0-9_$.]{3,}\b/g) ?? []) {
     if (chain.includes(".")) {
       tokens.add(chain);
@@ -433,13 +425,11 @@ function extractQueryTokens(query: string): string[] {
     }
   }
 
-  // camelCase and snake_case
   for (const c of query.match(/\b[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*\b/g) ?? [])
     tokens.add(c);
   for (const s of query.match(/\b[a-z][a-z0-9]*(_[a-z0-9]+){1,}\b/g) ?? [])
     tokens.add(s);
 
-  // Plain words
   for (const w of query
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, " ")
@@ -450,13 +440,10 @@ function extractQueryTokens(query: string): string[] {
 }
 
 // ─── C-aware symbol extraction ────────────────────────────────────────────────
-// Extracts function names, macro names, struct/typedef names from C source.
-// Used to enrich scoring when importGraph is empty (all C repos).
 
 function extractCSymbols(content: string): string[] {
   const syms = new Set<string>();
 
-  // Function definitions: return_type function_name(
   for (const m of content.matchAll(/^[\w\s\*]+?\b(\w+)\s*\(/gm)) {
     const name = m[1];
     if (
@@ -467,15 +454,12 @@ function extractCSymbols(content: string): string[] {
       syms.add(name);
   }
 
-  // #define MACRO_NAME
   for (const m of content.matchAll(/^#\s*define\s+(\w+)/gm))
     if (m[1]) syms.add(m[1]);
 
-  // struct/union/typedef names
   for (const m of content.matchAll(/(?:struct|union|typedef)\s+(\w+)/g))
     if (m[1]) syms.add(m[1]);
 
-  // EXPORT_SYMBOL / EXPORT_SYMBOL_GPL — these are the kernel's "exports"
   for (const m of content.matchAll(/EXPORT_SYMBOL(?:_GPL)?\s*\(\s*(\w+)\s*\)/g))
     if (m[1]) syms.add(m[1]);
 
@@ -483,8 +467,6 @@ function extractCSymbols(content: string): string[] {
 }
 
 // ─── C call-graph extraction ──────────────────────────────────────────────────
-// Builds a lightweight include-graph for C files since importGraph is JS-only.
-// Returns a map: filePath → list of #included local paths (best-effort).
 
 function buildCIncludeGraph(filesMetadata: any[]): Record<string, string[]> {
   const pathIndex = new Map<string, string>();
@@ -536,7 +518,6 @@ function scoreFile(
   const content = safeContent(file);
   const fullContent = content.toLowerCase();
 
-  // C-specific: extract symbols for richer matching
   const cSymbols =
     lang === "c" || lang === "mixed"
       ? extractCSymbols(content).map((s) => s.toLowerCase())
@@ -550,54 +531,43 @@ function scoreFile(
         .pop()
         ?.replace(/\.[^.]+$/, "") ?? "";
 
-    // Filename match
     if (pathBase === t) score += 30;
     else if (filePath.includes(t)) score += 5;
 
-    // JS/TS exports
     if (exports.some((e) => e.toLowerCase() === t)) score += 20;
     else if (exports.some((e) => e.toLowerCase().includes(t))) score += 8;
 
-    // JS/TS imports
     if (imports.some((i) => i.toLowerCase().includes(t))) score += 3;
 
-    // C symbol match (EXPORT_SYMBOL, function defs, macros, structs)
     if (cSymbols.includes(t)) score += 20;
     else if (cSymbols.some((s) => s.includes(t))) score += 8;
 
-    // Raw content occurrences (capped to prevent giant files dominating)
     const occurrences = (
       fullContent.match(new RegExp(`\\b${escapeRegex(t)}\\b`, "g")) ?? []
     ).length;
     score += Math.min(occurrences * 2, 30);
 
-    // Exact file path token
     if (token.includes("/") && filePath.includes(t)) score += 50;
   }
 
-  // Graph centrality bonus
   if (isImportQuery) {
-    // JS/TS import graph
     const jsImporterCount = Object.values(importGraph).filter((deps) =>
       deps.some((d) => d.includes(file.path) || file.path.includes(d)),
     ).length;
     score += jsImporterCount * 4;
 
-    // C include graph
     const cIncluderCount = Object.values(cIncludeGraph).filter((deps) =>
       deps.includes(file.path),
     ).length;
     score += cIncluderCount * 4;
   }
 
-  // Penalise near-empty files
   if ((file.metrics?.codeLines ?? 0) < 5) score = Math.floor(score * 0.4);
 
-  // Boost kernel-critical file types
   const fileName = file.path.split("/").pop() ?? "";
   if (fileName.startsWith("Kconfig")) score += 10;
   if (fileName === "Makefile" || fileName === "makefile") score += 5;
-  if (file.path.endsWith(".S")) score += 8; // assembly entry points
+  if (file.path.endsWith(".S")) score += 8;
 
   return score;
 }
@@ -707,7 +677,6 @@ function fileTier(filePath: string, lang: RepoLanguage = "web"): number {
   const ext = fileName.split(".").pop() ?? "";
   const extLower = ext.toLowerCase();
 
-  // Kernel-specific: Kconfig files have no extension but are critical Tier 1
   if (
     fileName === "Kconfig" ||
     fileName.startsWith("Kconfig.") ||
@@ -715,10 +684,7 @@ function fileTier(filePath: string, lang: RepoLanguage = "web"): number {
   )
     return 1;
 
-  // Linker scripts
   if (extLower === "ld" || extLower === "lds") return 2;
-
-  // Assembly entry points (arch/**/*.S)
   if (ext === "S") return 2;
 
   const isRoot = parts.length === 1;
@@ -772,16 +738,19 @@ function selectFilesByBudget(
   const tier3 = withTier.filter((x) => x.tier === 3).map((x) => x.file);
   const tier4 = withTier.filter((x) => x.tier === 4).map((x) => x.file);
 
+  // With no file count cap, budget is effectively unlimited — only drop tiers
+  // if aggregate word count would be truly enormous (>1B words, a safety rail).
+  const HARD_WORD_CEILING = 1_000_000_000;
   const wordsOf = (files: any[]) =>
     files.reduce((s, f) => s + estimateWords(f), 0);
   const droppedTiers: number[] = [];
 
   let selected = [...mustInclude, ...tier3, ...tier4];
-  if (wordsOf(selected) > TOTAL_WORD_BUDGET) {
+  if (wordsOf(selected) > HARD_WORD_CEILING) {
     selected = [...mustInclude, ...tier3];
     droppedTiers.push(4);
   }
-  if (wordsOf(selected) > TOTAL_WORD_BUDGET) {
+  if (wordsOf(selected) > HARD_WORD_CEILING) {
     selected = [...mustInclude];
     droppedTiers.push(3);
   }
@@ -793,7 +762,6 @@ function selectFilesByBudget(
 
 function isDocFile(filePath: string): boolean {
   const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
-  // Support .rst for kernel Documentation/
   if (ext !== "md" && ext !== "mdx" && ext !== "rst") return false;
   return !/node_modules|CHANGELOG|CHANGES|HISTORY|\.github\/|dist\//.test(
     filePath,
@@ -1051,8 +1019,6 @@ function getPulls(repoContext: any): string {
 }
 
 // ─── C include graph summary ──────────────────────────────────────────────────
-// Emits a human-readable cross-reference block for NotebookLLM.
-// Equivalent to what cscope/ctags would give for the selected files.
 
 function getCIncludeGraphSummary(
   cIncludeGraph: Record<string, string[]>,
@@ -1073,7 +1039,6 @@ function getCIncludeGraphSummary(
 }
 
 // ─── Function block parsing ───────────────────────────────────────────────────
-// JS/TS parser (unchanged from original)
 
 function parseFunctionBlocks(content: string): FunctionBlock[] {
   const lines = content.split("\n");
@@ -1183,21 +1148,16 @@ function parseFunctionBlocks(content: string): FunctionBlock[] {
 }
 
 // ─── C function block parsing ─────────────────────────────────────────────────
-// Splits a C file into per-function blocks for structured context.
 
 function parseCFunctionBlocks(content: string): FunctionBlock[] {
   const lines = content.split("\n");
   const blocks: FunctionBlock[] = [];
-
-  // Match C function definitions: lines that look like `type name(` not inside a struct/enum
-  // Heuristic: function def = a non-indented line ending in `)` or starting a `{` on next line.
   const defRe = /^[a-zA-Z_][\w\s\*]*\b(\w+)\s*\([^;]*$/;
 
   let i = 0;
   while (i < lines.length) {
     const line = lines[i].trim();
 
-    // Skip preprocessor, comments, empty
     if (
       !line ||
       line.startsWith("#") ||
@@ -1209,7 +1169,7 @@ function parseCFunctionBlocks(content: string): FunctionBlock[] {
       continue;
     }
 
-    const m = defRe.exec(lines[i]); // test original (unstripped) for indentation guard
+    const m = defRe.exec(lines[i]);
     if (!m || lines[i].startsWith(" ") || lines[i].startsWith("\t")) {
       i++;
       continue;
@@ -1224,7 +1184,6 @@ function parseCFunctionBlocks(content: string): FunctionBlock[] {
       continue;
     }
 
-    // Scan for opening brace
     let braceStart = i;
     while (
       braceStart < Math.min(i + 6, lines.length) &&
@@ -1236,7 +1195,6 @@ function parseCFunctionBlocks(content: string): FunctionBlock[] {
       continue;
     }
 
-    // Count braces to find closing
     let depth = 0,
       j = braceStart,
       found = false;
@@ -1257,7 +1215,6 @@ function parseCFunctionBlocks(content: string): FunctionBlock[] {
 
     if (found && j > i) {
       const text = lines.slice(i, j + 1).join("\n");
-      // Only keep blocks of reasonable size (skip 1-line stubs, extremely huge functions)
       const lineCount = j - i + 1;
       if (lineCount >= 3 && lineCount <= 500) {
         blocks.push({ name, startLine: i, endLine: j, text });
@@ -1318,7 +1275,7 @@ function getFileContext(
   const importsStr = imports.length
     ? `It imports from: ${imports.slice(0, 12).join(", ")}${imports.length > 12 ? ` and ${imports.length - 12} more` : ""}.`
     : isCFile
-      ? "" // C imports shown in include graph section
+      ? ""
       : "It has no imports.";
 
   const todosStr = todos.length ? ` TODOs: ${todos.join(" | ")}.` : "";
@@ -1356,7 +1313,6 @@ function getFileContext(
     return [heading, "", prose, "", `\`\`\`${ext}`, content, "```"].join("\n");
   }
 
-  // Choose parser based on language
   const blocks = isCFile
     ? parseCFunctionBlocks(content)
     : parseFunctionBlocks(content);
@@ -1402,32 +1358,40 @@ function countWords(text: string): number {
   return text.split(/\s+/).filter(Boolean).length;
 }
 
-// ─── Subsystem-aware packing ──────────────────────────────────────────────────
-// For C repos: group files by subsystem, then fill buckets by subsystem group.
-// This keeps fs/ together, mm/ together, etc. — critical for NotebookLLM coherence.
-// For web repos: falls back to original word-count greedy packing.
+// ─── Pack and flush ───────────────────────────────────────────────────────────
+// Meta blocks always go to a single dedicated 01_Meta.txt file.
+// Source blocks are packed into part_NN.txt files with no file count cap.
+// For C repos: source blocks are grouped by kernel subsystem before packing.
 
 async function packAndFlush(
-  blocks: Block[],
+  metaBlocks: Block[],
+  sourceBlocks: Block[],
   outDir: string,
   lang: RepoLanguage,
-): Promise<string[]> {
+): Promise<{ metaFile: string; sourceFiles: string[] }> {
   mkdirSync(outDir, { recursive: true });
 
+  // ── Dedicated meta file (repo overview, docs, graph summary, etc.) ─────────
+  const metaPath = join(outDir, "01_Meta.txt");
+  await writeFile(
+    metaPath,
+    metaBlocks.map((b) => b.text).join("\n\n"),
+    "utf-8",
+  );
+
+  // ── Source parts — no cap on number of files ───────────────────────────────
+  const written: string[] = [];
+
   if (lang === "c") {
-    // Group blocks by subsystem, then pack subsystem groups into buckets
+    // Group by kernel subsystem, keep subsystems together in buckets
     const subsystemGroups = new Map<string, Block[]>();
-    for (const block of blocks) {
-      const key = block.group === "_meta" ? "_meta" : subsystemKey(block.group);
+    for (const block of sourceBlocks) {
+      const key = subsystemKey(block.group);
       if (!subsystemGroups.has(key)) subsystemGroups.set(key, []);
       subsystemGroups.get(key)!.push(block);
     }
 
-    // Order: _meta first, then subsystems alphabetically
-    const orderedGroups = [
-      "_meta",
-      ...[...subsystemGroups.keys()].filter((k) => k !== "_meta").sort(),
-    ].filter((k) => subsystemGroups.has(k));
+    const orderedGroups = [...subsystemGroups.keys()].sort();
 
     const buckets: string[][] = [[]];
     const bucketWords: number[] = [0];
@@ -1437,27 +1401,19 @@ async function packAndFlush(
       const groupText = groupBlocks.map((b) => b.text);
       const groupWords = groupText.reduce((s, t) => s + countWords(t), 0);
 
-      // Try to keep each subsystem in one bucket; split only if over budget
       const curr = buckets.length - 1;
       if (
-        buckets.length < MAX_SOURCE_BUCKETS &&
         bucketWords[curr] + groupWords > WORD_LIMIT_PER_FILE &&
         bucketWords[curr] > 0
       ) {
-        // Start a new bucket for this subsystem
         buckets.push([]);
         bucketWords.push(0);
       }
 
-      // If the subsystem itself exceeds one bucket, spill across buckets
       for (const text of groupText) {
         const wc = countWords(text);
         const c = buckets.length - 1;
-        if (
-          buckets.length < MAX_SOURCE_BUCKETS &&
-          bucketWords[c] + wc > WORD_LIMIT_PER_FILE &&
-          bucketWords[c] > 0
-        ) {
+        if (bucketWords[c] + wc > WORD_LIMIT_PER_FILE && bucketWords[c] > 0) {
           buckets.push([text]);
           bucketWords.push(wc);
         } else {
@@ -1467,21 +1423,22 @@ async function packAndFlush(
       }
     }
 
-    const written: string[] = [];
     for (let i = 0; i < buckets.length; i++) {
       const paddedNum = String(i + 1).padStart(2, "0");
-      const fileName = `part_${paddedNum}.txt`;
-      const fullPath = join(outDir, fileName);
+      const fullPath = join(outDir, `part_${paddedNum}.txt`);
       await writeFile(fullPath, buckets[i].join("\n\n"), "utf-8");
       written.push(fullPath);
     }
-    return written;
   } else {
-    // Original greedy word-count packing for web/other repos
-    const allText = blocks.map((b) => b.text);
+    // Greedy word-count packing — no file count cap
+    const allText = sourceBlocks.map((b) => b.text);
     const totalWords = allText.reduce((s, t) => s + countWords(t), 0);
+    const bucketCount = Math.max(
+      1,
+      Math.ceil(totalWords / WORD_LIMIT_PER_FILE),
+    );
     const targetWordsPerBucket = Math.min(
-      Math.ceil(totalWords / MAX_SOURCE_BUCKETS),
+      Math.ceil(totalWords / bucketCount),
       WORD_LIMIT_PER_FILE,
     );
 
@@ -1492,7 +1449,6 @@ async function packAndFlush(
       const wc = countWords(text);
       const curr = buckets.length - 1;
       if (
-        buckets.length < MAX_SOURCE_BUCKETS &&
         bucketWords[curr] + wc > targetWordsPerBucket &&
         bucketWords[curr] > 0
       ) {
@@ -1504,22 +1460,21 @@ async function packAndFlush(
       }
     }
 
-    const written: string[] = [];
     for (let i = 0; i < buckets.length; i++) {
       const paddedNum = String(i + 1).padStart(2, "0");
-      const fileName = `part_${paddedNum}.txt`;
-      const fullPath = join(outDir, fileName);
+      const fullPath = join(outDir, `part_${paddedNum}.txt`);
       await writeFile(fullPath, buckets[i].join("\n\n"), "utf-8");
       written.push(fullPath);
     }
-    return written;
   }
+
+  return { metaFile: metaPath, sourceFiles: written };
 }
 
 // ─── Manifest ─────────────────────────────────────────────────────────────────
 
 function buildManifest(
-  fileCount: number,
+  sourceFileCount: number,
   repoName: string,
   repoContext: any,
   droppedTiers: number[],
@@ -1540,6 +1495,8 @@ function buildManifest(
         ].join("\n")
       : "";
 
+  const lastPart = String(sourceFileCount).padStart(2, "0");
+
   return [
     `00_Repo_Manifest.txt — ${repoName}`,
     `Generated: ${timestamp}`,
@@ -1549,11 +1506,15 @@ function buildManifest(
     "",
     `Mode: ${droppedTiers.length > 0 ? "BUDGET-CONSTRAINED (dropped tiers: " + droppedTiers.join(",") + ")" : "FULL (all source files)"}`,
     `Total files considered: ${totalSourceFiles}`,
-    `Output files produced: ${fileCount} source buckets + this manifest = ${fileCount + 1} total`,
+    `Output: 1 manifest + 1 meta file + ${sourceFileCount} source part(s) = ${sourceFileCount + 2} total files`,
     langNote,
     "",
-    `Each part_NN.txt contains source code${lang === "c" ? " grouped by kernel subsystem" : " organized alphabetically by directory"}.`,
-    `Upload all files (including this manifest) to NotebookLM as sources.`,
+    `Files in this set:`,
+    `  00_Repo_Manifest.txt  — this file`,
+    `  01_Meta.txt           — repo overview, docs, contributors, commits, directory tree, import/include graph`,
+    `  part_01.txt .. part_${lastPart}.txt — source code${lang === "c" ? " grouped by kernel subsystem" : " organized alphabetically by directory"}`,
+    "",
+    `Upload all files to NotebookLM as sources.`,
     "",
     "END OF MANIFEST",
   ].join("\n");
@@ -1620,11 +1581,18 @@ export async function buildMasterContext(
   const docFiles = allIncluded.filter((f) => isDocFile(f.path));
   const sourceFiles = allIncluded.filter((f) => !isDocFile(f.path));
 
-  const blocks: Block[] = [];
-  const push = (group: string, text: string) => {
-    if (text.trim()) blocks.push({ group, text });
+  // Separate accumulators: meta goes to 01_Meta.txt, source goes to part_NN.txt
+  const metaBlocks: Block[] = [];
+  const sourceBlocks: Block[] = [];
+
+  const pushMeta = (text: string) => {
+    if (text.trim()) metaBlocks.push({ group: "_meta", text });
+  };
+  const pushSource = (group: string, text: string) => {
+    if (text.trim()) sourceBlocks.push({ group, text });
   };
 
+  // ── Assemble meta content ──────────────────────────────────────────────────
   const metaLines: string[] = [];
   metaLines.push(
     `# ${repoContext?.meta?.fullName ?? "Unknown"} — Codebase Context`,
@@ -1679,7 +1647,7 @@ export async function buildMasterContext(
     );
   }
 
-  push("_meta", metaLines.join("\n\n"));
+  pushMeta(metaLines.join("\n\n"));
 
   if (needsCode) {
     const allGraphPaths = new Set([
@@ -1703,7 +1671,6 @@ export async function buildMasterContext(
 
     if (dumpAll) {
       if (lang === "c") {
-        // Sort by subsystem, then by path within subsystem — keeps related files together in buckets
         sortedFiles = [...sourceFiles].sort((a, b) => {
           const sa = subsystemKey(a.path);
           const sb = subsystemKey(b.path);
@@ -1748,21 +1715,20 @@ export async function buildMasterContext(
       });
 
       if (omittedCount > 0) {
-        push(
-          "_meta",
+        pushMeta(
           `## File Selection\n\n${sortedFiles.length} files included, ${omittedCount} files omitted as irrelevant.\nSample omitted: ${omittedPaths.join(", ")}`,
         );
       }
     }
 
-    // C include graph summary — acts as a lightweight cscope substitute
+    // C include graph summary goes to meta (reference data, not source code)
     if (lang === "c" || lang === "mixed") {
       const selectedPaths = new Set(sortedFiles.map((f) => f.path));
       const includeGraphSummary = getCIncludeGraphSummary(
         cIncludeGraph,
         selectedPaths,
       );
-      if (includeGraphSummary) push("_meta", includeGraphSummary);
+      if (includeGraphSummary) pushMeta(includeGraphSummary);
     }
 
     const graphHeader =
@@ -1772,7 +1738,7 @@ export async function buildMasterContext(
       `- **Utility**: not in the ${lang === "c" ? "include" : "import"} graph.\n\n` +
       `Entry points: ${entryPoints.slice(0, 20).join(", ") || "none detected"}.`;
 
-    if (sortedFiles.length > 0) push("_meta", graphHeader);
+    if (sortedFiles.length > 0) pushMeta(graphHeader);
 
     for (const file of sortedFiles) {
       const fileContext = getFileContext(
@@ -1785,19 +1751,23 @@ export async function buildMasterContext(
         lang === "c"
           ? subsystemKey(file.path)
           : file.path.split("/")[0] || "_root";
-      push(group, fileContext);
+      pushSource(group, fileContext);
     }
   }
 
-  push(
-    "_meta",
+  pushMeta(
     `## End of Context\n\nLanguage profile: ${lang}. Source files: ${needsCode ? "included" : "not included (meta-only query)"}.`,
   );
 
-  const writtenPaths = await packAndFlush(blocks, outputDir, lang);
+  const { metaFile, sourceFiles: writtenSourceFiles } = await packAndFlush(
+    metaBlocks,
+    sourceBlocks,
+    outputDir,
+    lang,
+  );
 
   const manifestText = buildManifest(
-    writtenPaths.length,
+    writtenSourceFiles.length,
     repoName,
     repoContext,
     droppedTiers,
