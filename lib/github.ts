@@ -1,5 +1,72 @@
 import { RepoContext, RepoTreeEntry, CommitDetail } from "./types";
 
+export async function fetchFileContents(
+  owner: string,
+  repo: string,
+  files: any[],
+  ref: string,
+  onStatus?: (msg: string, partial?: string, progress?: number) => void,
+) {
+  const result = new Map<string, string>();
+  const CHUNK_SIZE = 100;
+  const CONCURRENCY = 50;
+
+  const token = process.env.GITHUB_TOKEN || process.env.NEXT_PUBLIC_GITHUB_TOKEN;
+  const allChunks = [];
+  for (let i = 0; i < files.length; i += CHUNK_SIZE) {
+    allChunks.push(files.slice(i, i + CHUNK_SIZE));
+  }
+
+  for (let blockIndex = 0; blockIndex < allChunks.length; blockIndex += CONCURRENCY) {
+    const batchedChunks = allChunks.slice(blockIndex, blockIndex + CONCURRENCY);
+    const upperLimit = Math.min(blockIndex + CONCURRENCY, allChunks.length);
+    const filesFetched = Math.min(upperLimit * CHUNK_SIZE, files.length);
+
+    onStatus?.(
+      `Syncing source... (${filesFetched}/${files.length})`,
+      undefined,
+      Math.round((filesFetched / files.length) * 100),
+    );
+
+    await Promise.all(
+      batchedChunks.map(async (chunk) => {
+        const fields = chunk
+          .map(
+            (f: any, idx: number) =>
+              `f${idx}: object(expression: "${ref}:${f.path}") { ... on Blob { text } }`,
+          )
+          .join("\n");
+
+        const query = `{ repository(owner: "${owner}", name: "${repo}") { ${fields} } }`;
+
+        try {
+          const res = await fetch("https://api.github.com/graphql", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ query }),
+          });
+
+          if (!res.ok) return;
+
+          const { data } = await res.json();
+          if (data?.repository) {
+            chunk.forEach((f: any, idx: number) => {
+              if (data.repository[`f${idx}`]?.text) {
+                result.set(f.path, data.repository[`f${idx}`].text);
+              }
+            });
+          }
+        } catch (err: any) {}
+      }),
+    );
+  }
+
+  return result;
+}
+
 function getHeaders() {
   let token = process.env.GITHUB_TOKEN || process.env.NEXT_PUBLIC_GITHUB_TOKEN;
 

@@ -1,5 +1,5 @@
 import { mkdirSync } from "fs";
-import { writeFile } from "fs/promises";
+import { writeFile, readFile } from "fs/promises";
 import { join } from "path";
 
 const IMPORT_DEPTH = 99999;
@@ -7,8 +7,6 @@ const FILE_CHAR_LIMIT = 100_000;
 const SPLIT_THRESHOLD_CHARS = 3_000;
 const MIN_RELEVANCE_SCORE_GENERIC = 3;
 const MIN_RELEVANCE_SCORE_TARGETED = 15;
-
-const WORD_LIMIT_PER_FILE = 450_000;
 
 type RepoLanguage = "c" | "web" | "go" | "rust" | "python" | "java" | "mixed";
 
@@ -214,8 +212,6 @@ const STOP_WORDS = new Set([
   "works",
 ]);
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
 type ImportRole = "Entry Point" | `Depth ${number}` | "Utility";
 type QueryIntent =
   | "contributors"
@@ -244,6 +240,7 @@ interface ScoredFile {
 interface Block {
   group: string;
   text: string;
+  filePath?: string;
 }
 
 export interface ExpertPlan {
@@ -251,8 +248,6 @@ export interface ExpertPlan {
   intents?: QueryIntent[];
   focus?: CodeFocus;
 }
-
-// ─── Subsystem map (Linux kernel) ─────────────────────────────────────────────
 
 const LINUX_SUBSYSTEMS: Record<string, string> = {
   arch: "arch",
@@ -283,8 +278,6 @@ function subsystemKey(filePath: string): string {
   const first = filePath.split("/")[0];
   return LINUX_SUBSYSTEMS[first] ?? first ?? "_root";
 }
-
-// ─── Intent / focus detection ─────────────────────────────────────────────────
 
 function detectIntent(query: string): QueryIntent[] {
   const intents = new Set<QueryIntent>();
@@ -406,8 +399,6 @@ function detectCodeFocus(query: string): CodeFocus {
   return hasSymbol || hasFilePath || hasFocusedVerb ? "targeted" : "generic";
 }
 
-// ─── Token extraction ─────────────────────────────────────────────────────────
-
 function extractQueryTokens(query: string): string[] {
   const tokens = new Set<string>();
 
@@ -439,29 +430,38 @@ function extractQueryTokens(query: string): string[] {
   return [...tokens];
 }
 
-// ─── C-aware symbol extraction ────────────────────────────────────────────────
-
 function extractCSymbols(content: string): string[] {
   const syms = new Set<string>();
 
-  for (const m of content.matchAll(/^[\w\s\*]+?\b(\w+)\s*\(/gm)) {
+  for (const m of content.matchAll(
+    /^[\w\s\*]+?\b([a-zA-Z_]\w*)\s*\([^;]*?\)\s*\{/gm,
+  )) {
     const name = m[1];
     if (
       name &&
       name.length > 2 &&
-      !["if", "for", "while", "switch", "return"].includes(name)
-    )
+      !["if", "for", "while", "switch", "return", "sizeof"].includes(name)
+    ) {
       syms.add(name);
+    }
   }
 
-  for (const m of content.matchAll(/^#\s*define\s+(\w+)/gm))
-    if (m[1]) syms.add(m[1]);
+  for (const m of content.matchAll(
+    /\b(struct|union|enum|typedef)\s+([a-zA-Z_]\w*)\b/g,
+  )) {
+    if (m[2]) syms.add(m[2]);
+  }
 
-  for (const m of content.matchAll(/(?:struct|union|typedef)\s+(\w+)/g))
+  // Kernel specific: EXPORT_SYMBOL, #define
+  for (const m of content.matchAll(/^#\s*define\s+([a-zA-Z_]\w*)/gm)) {
     if (m[1]) syms.add(m[1]);
+  }
 
-  for (const m of content.matchAll(/EXPORT_SYMBOL(?:_GPL)?\s*\(\s*(\w+)\s*\)/g))
+  for (const m of content.matchAll(
+    /EXPORT_SYMBOL(?:_GPL)?\s*\(\s*([a-zA-Z_]\w*)\s*\)/g,
+  )) {
     if (m[1]) syms.add(m[1]);
+  }
 
   return [...syms];
 }
@@ -601,7 +601,12 @@ function selectFilesForQuery(
     );
   const isTestQuery = intents.includes("test");
 
-  const scored: ScoredFile[] = sourceFiles.map((file) => ({
+  const threshold =
+    focus === "targeted"
+      ? MIN_RELEVANCE_SCORE_TARGETED
+      : MIN_RELEVANCE_SCORE_GENERIC;
+
+  const scored: { file: any; score: number }[] = sourceFiles.map((file) => ({
     file,
     score: scoreFile(
       file,
@@ -614,12 +619,77 @@ function selectFilesForQuery(
     ),
   }));
 
+  // ─── Phase 2: Reverse-Dependency Lookback (Caller-Context Snapping) ───
+  const highSignalTargets = scored.filter(
+    (c) => c.score >= MIN_RELEVANCE_SCORE_TARGETED,
+  );
+  const targetSymbols = new Set<string>();
+
+  for (const target of highSignalTargets) {
+    const exports = target.file.analysis?.exports ?? [];
+    exports.forEach((e: string) => targetSymbols.add(e));
+    if (lang === "c" || lang === "mixed") {
+      extractCSymbols(safeContent(target.file)).forEach((s) =>
+        targetSymbols.add(s),
+      );
+    }
+  }
+
+  const statefulPatterns = [
+    /\.map\(/,
+    /\.forEach\(/,
+    /\.reduce\(/,
+    /\bwhile\b/,
+    /list_for_each/,
+    /\.(push|add|insert|append)\(/,
+    /\.id\s*==/,
+  ];
+
+  if (targetSymbols.size > 0) {
+    for (const candidate of scored) {
+      if (candidate.score >= MIN_RELEVANCE_SCORE_TARGETED) continue;
+
+      const content = safeContent(candidate.file);
+      const foundSymbols = [...targetSymbols].filter((sym) =>
+        new RegExp(`\\b${escapeRegex(sym)}\\b`).test(content),
+      );
+
+      if (foundSymbols.length > 0) {
+        const isStatefulCall = statefulPatterns.some((pattern) =>
+          pattern.test(content),
+        );
+        if (isStatefulCall) {
+          candidate.score += 25;
+          (candidate.file as any).snapSymbols = foundSymbols;
+        }
+      }
+    }
+  }
+
+  // ─── Phase 3: Shadow Context (Consumer Pulling) ───
+  for (const target of highSignalTargets) {
+    const targetPath = target.file.path;
+    const consumers = scored.filter((c) => {
+      const deps = importGraph[c.file.path] || cIncludeGraph[c.file.path] || [];
+      return deps.some((d) => d.includes(targetPath) || targetPath.includes(d));
+    });
+
+    for (const consumer of consumers) {
+      if (consumer.score >= threshold) continue;
+      const content = safeContent(consumer.file);
+      // High-density logic check: presence of conditionals/loops AND variable assignments
+      if (
+        /\b(if|while|for|switch|case)\b/.test(content) &&
+        content.includes("=")
+      ) {
+        consumer.score += 20;
+        (consumer.file as any).isShadowContext = true;
+      }
+    }
+  }
+
   scored.sort((a, b) => b.score - a.score);
 
-  const threshold =
-    focus === "targeted"
-      ? MIN_RELEVANCE_SCORE_TARGETED
-      : MIN_RELEVANCE_SCORE_GENERIC;
   const relevant = scored.filter((s) => s.score >= threshold);
   const selected = relevant.map((s) => s.file);
   const omitted = scored
@@ -738,8 +808,6 @@ function selectFilesByBudget(
   const tier3 = withTier.filter((x) => x.tier === 3).map((x) => x.file);
   const tier4 = withTier.filter((x) => x.tier === 4).map((x) => x.file);
 
-  // With no file count cap, budget is effectively unlimited — only drop tiers
-  // if aggregate word count would be truly enormous (>1B words, a safety rail).
   const HARD_WORD_CEILING = 1_000_000_000;
   const wordsOf = (files: any[]) =>
     files.reduce((s, f) => s + estimateWords(f), 0);
@@ -778,8 +846,9 @@ function safeFileExt(file: any): string {
 }
 
 function safeContent(file: any): string {
-  const c = file.content;
-  if (c === null || c === undefined) return "";
+  if (!file) return "";
+  const c = file.content || file.analysis?.fullContent;
+  if (!c) return "";
   return String(c);
 }
 
@@ -951,8 +1020,9 @@ function getCommitHistory(repoContext: any): string {
     return `## Recent Commits\n\n${lines.join("\n")}`;
   }
   const parts: string[] = ["## Commit History"];
+  // Sort authors for deterministic output
   for (const [author, commits] of Object.entries(commitsByAuthor).sort(
-    (a, b) => b[1].length - a[1].length,
+    (a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]),
   )) {
     const shown = (commits as any[]).slice(0, 20);
     const hidden = commits.length - shown.length;
@@ -1024,10 +1094,14 @@ function getCIncludeGraphSummary(
   cIncludeGraph: Record<string, string[]>,
   selectedFilePaths: Set<string>,
 ): string {
-  const entries = Object.entries(cIncludeGraph)
-    .filter(([from]) => selectedFilePaths.has(from))
-    .map(([from, deps]) => {
-      const relevantDeps = deps.filter((d) => selectedFilePaths.has(d));
+  // Sort keys for deterministic output
+  const entries = Object.keys(cIncludeGraph)
+    .sort()
+    .filter((from) => selectedFilePaths.has(from))
+    .map((from) => {
+      const relevantDeps = cIncludeGraph[from]
+        .filter((d) => selectedFilePaths.has(d))
+        .sort();
       return relevantDeps.length
         ? `- ${from} includes: ${relevantDeps.join(", ")}`
         : null;
@@ -1226,6 +1300,192 @@ function parseCFunctionBlocks(content: string): FunctionBlock[] {
   return blocks;
 }
 
+// ─── Universal Bracket Parser ───────────────────────────────────────────────────
+
+function parseUniversalBlocks(content: string, ext: string): FunctionBlock[] {
+  const lines = content.split("\n");
+  const blocks: FunctionBlock[] = [];
+
+  const isPython = ext === "py" || ext === "yml" || ext === "yaml";
+  let inBlock = false;
+  let blockStart = -1;
+  let braceDepth = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (
+      !trimmed ||
+      trimmed.startsWith("//") ||
+      trimmed.startsWith("#") ||
+      trimmed.startsWith("/*") ||
+      trimmed.startsWith("*")
+    )
+      continue;
+
+    if (isPython) {
+      const match = line.match(/^([ \t]*)(def|class)\s+(\w+)/);
+      if (match && !inBlock) {
+        const indent = match[1].length;
+        const name = match[3];
+        blockStart = i;
+        inBlock = true;
+        let j = i + 1;
+        while (j < lines.length) {
+          const l2 = lines[j];
+          if (l2.trim() === "") {
+            j++;
+            continue;
+          }
+          const l2Indent = l2.match(/^[ \t]*/)?.[0].length ?? 0;
+          if (l2Indent <= indent && !l2.trim().startsWith("#")) {
+            break;
+          }
+          j++;
+        }
+        blocks.push({
+          name,
+          startLine: blockStart,
+          endLine: j - 1,
+          text: lines.slice(blockStart, j).join("\n"),
+        });
+        i = j - 1;
+        inBlock = false;
+      }
+    } else {
+      for (const ch of line) {
+        if (ch === "{") braceDepth++;
+        else if (ch === "}") braceDepth--;
+      }
+
+      if (!inBlock && braceDepth > 0) {
+        inBlock = true;
+        blockStart = i;
+      } else if (inBlock && braceDepth <= 0) {
+        inBlock = false;
+        if (i - blockStart >= 3) {
+          blocks.push({
+            name: `[Anonymous Block at Line ${blockStart + 1}]`,
+            startLine: blockStart,
+            endLine: i,
+            text: lines.slice(blockStart, i + 1).join("\n"),
+          });
+        }
+        braceDepth = 0;
+      }
+    }
+  }
+  return blocks;
+}
+
+function prioritizeBlocks(
+  blocks: FunctionBlock[],
+  lang: RepoLanguage = "mixed",
+  snapSymbols: string[] = [],
+): FunctionBlock[] {
+  if (blocks.length <= 9 && snapSymbols.length === 0) return blocks;
+
+  const logicKeywords = [
+    "if",
+    "while",
+    "return",
+    "await",
+    "yield",
+    "match",
+    "case",
+    "for",
+    "switch",
+    "list_for_each",
+    "list_entry",
+    "push",
+    "reduce",
+    "aggregate",
+    "join",
+    "groupby",
+    "yield",
+  ];
+
+  const scoreBlock = (b: FunctionBlock) => {
+    let score = 0;
+    const words = b.text.split(/[^a-zA-Z_]/);
+    for (const w of words) if (logicKeywords.includes(w)) score++;
+
+    // Caller-Context Snapping (+50)
+    if (snapSymbols.length > 0) {
+      for (const sym of snapSymbols) {
+        if (new RegExp(`\\b${escapeRegex(sym)}\\b`).test(b.text)) {
+          score += 50;
+        }
+      }
+    }
+
+    // 1. Logic-Unit Bundling (+40)
+    // Recognizes structural iterators that likely wrap target logic
+    const hasControlFlowIterator = /\b(for|while|foreach|do)\s*\(/.test(b.text);
+    const hasPythonComprehension = /\[.*\s+for\s+.*\s+in\s+.*\]/.test(b.text);
+    const hasFunctionalIterator =
+      /\.(map|reduce|filter|forEach|flatMap)\(/.test(b.text);
+
+    if (
+      snapSymbols.length > 0 &&
+      (hasControlFlowIterator ||
+        hasPythonComprehension ||
+        hasFunctionalIterator)
+    ) {
+      // If this block is an iterator AND it contains a target symbol (already boosted by +50),
+      // give it an extra "Logic-Unit" boost to ensure the entire wrapper is kept.
+      score += 40;
+    }
+
+    // 2. State-Accumulator Heuristic (+25)
+    // C/C++: Pointers/Arrays being filled
+    const hasCPointerAccumulator =
+      /\*\w+\+\+\s*=/.test(b.text) || /\w+\[\w+\]\s*=/.test(b.text);
+    // Scripting: +=, .push, .append, dict[k] =
+    const hasScriptAccumulator =
+      /\+=/.test(b.text) ||
+      /\.(push|append|add|insert|extend|update)\(/.test(b.text);
+
+    if (hasCPointerAccumulator || hasScriptAccumulator) {
+      score += 25;
+    }
+
+    // 3. Relational/Stateful Bonus (+15)
+    const hasIdCheck =
+      /\.id\s*==/.test(b.text) || /\b(PK|UUID|guid)\b/i.test(b.text);
+    if (hasIdCheck && (hasScriptAccumulator || hasFunctionalIterator)) {
+      score += 15;
+    }
+
+    return score;
+  };
+
+  const scored = blocks.map((b, idx) => ({
+    block: b,
+    score: scoreBlock(b),
+    idx,
+  }));
+
+  const oneThird = Math.floor(scored.length / 3);
+  const firstThird = scored
+    .slice(0, oneThird)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3);
+  const middleThird = scored
+    .slice(oneThird, 2 * oneThird)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3);
+  const lastThird = scored
+    .slice(2 * oneThird)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3);
+
+  const selected = [...firstThird, ...middleThird, ...lastThird]
+    .sort((a, b) => a.idx - b.idx)
+    .map((s) => s.block);
+  return selected;
+}
+
 // ─── File context generation ──────────────────────────────────────────────────
 
 function getFileContext(
@@ -1233,6 +1493,8 @@ function getFileContext(
   role: ImportRole,
   repoName: string,
   lang: RepoLanguage,
+  notebookName = "",
+  crossDeps: string[] = [],
 ): string {
   const ext = safeFileExt(file);
   const exports: string[] = file.analysis?.exports ?? [];
@@ -1261,22 +1523,40 @@ function getFileContext(
   ].includes(ext);
 
   let exportsStr: string;
+  let exportsInfoStr: string;
+
   if (isCFile) {
     const symbols = extractCSymbols(safeContent(file));
-    exportsStr = symbols.length
-      ? `Symbols (functions, macros, structs, EXPORT_SYMBOL): ${symbols.slice(0, 30).join(", ")}${symbols.length > 30 ? ` and ${symbols.length - 30} more` : ""}.`
-      : "No detected public symbols.";
+    if (symbols.length) {
+      const shown = symbols.slice(0, 30);
+      const extra =
+        symbols.length > 30 ? ` and ${symbols.length - 30} more` : "";
+      exportsStr = `Symbols (functions, macros, structs, EXPORT_SYMBOL): ${shown.join(", ")}${extra}.`;
+      exportsInfoStr = shown.join(", ") + extra;
+    } else {
+      exportsStr = "No detected public symbols.";
+      exportsInfoStr = "(none detected)";
+    }
   } else {
-    exportsStr = exports.length
-      ? `It exports: ${exports.join(", ")}.`
-      : "It has no named exports.";
+    if (exports.length) {
+      exportsStr = `It exports: ${exports.join(", ")}.`;
+      exportsInfoStr = exports.join(", ");
+    } else {
+      exportsStr = "It has no named exports.";
+      exportsInfoStr = "(none)";
+    }
   }
 
+  const topImports = imports.slice(0, 12);
   const importsStr = imports.length
-    ? `It imports from: ${imports.slice(0, 12).join(", ")}${imports.length > 12 ? ` and ${imports.length - 12} more` : ""}.`
+    ? `It imports from: ${topImports.join(", ")}${imports.length > 12 ? ` and ${imports.length - 12} more` : ""}.`
     : isCFile
       ? ""
       : "It has no imports.";
+  const importsInfoStr = imports.length
+    ? topImports.join(", ") +
+      (imports.length > 12 ? ` and ${imports.length - 12} more` : "")
+    : "(none)";
 
   const todosStr = todos.length ? ` TODOs: ${todos.join(" | ")}.` : "";
   const flagsStr = flags ? ` (${flags})` : "";
@@ -1287,14 +1567,6 @@ function getFileContext(
     `${exportsStr}${importsStr ? " " + importsStr : ""}${todosStr}`;
 
   let content = safeContent(file);
-  if (content.length > FILE_CHAR_LIMIT) {
-    const cut = content.lastIndexOf("\n", FILE_CHAR_LIMIT);
-    content =
-      content.slice(0, cut > 0 ? cut : FILE_CHAR_LIMIT) +
-      `\n\n[TRUNCATED: file exceeds ${FILE_CHAR_LIMIT.toLocaleString()} characters.]`;
-  }
-
-  const heading = `### ${file.path} (${role})`;
   const isNonCodeFile = [
     "css",
     "scss",
@@ -1309,21 +1581,81 @@ function getFileContext(
     "rst",
   ].includes(ext);
 
+  const heading = `### ${file.path} (${role})`;
+
+  const manifestSummaryLine = notebookName
+    ? `> This file is part of **${notebookName}**. The local manifest (\`00_manifest.txt\`) lists all files in this notebook.`
+    : "";
+
+  const crossDepsInfoStr =
+    crossDeps.length > 0 ? crossDeps.join("; ") : "(none in this file)";
+
+  const fileInfoBlock = [
+    `**File Information:**`,
+    `- **Original path:** ${file.path}`,
+    `- **Role:** ${role}`,
+    `- **Exports:** ${exportsInfoStr}`,
+    `- **Imports:** ${importsInfoStr}`,
+    `- **Cross‑notebook dependencies:** ${crossDepsInfoStr}`,
+  ].join("\n");
+
+  const headerParts: string[] = [heading];
+  if (manifestSummaryLine) headerParts.push("", manifestSummaryLine);
+  headerParts.push("", fileInfoBlock, "", prose);
+
   if (content.length <= SPLIT_THRESHOLD_CHARS || isNonCodeFile) {
-    return [heading, "", prose, "", `\`\`\`${ext}`, content, "```"].join("\n");
+    if (content.length > FILE_CHAR_LIMIT && isNonCodeFile) {
+      const cut = content.lastIndexOf("\n", FILE_CHAR_LIMIT);
+      content =
+        content.slice(0, cut > 0 ? cut : FILE_CHAR_LIMIT) +
+        `\n\n[TRUNCATED: file exceeds ${FILE_CHAR_LIMIT.toLocaleString()} characters.]`;
+    }
+    return [...headerParts, "", `\`\`\`${ext}`, content, "```"].join("\n");
   }
 
-  const blocks = isCFile
+  let blocks = isCFile
     ? parseCFunctionBlocks(content)
     : parseFunctionBlocks(content);
 
+  if (blocks.length === 0 && !isNonCodeFile) {
+    blocks = parseUniversalBlocks(content, ext);
+  }
+
+  const snapSymbols: string[] = file.snapSymbols ?? [];
+  if (snapSymbols.length > 0) {
+    blocks = prioritizeBlocks(blocks, lang, snapSymbols);
+  }
+
+  const originalFirstBlockLine = blocks.length > 0 ? blocks[0].startLine : 0;
+
+  if (content.length > FILE_CHAR_LIMIT) {
+    if (blocks.length === 0) {
+      const len = content.length;
+      const s1 = content.slice(0, Math.floor(len * 0.1));
+      const s2 = content.slice(Math.floor(len * 0.4), Math.floor(len * 0.6));
+      const s3 = content.slice(Math.floor(len * 0.9));
+      content =
+        s1 +
+        "\n\n[... TRUNCATED SAMPLING WINDOW ...]\n\n" +
+        s2 +
+        "\n\n[... TRUNCATED SAMPLING WINDOW ...]\n\n" +
+        s3;
+      return [...headerParts, "", `\`\`\`${ext}`, content, "```"].join("\n");
+    } else {
+      blocks = prioritizeBlocks(blocks);
+    }
+  }
+
   if (!blocks.length) {
-    return [heading, "", prose, "", `\`\`\`${ext}`, content, "```"].join("\n");
+    return [...headerParts, "", `\`\`\`${ext}`, content, "```"].join("\n");
   }
 
   const fileLines = content.split("\n");
-  const headerText = fileLines.slice(0, blocks[0].startLine).join("\n").trim();
-  const parts: string[] = [heading, "", prose];
+  const headerText = fileLines
+    .slice(0, originalFirstBlockLine)
+    .join("\n")
+    .trim();
+  const parts: string[] = [...headerParts];
 
   if (headerText) {
     parts.push(
@@ -1358,168 +1690,180 @@ function countWords(text: string): number {
   return text.split(/\s+/).filter(Boolean).length;
 }
 
-// ─── Pack and flush ───────────────────────────────────────────────────────────
-// Meta blocks always go to a single dedicated 01_Meta.txt file.
-// Source blocks are packed into part_NN.txt files with no file count cap.
-// For C repos: source blocks are grouped by kernel subsystem before packing.
-
-async function packAndFlush(
-  metaBlocks: Block[],
+// ─── Split source blocks into batches of up to maxFilesPerBatch ──────────────
+// Input must already be sorted by filePath for deterministic batching.
+function splitSourceBlocksIntoBatches(
   sourceBlocks: Block[],
-  outDir: string,
-  lang: RepoLanguage,
-): Promise<{ metaFile: string; sourceFiles: string[] }> {
-  mkdirSync(outDir, { recursive: true });
+  maxFilesPerBatch: number,
+): Block[][] {
+  const batches: Block[][] = [];
+  let currentBatch: Block[] = [];
+  for (const block of sourceBlocks) {
+    if (currentBatch.length >= maxFilesPerBatch) {
+      batches.push(currentBatch);
+      currentBatch = [];
+    }
+    currentBatch.push(block);
+  }
+  if (currentBatch.length > 0) {
+    batches.push(currentBatch);
+  }
+  return batches;
+}
 
-  // ── Dedicated meta file (repo overview, docs, graph summary, etc.) ─────────
-  const metaPath = join(outDir, "01_Meta.txt");
+// ─── Write a single notebook folder ──────────────────────────────────────────
+async function writeNotebookFolder(
+  batch: Block[],
+  folderIndex: number,
+  outputDir: string,
+): Promise<{
+  name: string;
+  fileCount: number;
+  groups: string[];
+  filePaths: string[];
+  localManifestPath: string;
+}> {
+  const folderName = `notebook_${String(folderIndex + 1).padStart(2, "0")}`;
+  const folderPath = join(outputDir, folderName);
+  mkdirSync(folderPath, { recursive: true });
+
+  const groupsSet = new Set<string>();
+  const originalFilePaths: string[] = [];
+
+  for (let i = 0; i < batch.length; i++) {
+    const block = batch[i];
+    groupsSet.add(block.group);
+    let filePath = block.filePath;
+    if (!filePath) {
+      const firstLine = block.text.split("\n")[0];
+      const match = firstLine.match(/^### (.+?) \(/);
+      filePath = match ? match[1] : `file_${i + 1}_NB${folderIndex + 1}`;
+    }
+    originalFilePaths.push(filePath);
+
+    const fileName = `file_${String(i + 1).padStart(3, "0")}_NB${folderIndex + 1}.txt`;
+    const fileFullPath = join(folderPath, fileName);
+    await writeFile(fileFullPath, block.text, "utf-8");
+  }
+
+  // Sort groups for deterministic manifest output
+  const sortedGroups = Array.from(groupsSet).sort();
+
+  // Write local manifest (always included)
+  const manifestLines = [
+    `# Manifest for ${folderName}`,
+    `Generated: ${new Date().toISOString()}`,
+    `Contains ${batch.length} source files.`,
+    `Groups: ${sortedGroups.join(", ")}`,
+    ``,
+    `Files in this notebook:`,
+    ...originalFilePaths.map(
+      (fp, idx) =>
+        `file_${String(idx + 1).padStart(3, "0")}_NB${folderIndex + 1}.txt -> ${fp}`,
+    ),
+    ``,
+    `[RELATIONAL ANCHORS]`,
+    `This notebook contains files marked as 'Stateful Callers' or 'Mappers'.`,
+    `Check the 'Cross-notebook dependencies' header in each file for precise links.`,
+    ``,
+    `END OF MANIFEST`,
+  ];
+  const manifestPath = join(folderPath, "00_manifest.txt");
+  await writeFile(manifestPath, manifestLines.join("\n"), "utf-8");
+
+  return {
+    name: folderName,
+    fileCount: batch.length,
+    groups: sortedGroups,
+    filePaths: originalFilePaths,
+    localManifestPath: manifestPath,
+  };
+}
+
+// ─── Write root manifest and meta file ───────────────────────────────────────
+async function writeRootManifest(
+  metaTexts: string[],
+  folderInfos: Array<{
+    name: string;
+    fileCount: number;
+    groups: string[];
+    filePaths: string[];
+  }>,
+  outputDir: string,
+  repoContext: any,
+  lang: RepoLanguage,
+  totalSourceFiles: number,
+  droppedTiers: number[],
+  allCandidatesCount: number,
+  globalDeps: Map<number, Set<number>>,
+): Promise<{ rootManifestPath: string; metaFilePath: string }> {
+  // Write the meta file (01_Meta.txt)
+  const metaFilePath = join(outputDir, "01_Meta.txt");
+  const logicalCouplesText =
+    "## Functional Relationships (Logical Couples)\n" +
+    "This codebase contains 'Logical Couples' where one file defines a data transformation (The Mapper) " +
+    "and another file contains the stateful aggregation loop (The Aggregator). \n\n" +
+    "RepoOrbit has bundled these together into 'Logic Units'. When analyzing a Mapper, the Planner " +
+    "should also check its corresponding Aggregator in the manifest to understand the full stateful flow.";
+
   await writeFile(
-    metaPath,
-    metaBlocks.map((b) => b.text).join("\n\n"),
+    metaFilePath,
+    [...metaTexts, logicalCouplesText].join("\n\n"),
     "utf-8",
   );
 
-  // ── Source parts — no cap on number of files ───────────────────────────────
-  const written: string[] = [];
+  // Build root manifest lines
+  const lines: string[] = [
+    `00_Root_Manifest.txt — ${repoContext?.meta?.fullName ?? "Unknown"} Root Manifest`,
+    `Generated: ${new Date().toISOString()}`,
+    `Language profile: ${lang}`,
+    `Mode: ${droppedTiers.length > 0 ? "BUDGET-CONSTRAINED (dropped tiers: " + droppedTiers.join(",") + ")" : "FULL (all source files)"}`,
+    `Total files considered: ${allCandidatesCount}`,
+    `Total source files selected: ${totalSourceFiles}`,
+    `Split into ${folderInfos.length} notebooks (max 49 files per notebook)`,
+    "",
+  ];
 
-  if (lang === "c") {
-    // Group by kernel subsystem, keep subsystems together in buckets
-    const subsystemGroups = new Map<string, Block[]>();
-    for (const block of sourceBlocks) {
-      const key = subsystemKey(block.group);
-      if (!subsystemGroups.has(key)) subsystemGroups.set(key, []);
-      subsystemGroups.get(key)!.push(block);
+  if (globalDeps.size > 0) {
+    lines.push("## Cross‑Notebook Dependencies & Relational Anchors");
+    const sortedNotebooks = Array.from(globalDeps.keys()).sort((a, b) => a - b);
+    for (const srcIdx of sortedNotebooks) {
+      const srcName = `notebook_${String(srcIdx + 1).padStart(2, "0")}`;
+      const targets = Array.from(globalDeps.get(srcIdx)!).sort((a, b) => a - b);
+      const targetNames = targets
+        .map((t) => `notebook_${String(t + 1).padStart(2, "0")}`)
+        .join(", ");
+
+      const relationalNote = targets.some((t) => t < srcIdx)
+        ? " (Contains Callers/Aggregators)"
+        : "";
+      lines.push(`- ${srcName} depends on: ${targetNames}${relationalNote}`);
     }
-
-    const orderedGroups = [...subsystemGroups.keys()].sort();
-
-    const buckets: string[][] = [[]];
-    const bucketWords: number[] = [0];
-
-    for (const groupKey of orderedGroups) {
-      const groupBlocks = subsystemGroups.get(groupKey)!;
-      const groupText = groupBlocks.map((b) => b.text);
-      const groupWords = groupText.reduce((s, t) => s + countWords(t), 0);
-
-      const curr = buckets.length - 1;
-      if (
-        bucketWords[curr] + groupWords > WORD_LIMIT_PER_FILE &&
-        bucketWords[curr] > 0
-      ) {
-        buckets.push([]);
-        bucketWords.push(0);
-      }
-
-      for (const text of groupText) {
-        const wc = countWords(text);
-        const c = buckets.length - 1;
-        if (bucketWords[c] + wc > WORD_LIMIT_PER_FILE && bucketWords[c] > 0) {
-          buckets.push([text]);
-          bucketWords.push(wc);
-        } else {
-          buckets[c].push(text);
-          bucketWords[c] += wc;
-        }
-      }
-    }
-
-    for (let i = 0; i < buckets.length; i++) {
-      const paddedNum = String(i + 1).padStart(2, "0");
-      const fullPath = join(outDir, `part_${paddedNum}.txt`);
-      await writeFile(fullPath, buckets[i].join("\n\n"), "utf-8");
-      written.push(fullPath);
-    }
-  } else {
-    // Greedy word-count packing — no file count cap
-    const allText = sourceBlocks.map((b) => b.text);
-    const totalWords = allText.reduce((s, t) => s + countWords(t), 0);
-    const bucketCount = Math.max(
-      1,
-      Math.ceil(totalWords / WORD_LIMIT_PER_FILE),
-    );
-    const targetWordsPerBucket = Math.min(
-      Math.ceil(totalWords / bucketCount),
-      WORD_LIMIT_PER_FILE,
-    );
-
-    const buckets: string[][] = [[]];
-    const bucketWords: number[] = [0];
-
-    for (const text of allText) {
-      const wc = countWords(text);
-      const curr = buckets.length - 1;
-      if (
-        bucketWords[curr] + wc > targetWordsPerBucket &&
-        bucketWords[curr] > 0
-      ) {
-        buckets.push([text]);
-        bucketWords.push(wc);
-      } else {
-        buckets[curr].push(text);
-        bucketWords[curr] += wc;
-      }
-    }
-
-    for (let i = 0; i < buckets.length; i++) {
-      const paddedNum = String(i + 1).padStart(2, "0");
-      const fullPath = join(outDir, `part_${paddedNum}.txt`);
-      await writeFile(fullPath, buckets[i].join("\n\n"), "utf-8");
-      written.push(fullPath);
-    }
+    lines.push("");
   }
 
-  return { metaFile: metaPath, sourceFiles: written };
+  lines.push("# Notebooks", "");
+  for (const info of folderInfos) {
+    lines.push(`## ${info.name}`);
+    lines.push(`- Contains ${info.fileCount} source files.`);
+    lines.push(`- Groups: ${info.groups.join(", ")}`);
+    // Print ALL file paths — no truncation — so the orchestrator has a
+    // complete picture of every notebook's contents.
+    lines.push(`- Files:`);
+    for (const fp of info.filePaths) {
+      lines.push(`  - ${fp}`);
+    }
+    lines.push("");
+  }
+  lines.push("END OF MANIFEST");
+
+  const rootManifestPath = join(outputDir, "00_Root_Manifest.txt");
+  await writeFile(rootManifestPath, lines.join("\n"), "utf-8");
+
+  return { rootManifestPath, metaFilePath };
 }
 
-// ─── Manifest ─────────────────────────────────────────────────────────────────
-
-function buildManifest(
-  sourceFileCount: number,
-  repoName: string,
-  repoContext: any,
-  droppedTiers: number[],
-  totalSourceFiles: number,
-  lang: RepoLanguage,
-): string {
-  const timestamp = new Date().toISOString();
-  const langNote =
-    lang === "c"
-      ? [
-          "",
-          "C/SYSTEMS REPO NOTES:",
-          "  - Files sorted and packed by kernel subsystem (arch/, block/, fs/, mm/, net/, etc.)",
-          "  - Kconfig, assembly (.S), and linker script (.ld) files included as Tier 1/2",
-          "  - C symbols extracted from EXPORT_SYMBOL, struct, typedef, and function definitions",
-          "  - C include graph (#include directives) replaces JS import graph for cross-reference",
-          "  - parseCFunctionBlocks() used instead of JS-only parseFunctionBlocks()",
-        ].join("\n")
-      : "";
-
-  const lastPart = String(sourceFileCount).padStart(2, "0");
-
-  return [
-    `00_Repo_Manifest.txt — ${repoName}`,
-    `Generated: ${timestamp}`,
-    `Repository: ${repoContext?.meta?.fullName ?? repoName}`,
-    `Description: ${repoContext?.github?.description ?? "N/A"}`,
-    `Detected language profile: ${lang}`,
-    "",
-    `Mode: ${droppedTiers.length > 0 ? "BUDGET-CONSTRAINED (dropped tiers: " + droppedTiers.join(",") + ")" : "FULL (all source files)"}`,
-    `Total files considered: ${totalSourceFiles}`,
-    `Output: 1 manifest + 1 meta file + ${sourceFileCount} source part(s) = ${sourceFileCount + 2} total files`,
-    langNote,
-    "",
-    `Files in this set:`,
-    `  00_Repo_Manifest.txt  — this file`,
-    `  01_Meta.txt           — repo overview, docs, contributors, commits, directory tree, import/include graph`,
-    `  part_01.txt .. part_${lastPart}.txt — source code${lang === "c" ? " grouped by kernel subsystem" : " organized alphabetically by directory"}`,
-    "",
-    `Upload all files to NotebookLM as sources.`,
-    "",
-    "END OF MANIFEST",
-  ].join("\n");
-}
-
+// ─── Main export ──────────────────────────────────────────────────────────────
 export async function buildMasterContext(
   query: string,
   filesMetadata: any[],
@@ -1565,9 +1909,14 @@ export async function buildMasterContext(
     : (expertPlan?.focus ??
       (needsCode ? detectCodeFocus(safeQuery) : "generic"));
 
-  const allCandidates = filesMetadata.filter(
-    (f) => f && typeof f.path === "string" && shouldInclude(f.path, lang),
-  );
+  // ── Sort all candidates lexicographically by path before any processing ──
+  // This is the root of determinism: every downstream collection derives from
+  // this sorted list, so file-to-notebook assignments are stable across runs.
+  const allCandidates = filesMetadata
+    .filter(
+      (f) => f && typeof f.path === "string" && shouldInclude(f.path, lang),
+    )
+    .sort((a, b) => (a.path as string).localeCompare(b.path));
 
   const estimateWords = (f: any) =>
     Math.ceil((f.metrics?.charCount ?? f.content?.length ?? 0) / 5);
@@ -1578,21 +1927,26 @@ export async function buildMasterContext(
     lang,
   );
 
-  const docFiles = allIncluded.filter((f) => isDocFile(f.path));
-  const sourceFiles = allIncluded.filter((f) => !isDocFile(f.path));
+  // Preserve lexicographic order after budget filtering
+  const allIncludedSorted = [...allIncluded].sort((a, b) =>
+    (a.path as string).localeCompare(b.path),
+  );
 
-  // Separate accumulators: meta goes to 01_Meta.txt, source goes to part_NN.txt
-  const metaBlocks: Block[] = [];
+  const docFiles = allIncludedSorted.filter((f) => isDocFile(f.path));
+  const sourceFiles = allIncludedSorted.filter((f) => !isDocFile(f.path));
+
+  // Accumulators
+  const metaTexts: string[] = [];
   const sourceBlocks: Block[] = [];
 
   const pushMeta = (text: string) => {
-    if (text.trim()) metaBlocks.push({ group: "_meta", text });
+    if (text.trim()) metaTexts.push(text);
   };
-  const pushSource = (group: string, text: string) => {
-    if (text.trim()) sourceBlocks.push({ group, text });
+  const pushSource = (group: string, text: string, filePath: string) => {
+    if (text.trim()) sourceBlocks.push({ group, text, filePath });
   };
 
-  // ── Assemble meta content ──────────────────────────────────────────────────
+  // ── Meta content assembly ──────────────────────────────────────────────────
   const metaLines: string[] = [];
   metaLines.push(
     `# ${repoContext?.meta?.fullName ?? "Unknown"} — Codebase Context`,
@@ -1635,8 +1989,9 @@ export async function buildMasterContext(
     (intents.includes("repo_meta") && focus === "generic")
   ) {
     const extFreq = repoContext?.stats?.extFrequency ?? {};
+    // Sort extension frequency entries for deterministic output
     const extSummary = Object.entries(extFreq)
-      .sort((a: any, b: any) => b[1] - a[1])
+      .sort((a: any, b: any) => b[1] - a[1] || a[0].localeCompare(b[0]))
       .slice(0, 10)
       .map(([ext, count]) => `.${ext}: ${count} files`)
       .join(", ");
@@ -1649,37 +2004,41 @@ export async function buildMasterContext(
 
   pushMeta(metaLines.join("\n\n"));
 
+  // ── Source file processing ─────────────────────────────────────────────────
+  let sortedFiles: any[] = [];
+  const globalDeps = new Map<number, Set<number>>();
+
   if (needsCode) {
     const allGraphPaths = new Set([
       ...Object.keys(mergedImportGraph),
       ...Object.values(mergedImportGraph).flat(),
     ]);
     const importedByOthers = new Set(Object.values(mergedImportGraph).flat());
-    const entryPoints = [...allGraphPaths].filter(
-      (p) => !importedByOthers.has(p),
-    );
+    const entryPoints = [...allGraphPaths]
+      .filter((p) => !importedByOthers.has(p))
+      .sort(); // sort for deterministic seed order
     const graphlessFiles = sourceFiles
       .map((f) => f.path)
-      .filter((p) => !allGraphPaths.has(p));
+      .filter((p) => !allGraphPaths.has(p))
+      .sort(); // sort for deterministic seed order
     const depthMap = resolveImportDepths(
       [...entryPoints, ...graphlessFiles],
       mergedImportGraph,
       IMPORT_DEPTH,
     );
 
-    let sortedFiles: any[];
-
     if (dumpAll) {
+      // Always sort lexicographically by path so notebook assignments are stable
       if (lang === "c") {
         sortedFiles = [...sourceFiles].sort((a, b) => {
           const sa = subsystemKey(a.path);
           const sb = subsystemKey(b.path);
           if (sa !== sb) return sa.localeCompare(sb);
-          return a.path.localeCompare(b.path);
+          return (a.path as string).localeCompare(b.path);
         });
       } else {
         sortedFiles = [...sourceFiles].sort((a, b) =>
-          a.path.localeCompare(b.path),
+          (a.path as string).localeCompare(b.path),
         );
       }
     } else {
@@ -1708,11 +2067,10 @@ export async function buildMasterContext(
         }
       }
 
-      sortedFiles = [...selectedFiles].sort((a, b) => {
-        const da = depthMap.get(a.path) ?? 999;
-        const db = depthMap.get(b.path) ?? 999;
-        return da !== db ? da - db : a.path.localeCompare(b.path);
-      });
+      // Sort selected files lexicographically for deterministic ordering
+      sortedFiles = [...selectedFiles].sort((a, b) =>
+        (a.path as string).localeCompare(b.path),
+      );
 
       if (omittedCount > 0) {
         pushMeta(
@@ -1721,7 +2079,13 @@ export async function buildMasterContext(
       }
     }
 
-    // C include graph summary goes to meta (reference data, not source code)
+    // Build global index map: filePath -> global file index
+    const globalFileIndexMap = new Map<string, number>();
+    for (let i = 0; i < sortedFiles.length; i++) {
+      globalFileIndexMap.set(sortedFiles[i].path, i);
+    }
+
+    // C include graph summary goes to meta
     if (lang === "c" || lang === "mixed") {
       const selectedPaths = new Set(sortedFiles.map((f) => f.path));
       const includeGraphSummary = getCIncludeGraphSummary(
@@ -1740,18 +2104,65 @@ export async function buildMasterContext(
 
     if (sortedFiles.length > 0) pushMeta(graphHeader);
 
-    for (const file of sortedFiles) {
-      const fileContext = getFileContext(
+    // ── Pass 1: compute cross‑notebook dependencies for every file ─────────
+    const fileCrossDeps = new Map<number, string[]>();
+
+    for (let i = 0; i < sortedFiles.length; i++) {
+      const file = sortedFiles[i];
+      const notebookIdx = Math.floor(i / 49);
+      // Sort deps for deterministic cross-dep listing
+      const deps = (mergedImportGraph[file.path] ?? []).slice().sort();
+      const crossDeps: string[] = [];
+
+      for (const depPath of deps) {
+        const depGlobalIdx = globalFileIndexMap.get(depPath);
+        if (depGlobalIdx !== undefined) {
+          const depNotebookIdx = Math.floor(depGlobalIdx / 49);
+          if (depNotebookIdx !== notebookIdx) {
+            const depLocalIdx = depGlobalIdx % 49;
+            const depLocalFileName = `file_${String(depLocalIdx + 1).padStart(3, "0")}_NB${depNotebookIdx + 1}.txt`;
+            const depNotebookName = `notebook_${String(depNotebookIdx + 1).padStart(2, "0")}`;
+            crossDeps.push(
+              `${depNotebookName}: ${depLocalFileName} (${depPath})`,
+            );
+
+            if (!globalDeps.has(notebookIdx))
+              globalDeps.set(notebookIdx, new Set());
+            globalDeps.get(notebookIdx)!.add(depNotebookIdx);
+          }
+        }
+      }
+
+      if (crossDeps.length > 0) {
+        fileCrossDeps.set(i, crossDeps);
+      }
+    }
+
+    // ── Pass 2: generate file context blocks ────────────────────────────────
+    for (let i = 0; i < sortedFiles.length; i++) {
+      const file = sortedFiles[i];
+      const notebookIdx = Math.floor(i / 49);
+      const notebookName = `notebook_${String(notebookIdx + 1).padStart(2, "0")}`;
+      const crossDeps = fileCrossDeps.get(i) ?? [];
+
+      let fileContext = getFileContext(
         file,
         importRoleLabel(depthMap.get(file.path)),
         repoName,
         lang,
+        notebookName,
+        crossDeps,
       );
+
+      if (crossDeps.length > 0) {
+        fileContext += `\n\nCross‑notebook dependencies:\n- ${crossDeps.join("\n- ")}`;
+      }
+
       const group =
         lang === "c"
           ? subsystemKey(file.path)
           : file.path.split("/")[0] || "_root";
-      pushSource(group, fileContext);
+      pushSource(group, fileContext, file.path);
     }
   }
 
@@ -1759,23 +2170,43 @@ export async function buildMasterContext(
     `## End of Context\n\nLanguage profile: ${lang}. Source files: ${needsCode ? "included" : "not included (meta-only query)"}.`,
   );
 
-  const { metaFile, sourceFiles: writtenSourceFiles } = await packAndFlush(
-    metaBlocks,
-    sourceBlocks,
-    outputDir,
-    lang,
-  );
+  // Add global dependency summary to metaTexts
+  if (globalDeps.size > 0) {
+    const depLines: string[] = ["## Cross‑Notebook Dependency Graph"];
+    // Sort notebook indices for deterministic output
+    const sortedNotebooks = Array.from(globalDeps.keys()).sort((a, b) => a - b);
+    for (const srcIdx of sortedNotebooks) {
+      const srcName = `notebook_${String(srcIdx + 1).padStart(2, "0")}`;
+      // Sort dependent notebook indices for deterministic output
+      const targets = Array.from(globalDeps.get(srcIdx)!).sort((a, b) => a - b);
+      const targetNames = targets
+        .map((t) => `notebook_${String(t + 1).padStart(2, "0")}`)
+        .join(", ");
+      depLines.push(`- ${srcName} depends on: ${targetNames}`);
+    }
+    pushMeta(depLines.join("\n"));
+  }
 
-  const manifestText = buildManifest(
-    writtenSourceFiles.length,
-    repoName,
+  // sourceBlocks are already in sorted order (pushed in sortedFiles order above)
+  const batches = splitSourceBlocksIntoBatches(sourceBlocks, 49);
+  const folderInfos = [];
+  for (let i = 0; i < batches.length; i++) {
+    const info = await writeNotebookFolder(batches[i], i, outputDir);
+    folderInfos.push(info);
+  }
+
+  const { rootManifestPath } = await writeRootManifest(
+    metaTexts,
+    folderInfos,
+    outputDir,
     repoContext,
+    lang,
+    sourceBlocks.length,
     droppedTiers,
     allCandidates.length,
-    lang,
+    globalDeps,
   );
-  const manifestPath = join(outputDir, "00_Repo_Manifest.txt");
-  await writeFile(manifestPath, manifestText, "utf-8");
 
-  return manifestText;
+  const rootManifestContent = await readFile(rootManifestPath, "utf-8");
+  return rootManifestContent;
 }

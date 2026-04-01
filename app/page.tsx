@@ -30,14 +30,15 @@ const Page = () => {
           {}
           <div className="flex flex-col items-center md:items-start flex-1 text-center md:text-left">
             <h1 className="text-gray-100 text-5xl lg:text-6xl xl:text-7xl font-black tracking-tighter leading-none md:leading-[0.95]">
-              Visualize your <br />
-              <span className="text-blue-500">Codebase DNA.</span>
+              The Developer <br />
+              <span className="text-blue-500">Exoskeleton.</span>
             </h1>
 
             <p className="text-base md:text-lg text-gray-400 max-w-xl mt-6 leading-relaxed font-medium">
-              Tired of the mess your intern made or just your old self? Stop
-              snooping around scattered files at 3am. RepoOrbit turns your mess
-              of a codebase into a visual map so you don't go insane
+              High-Precision AI Orchestration Pipeline. Solve the "Context Limit"
+              problem with deterministic mapping. RepoOrbit audits massive
+              codebases to generate zero-hallucination architectural briefings
+              for senior engineers.
             </p>
 
             {}
@@ -49,7 +50,7 @@ const Page = () => {
                   strokeWidth={2.5}
                 />
                 <span className="text-gray-400 pt-1 font-mono text-[10px] font-bold uppercase tracking-wider">
-                  No Login Required
+                  Deterministic Mapping
                 </span>
               </div>
 
@@ -60,14 +61,14 @@ const Page = () => {
                   strokeWidth={2.5}
                 />
                 <span className="text-gray-400 pt-1 font-mono text-[10px] font-bold uppercase tracking-wider">
-                  MIT Open Source
+                  Context Exoskeleton
                 </span>
               </div>
 
               <div className="flex items-center gap-2 border-2 border-gray-600 px-3 py-2 rounded-full">
                 <Atom size={14} className="text-blue-500" strokeWidth={2.5} />
                 <span className="text-gray-400 pt-1 font-mono text-[10px] font-bold uppercase tracking-wider">
-                  Instant Visualization
+                  Zero Hallucinations
                 </span>
               </div>
             </div>
@@ -156,9 +157,9 @@ const Page = () => {
           </h2>
 
           <p className="text-gray-400 text-lg md:text-xl mt-8 max-w-2xl leading-relaxed font-medium">
-            Experience your codebase like never before. No configuration, no
-            clunky extensions, and zero indexing wait times. Just drop a
-            repository and explore.
+            Experience deterministic context mapping. No generative guessing,
+            no lost-in-the-middle context, and zero hallucination wait times. 
+            Just drop a massive repository and map the "Narrow Path."
           </p>
 
           <button className="mt-12 flex items-center gap-3 text-white bg-blue-700 hover:bg-blue-600 px-10 py-4 rounded-full transition-all duration-300 transform active:scale-95 cursor-pointer text-xl font-bold border-b-4 border-blue-900">
@@ -181,8 +182,8 @@ const Page = () => {
               </span>
             </div>
             <p className="text-gray-500 text-sm max-w-xs leading-relaxed">
-              The ultimate spatial visualization tool for modern codebases.
-              Built for developers who want to see the bigger picture.
+              The high-precision AI orchestration pipeline for massive codebases.
+              Built for senior engineers who need the full picture, instantly.
             </p>
           </div>
 

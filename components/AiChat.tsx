@@ -310,7 +310,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
               {msg.role === "assistant" ? (
                 <div className="flex flex-col gap-1">
                   {msg.content === "" && msg.streaming ? (
-                    <div className="flex flex-col gap-1.5 mt-1 pt-1.5 w-full">
+                    <div className="flex flex-col gap-1.5 w-full">
                       <div className="flex items-center gap-1.5 text-slate-500">
                         <Loader2
                           size={10}

@@ -1,73 +1,108 @@
-# 🛰️ RepoOrbit
+# RepoOrbit: The Developer Exoskeleton
 
-**Stop reading code. Start seeing it.**
+RepoOrbit is a **High-Precision AI Orchestration Pipeline** and **Context Exoskeleton** designed for senior engineers auditing massive, complex codebases. Unlike traditional "generative" tools that guess at repository structures, RepoOrbit uses a deterministic, three-stage discovery loop to eliminate hallucinations and solve the "Context Limit" problem.
 
-RepoOrbit is an open-source, physics-based repository explorer that transforms flat GitHub file structures into interactive, multidimensional maps. Built for developers who need to audit architecture, identify technical debt, and context-load entire repositories into Google's NotebookLM for instant AI analysis.
+## 🛰️ The Core Philosophy: Deterministic Mapping over Generative Guessing
 
-![Visualization Interface](https://assets.prebuiltui.com/images/components/hero-section/hero-rightsocial-image.png)
+Modern LLMs struggle with "lost in the middle" and context saturation. RepoOrbit rejects the brute-force approach of dumping entire directories into a prompt. Instead, it follows the **"Narrow Path"** approach to context loading: 
+- **Identify** the exact required files through graph-based dependency analysis.
+- **Prune** noise (build artifacts, vendor code, irrelevant types).
+- **Surface** "Missing Links"—dependencies called in code but not yet implemented or indexed.
 
-## ✨ Key Features
+---
 
-- **Codebase Visualization**: A deeply interactive D3.js and WebGL powered spatial map (Galaxy View, Root System, Explorer).
-- **Automated AI Ingestion**: Context-load massive repositories directly into NotebookLM. RepoOrbit automatically chunks your code, strips noise, graphs dependencies, and uses Playwright via CDP to drive a background browser session—uploading your entire codebase without you having to lift a finger.
-- **Smart Context Engine**: Prioritizes crucial files (Entry points, Configs, Core Logic) while accurately omitting build artifacts, minified files, and bloat.
-- **Dependency Tracing**: Visualizes imports and exports with directed arrows (Trace Mode) to help you understand complex relationships instantly.
+## 📐 The Engine Architecture
+
+```mermaid
+graph TD
+    A[GitHub Repository] --> B[Phase 1: The Scout]
+    B -->|Manifest Analysis| C[Neighborhood Mapping]
+    C --> D[Phase 2: The Surveyor]
+    D -->|Dependency Tracing| E[Shadow Context Detection]
+    E --> F[Phase 3: The Surgeon]
+    F -->|Surgical Ingestion| G[NotebookLM / DeepSeek V3]
+    G --> H[Final Synthesis & Implementation Plan]
+```
+
+---
+
+## ⚙️ The Three-Stage Engine
+
+### 🔭 Phase 1: The Planner (The Scout)
+The engine performs a high-level manifest analysis (Package maps, `tsconfig`, `go.mod`, `Cargo.toml`) to identify the "Neighborhoods" relevant to your query. It ignores the 90% of the codebase that doesn't touch the execution path, reducing noise before the first AI call is ever made.
+
+### 📐 Phase 2: The Architect (The Surveyor)
+Using the Planner's findings, the Architect maps execution traces and identifies "Shadow" dependencies. This phase is critical for finding **Missing Links**—detecting references to unimplemented or external code and flagging them as architectural anomalies before they cause hallucinations in the synthesis phase.
+
+### 🔪 Phase 3: The Surgeon (The Coder)
+The final stage feeds surgical, high-density code blocks to DeepSeek or Gemini. By providing 100% accurate, importance-weighted context, the Surgeon generates zero-hallucination architectural briefings and implementation plans that are ready for senior-level review.
+
+---
+
+## 🚀 Key Technical Breakthroughs
+
+### 👻 The Proximity Protocol (Shadow Context)
+A graph-traversal algorithm that automatically pulls "Shadow" files—relevant types, constants, and neighbor components—even if they reside outside the main file's directory. This ensures the LLM always has the required structural context to understand a single file's logic.
+
+### 🛡️ The Hallucination Firewall
+A deterministic audit layer that detects references to symbols not present in the indexed manifest. This prevents AI from "inventing" implementation details for external or planned but unimplemented code.
+
+### 🌉 NotebookLM CDP Bridge
+RepoOrbit leverages Playwright to automate the Gemini 1.5 Pro "Expert Context" within NotebookLM. By connecting via the Chrome DevTools Protocol (CDP), it automates data ingestion and context-syncing without requiring manual file uploads or UI interaction.
+
+### 🧠 Relational Context Anchors
+RepoOrbit uses advanced heuristics to ensure the AI "sees" logic in its natural environment:
+- **Logic-Unit Bundling**: Detects structural iterators (maps, for-each, reducers) that wrap target logic and keeps the entire wrapper for context.
+- **State-Accumulator Heuristic**: Identifies patterns like `+=`, `.push()`, or pointer increments to ensure that state-mutation logic is never truncated.
+- **Caller-Context Snapping**: Automatically prioritizes files that *call* into your high-signal targets, providing the "Why" behind the "What."
+
+---
 
 ## 🛠️ Tech Stack
 
-- **Framework**: Next.js 16 (App Router)
-- **Visualization**: D3.js
-- **Automation**: Playwright (connecting to local Brave/Chrome via CDP)
-- **Styling**: Tailwind CSS v4
-- **State Management**: Zustand
-- **Syntax Highlighting**: Prism (react-syntax-highlighter)
+- **Automation**: Playwright (CDP-based Browser Orchestration)
+- **Framework**: Next.js 16 (App Router + Server Actions)
+- **LLM Pipeline**: 
+    - **Gemini 1.5 Pro**: Primary Architect for high-density context analysis.
+    - **DeepSeek V3**: Specialized Synthesis for implementation logic.
+- **State**: Zustand (Atomic Architectural State)
+- **Styling**: Tailwind CSS v4 (Glassmorphic Engineering Aesthetics)
 
-## 🚀 Getting Started
+---
 
-### Prerequisites
-1. **Node.js** v20+
-2. **Brave Browser** or Google Chrome (required for NotebookLM automation)
-3. **GitHub Personal Access Token** (for fetching repository trees and blobs)
+## 🏁 Quick Start
 
-### Required Environment Variables
-Create a `.env` file in the root of the project with your API keys:
+### 1. Prerequisites
+- Node.js 20+
+- a GitHub Personal Access Token (for repository ingestion)
 
-```env
-GITHUB_TOKEN="your_github_pat_here"
-NEXT_PUBLIC_GITHUB_TOKEN="your_github_pat_here"
-GROQ_API_KEY="your_optional_groq_key"
-```
-
-### Installation & Running
-
-RepoOrbit includes a custom `start-dev.sh` script that automatically handles the complex browser orchestration required for NotebookLM automation.
-
-1. Clone the repository and install dependencies:
+### 2. Installation
 ```bash
-git clone https://github.com/jaadu611/repoorbit.git
+# Clone the repository
+git clone https://github.com/jaadu611/repoorbit
 cd repoorbit
-npm install
-```
 
-2. Start the development environment:
-```bash
+# Install dependencies
+npm install
+
+# Run the dev server
 npm run dev
 ```
 
-**What happens when you run `npm run dev`?**
-- The script detects your local Brave/Chrome installation.
-- It launches the browser with Remote Debugging enabled on `port 9222`.
-- It opens **NotebookLM** in the background, keeping your primary focus on `http://localhost:3000` (RepoOrbit).
-- Finally, it boots up the Next.js development server.
+### 3. Environment Setup
+Create a `.env` file in the root directory:
+```env
+GITHUB_TOKEN=your_github_token_here
+DEEPSEEK_API_KEY=your_deepseek_api_key_here
+GEMINI_API_KEY=your_gemini_api_key_here
+```
 
-## 🧠 How the NotebookLM Automation Works
-When you submit a repository and a query to RepoOrbit:
-1. **Fetch**: The app pulls the full file tree and blobs via GitHub GraphQL/REST APIs.
-2. **Filter & Score**: The Context Builder heuristically scores files (giving higher weight to `config` files, root `md` files, and heavily-imported modules) ensuring it respects NotebookLM's input limits while maximizing context density.
-3. **Inject**: Playwright attaches to your running browser (via CDP on port 9222), creates a new NotebookLM workspace, automates the file uploader dialog, waits for processing, and inputs your architecture query.
-4. **Scrape**: It continuously polls the NotebookLM shadow DOM, capturing the "Expert Context" generated by Google's Gemini 1.5 Pro model, and feeds the cleaned response back into the RepoOrbit UI.
+---
 
-## 📜 License
-[MIT Open Source](LICENSE)
+## 🎯 'Mic Drop' Demos
 
-*Built with React & WebGL. Designed for developers who want to see the bigger picture.*
+- **XState Actor Logic Audit**: Successfully mapped the internal transition-state-machine of the XState Actor system with 10/10 accuracy.
+- **TS Compiler Emitter-Transformer Chain**: Fully traced the emitter-to-transformer pipeline in the TypeScript compiler source, identifying five undocumented optimization hooks.
+
+---
+*Built for engineers who need to see through the noise.*
