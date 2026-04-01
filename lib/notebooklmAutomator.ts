@@ -1,7 +1,6 @@
 import { Page } from "playwright";
 import path from "path";
 import fs from "fs";
-import { getArchitectPrompt } from "./prompts";
 
 const UI_JUNK_LABELS = [
   "keep_pin",
@@ -14,6 +13,60 @@ const UI_JUNK_LABELS = [
   "bookmark",
   "share",
 ];
+
+export interface NotebookEntry {
+  name: string;
+  sub_question: string;
+}
+
+export interface NotebookPlan {
+  notebooks?: NotebookEntry[];
+  direct_answer?: string;
+}
+
+// ─── Plan parsing ─────────────────────────────────────────────────────────────
+
+export function parseNotebookPlan(raw: string): NotebookPlan {
+  let clean = raw.trim();
+  const jsonMatch = clean.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    clean = jsonMatch[0];
+  }
+  try {
+    const obj = JSON.parse(clean);
+    return validatePlan(obj);
+  } catch (err: any) {
+    console.error("[NotebookLM Automator] Failed to parse JSON plan:", clean);
+    throw new Error(
+      `Failed to parse NotebookLM planner output: ${err.message}`,
+    );
+  }
+}
+
+function validatePlan(obj: unknown): NotebookPlan {
+  if (!obj || typeof obj !== "object") {
+    throw new Error("Invalid response: expected an object.");
+  }
+  const plan = obj as NotebookPlan;
+
+  if (plan.direct_answer && typeof plan.direct_answer === "string") {
+    return plan;
+  }
+
+  if (!Array.isArray(plan.notebooks)) {
+    throw new Error(
+      "Invalid NotebookPlan shape: expected { notebooks: [...] } or { direct_answer: '...' }",
+    );
+  }
+
+  if (plan.notebooks.length === 0) {
+    throw new Error("NotebookPlan has zero notebooks.");
+  }
+
+  return plan;
+}
+
+// ─── Text cleaning ────────────────────────────────────────────────────────────
 
 function cleanScrapedText(raw: string): string {
   const lines = raw.split("\n");
@@ -34,123 +87,304 @@ function cleanScrapedText(raw: string): string {
       const t = line.trim();
       if (UI_JUNK_LABELS.includes(t)) return false;
       if (/^[-*_]{3,}$/.test(t)) return false;
-      if (/^\d{1,2}$/.test(t)) return false;
-      if (/^[.,;:]{1,2}$/.test(t)) return false;
       return true;
     })
     .join("\n")
-    .replace(/(\S)\d{1,2}(\s)/g, "$1$2")
-    .replace(/(\S)\d{1,2}$/gm, "$1")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
-function extractPartial(rawText: string): string | null {
-  let partial = rawText;
+// ─── Source deletion helper ───────────────────────────────────────────────────
 
-  const hasStart = partial.includes("STARTOFANS");
-  const hasEnd = partial.includes("ENDOFANS");
+/**
+ * Attempts to delete a source from the currently open NotebookLM notebook by
+ * its display name (filename without extension, or full filename).
+ * Returns true if a deletion was performed.
+ */
+async function deleteSourceByName(
+  page: Page,
+  displayName: string,
+): Promise<boolean> {
+  // Try multiple selector strategies to find the source card
+  const cardSelectors = [
+    `.source-card:has-text("${displayName}")`,
+    `.source-item:has-text("${displayName}")`,
+    `[data-source-title="${displayName}"]`,
+    `li:has-text("${displayName}")`,
+  ];
 
-  if (hasStart) {
-    partial = partial.split("STARTOFANS")[1] || "";
+  for (const sel of cardSelectors) {
+    try {
+      const card = page.locator(sel).first();
+      if (!(await card.isVisible({ timeout: 3000 }).catch(() => false))) {
+        continue;
+      }
+
+      // Open the source's context/more menu
+      const menuBtnSelectors = [
+        'button[aria-label*="More options"]',
+        'button[aria-label*="More"]',
+        "button.more-button",
+        "button.overflow-menu",
+        '[aria-label*="options"]',
+      ];
+
+      let menuOpened = false;
+      for (const menuSel of menuBtnSelectors) {
+        const menuBtn = card.locator(menuSel).first();
+        if (await menuBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await menuBtn.click({ force: true });
+          await page.waitForTimeout(600);
+          menuOpened = true;
+          break;
+        }
+      }
+
+      if (!menuOpened) {
+        // Try right-clicking the card itself to get a context menu
+        await card.click({ button: "right", force: true });
+        await page.waitForTimeout(600);
+      }
+
+      // Click the Delete / Remove option in the menu
+      const deleteBtnSelectors = [
+        'button:has-text("Delete")',
+        '[role="menuitem"]:has-text("Delete")',
+        'button:has-text("Remove")',
+        '[role="menuitem"]:has-text("Remove")',
+      ];
+
+      let deleted = false;
+      for (const delSel of deleteBtnSelectors) {
+        const delBtn = page.locator(delSel).first();
+        if (await delBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+          await delBtn.click({ force: true });
+          await page.waitForTimeout(500);
+
+          // Handle confirmation dialog if one appears
+          const confirmSelectors = [
+            'button:has-text("Delete")',
+            'button:has-text("Remove")',
+            'button:has-text("Confirm")',
+            '[aria-label*="confirm"]',
+          ];
+          for (const confSel of confirmSelectors) {
+            const confBtn = page.locator(confSel).last();
+            if (await confBtn.isVisible({ timeout: 4000 }).catch(() => false)) {
+              await confBtn.click({ force: true });
+              await page.waitForTimeout(2500);
+              break;
+            }
+          }
+
+          deleted = true;
+          break;
+        }
+      }
+
+      if (deleted) {
+        return true;
+      }
+
+      // Close any open menu if delete wasn't found
+      await page.keyboard.press("Escape");
+      await page.waitForTimeout(300);
+    } catch (err: any) {
+      console.warn(
+        `[deleteSourceByName] Attempt with selector "${sel}" failed: ${err.message}`,
+      );
+    }
   }
-  if (hasEnd) {
-    partial = partial.split("ENDOFANS")[0];
-  }
 
-  partial = partial.trim();
-  return partial.length > 20 ? partial : null;
+  console.warn(
+    `[deleteSourceByName] Could not delete source: "${displayName}"`,
+  );
+  return false;
 }
+
+// ─── Main automator ───────────────────────────────────────────────────────────
 
 export async function automateNotebookLM(
   page: Page,
   files: string[],
-  query: string,
-  repoName: string,
+  subQuestion: string,
+  notebookTitle: string,
   onStatus?: (msg: string, partial?: string, progress?: number) => void,
+  isFinalStep = false,
+  /**
+   * Files whose existing source in the notebook MUST be deleted and re-uploaded.
+   * Used when the content of an already-uploaded file has changed (e.g. phase2_insights.txt
+   * after a gap fill has been appended to it).
+   */
+  forceReplace?: string[],
 ): Promise<string> {
-  const notebookTitle = `@RepoOrbit: ${repoName}`;
+  // ── Ensure we are on the NotebookLM homepage ─────────────────────────────
   let url = page.url();
+  if (!url.includes("notebooklm.google.com")) {
+    onStatus?.("Navigating to NotebookLM...");
+    await page.goto("https://notebooklm.google.com/", {
+      waitUntil: "domcontentloaded",
+      timeout: 45000,
+    });
+    await page.waitForTimeout(2000);
+    url = page.url();
+  }
 
   if (url.includes("/notebook/")) {
-    await page.waitForTimeout(1000);
-    const currentTitle = await page.title();
-    if (!currentTitle.includes(notebookTitle)) {
-      onStatus?.("Switching notebooks...");
-      await page.goto("https://notebooklm.google.com/", {
-        waitUntil: "domcontentloaded",
-        timeout: 45000,
-      });
-      url = page.url();
+    onStatus?.("Switching to homepage...");
+    await page.goto("https://notebooklm.google.com/", {
+      waitUntil: "domcontentloaded",
+      timeout: 45000,
+    });
+    await page.waitForTimeout(2000);
+  }
+
+  onStatus?.("Connecting to NotebookLM...");
+
+  const notebookNamePart = notebookTitle.split(" - ")[1] || notebookTitle;
+  let notebookFound = false;
+
+  // ── Try to find an existing notebook with this title ─────────────────────
+  const matchHandle = await page.evaluateHandle(
+    ({ title, namePart }) => {
+      const candidates = Array.from(
+        document.querySelectorAll(
+          "mat-card, [role='button'], a[href*='notebook'], .notebook-card, div.title, span.title",
+        ),
+      );
+      return (
+        candidates.find((el) => {
+          const text = (el as HTMLElement).innerText?.trim() || "";
+          return text === title;
+        }) || null
+      );
+    },
+    { title: notebookTitle, namePart: notebookNamePart },
+  );
+
+  const matchedElement = matchHandle.asElement();
+  if (matchedElement) {
+    const isLink = await matchedElement.evaluate(
+      (el) => el.tagName.toLowerCase() === "a",
+    );
+    if (isLink) {
+      const href = await matchedElement.evaluate(
+        (el) => (el as HTMLAnchorElement).href,
+      );
+      if (href) {
+        onStatus?.("Opening existing notebook...");
+        await page.goto(href, {
+          waitUntil: "domcontentloaded",
+          timeout: 20000,
+        });
+        notebookFound = true;
+      }
+    }
+
+    if (!notebookFound) {
+      onStatus?.("Opening existing notebook...");
+      await matchedElement.click({ force: true });
       await page.waitForTimeout(2000);
+      try {
+        await page.waitForURL((u) => u.href.includes("/notebook/"), {
+          timeout: 15000,
+        });
+      } catch (_) {}
+      notebookFound = true;
     }
   }
 
-  if (!url.includes("/notebook/")) {
-    onStatus?.("Connecting to NotebookLM...");
-    const notebookBtn = page
+  // ── Create new notebook if not found ─────────────────────────────────────
+  if (!notebookFound) {
+    onStatus?.("Creating new notebook...");
+    const createBtn = page
       .locator(
-        `div[role="button"]:has-text("${notebookTitle}"), mat-card:has-text("${notebookTitle}")`,
+        'button.create-new-button, [aria-label*="Create new notebook"], [aria-label*="New notebook"], .create-new-action-button, div:has-text("New notebook") > mat-icon, span:has-text("New notebook")',
+      )
+      .first();
+    await createBtn.waitFor({ state: "visible", timeout: 20000 });
+    await createBtn.click({ force: true });
+
+    await page.waitForURL((u) => u.href.includes("/notebook/"), {
+      timeout: 30000,
+    });
+    await page.waitForTimeout(3000);
+
+    // Rename notebook
+    const titleEditTrigger = page
+      .locator(
+        '[aria-label*="Rename notebook"], .notebook-title-edit, span:has-text("Untitled notebook"), h2:has-text("Untitled notebook")',
       )
       .first();
 
-    if (await notebookBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-      onStatus?.("Opening existing notebook...");
-      await notebookBtn.click({ force: true });
-    } else {
-      onStatus?.("Creating new notebook...");
-      const createBtn = page
-        .locator(
-          'button.create-new-button, [aria-label*="Create new notebook"], .create-new-action-button',
-        )
-        .first();
-      await createBtn.waitFor({ state: "visible", timeout: 20000 });
-      await createBtn.click({ force: true });
+    if (await titleEditTrigger.isVisible().catch(() => false)) {
+      await titleEditTrigger.click({ force: true });
+      await page.waitForTimeout(500);
+    }
 
-      await page.waitForURL((u) => u.href.includes("/notebook/"), {
-        timeout: 30000,
-      });
-      await page.waitForTimeout(3000);
+    const titleInput = page
+      .locator(
+        'input[aria-label*="title"], input.title-input, textarea.title-input, input[value="Untitled notebook"]',
+      )
+      .first();
 
-      const titleEditTrigger = page
-        .locator(
-          '[aria-label*="Rename notebook"], .notebook-title-edit, span:has-text("Untitled notebook"), h2:has-text("Untitled notebook")',
-        )
-        .first();
+    if (await titleInput.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await titleInput.fill(notebookTitle);
+      await page.keyboard.press("Enter");
+      await page.waitForTimeout(1000);
+    }
+  }
 
-      if (await titleEditTrigger.isVisible().catch(() => false)) {
-        await titleEditTrigger.click({ force: true });
-        await page.waitForTimeout(500);
+  // Wait for the notebook to fully load
+  await page.waitForTimeout(3000);
+
+  // ── Force-replace specified sources BEFORE checking what needs uploading ──
+  if (forceReplace && forceReplace.length > 0) {
+    for (const fileToReplace of forceReplace) {
+      const baseName = path.basename(fileToReplace);
+      const baseNoExt = baseName.replace(/\.txt$/i, "");
+
+      onStatus?.(`Removing outdated source: ${baseName}...`);
+
+      // Try both with and without extension as the display name may differ
+      let deleted = await deleteSourceByName(page, baseName);
+      if (!deleted) {
+        deleted = await deleteSourceByName(page, baseNoExt);
       }
 
-      const titleInput = page
-        .locator(
-          'input[aria-label*="title"], input.title-input, textarea.title-input, input[value="Untitled notebook"]',
-        )
-        .first();
-
-      if (await titleInput.isVisible({ timeout: 5000 }).catch(() => false)) {
-        await titleInput.fill(notebookTitle);
-        await page.keyboard.press("Enter");
-        await page.waitForTimeout(1000);
+      if (deleted) {
+        // Give the UI a moment to settle after deletion
+        await page.waitForTimeout(2000);
+      } else {
+        console.warn(
+          `[automateNotebookLM] Could not delete "${baseName}" — will attempt to upload anyway (duplicate may result).`,
+        );
       }
     }
   }
 
-  onStatus?.("Checking existing sources...");
-  await page.waitForTimeout(2000);
+  // ── Determine which files still need uploading ────────────────────────────
   const domHTML = await page.evaluate(() => document.body.innerText || "");
 
   const filesToUpload = files.filter((file) => {
     const baseName = path.basename(file);
-    const baseNoExt = baseName.replace(".txt", "");
+    const baseNoExt = baseName.replace(/\.txt$/i, "");
+
+    // If this file was force-replaced, always re-upload
+    if (forceReplace?.some((f) => path.basename(f) === baseName)) {
+      return true;
+    }
+
+    // Otherwise skip if it already appears in the notebook UI
     return !domHTML.includes(baseName) && !domHTML.includes(baseNoExt);
   });
 
+  // ── Upload files in batches ───────────────────────────────────────────────
   if (filesToUpload.length > 0) {
     onStatus?.(
       `Syncing ${filesToUpload.length} context file${filesToUpload.length !== 1 ? "s" : ""}...`,
     );
+
     const uploadIconBtnSelector =
       'button.drop-zone-icon-button, button:has-text("Upload files"), [aria-label*="Upload files"]';
 
@@ -164,9 +398,8 @@ export async function automateNotebookLM(
     for (const file of filesToUpload) {
       let fileSize = 0;
       try {
-        const stats = fs.statSync(file);
-        fileSize = stats.size;
-      } catch (e) {}
+        fileSize = fs.statSync(file).size;
+      } catch (_) {}
 
       if (
         currentBatch.length > 0 &&
@@ -177,21 +410,19 @@ export async function automateNotebookLM(
         currentBatch = [];
         currentBatchSizeBytes = 0;
       }
-
       currentBatch.push(file);
       currentBatchSizeBytes += fileSize;
     }
-    if (currentBatch.length > 0) {
-      batches.push(currentBatch);
-    }
+    if (currentBatch.length > 0) batches.push(currentBatch);
 
     let uploadedCount = 0;
+
     for (const batch of batches) {
       if (batch.length === 0) continue;
 
+      // Ensure the upload modal / panel is open
       const uploadIconBtn = page.locator(uploadIconBtnSelector).first();
-      let isModalOpen = await uploadIconBtn.isVisible().catch(() => false);
-
+      const isModalOpen = await uploadIconBtn.isVisible().catch(() => false);
       if (!isModalOpen) {
         const addSourceBtn = page
           .locator(
@@ -206,17 +437,15 @@ export async function automateNotebookLM(
         }
       }
 
-      // Retry file chooser if it times out or fails (NotebookLM processing might block UI)
       let fileChooserSuccess = false;
-      let retries = 15; // Increased retries for heavy processing
+      let retries = 15;
+
       while (!fileChooserSuccess && retries > 0) {
         try {
-          // Ensure button is ready
           await uploadIconBtn.waitFor({ state: "visible", timeout: 5000 });
           await uploadIconBtn.scrollIntoViewIfNeeded();
-          await page.waitForTimeout(400); // Wait for animations to settle
+          await page.waitForTimeout(400);
 
-          // Attempt to trigger the file chooser
           const [fileChooser] = await Promise.all([
             page.waitForEvent("filechooser", { timeout: 20000 }),
             uploadIconBtn.click({ force: true, delay: 100 }),
@@ -229,29 +458,27 @@ export async function automateNotebookLM(
             fileChooserSuccess = true;
           } catch (err: any) {
             if (err.message.includes("transfer files larger than 50Mb")) {
-              console.log("[NotebookLM automator] Hit 50MB limit on CDP. Bypassing via native CDP command...");
               try {
-                // If it's a remote connection over CDP to localhost, we can tell 
-                // the browser to just read the local paths directly using the native CDP protocol.
                 const client = await page.context().newCDPSession(page);
                 const { root } = await client.send("DOM.getDocument");
                 const { nodeId } = await client.send("DOM.querySelector", {
                   nodeId: root.nodeId,
-                  selector: "input[type=\"file\"]"
+                  selector: 'input[type="file"]',
                 });
                 if (nodeId) {
                   await client.send("DOM.setFileInputFiles", {
                     files: batch,
-                    nodeId
+                    nodeId,
                   });
                   fileChooserSuccess = true;
-                  console.log("[NotebookLM automator] Native CDP bypass successful.");
                 } else {
-                  throw new Error("Could not find file input element via native CDP.");
+                  throw new Error(
+                    "Could not find file input element via native CDP.",
+                  );
                 }
               } catch (cdpErr: any) {
-                console.error(`[NotebookLM automator] Native CDP bypass failed: ${cdpErr.message}`);
-                throw err; // Re-throw original upload error
+                console.error(`Native CDP bypass failed: ${cdpErr.message}`);
+                throw err;
               }
             } else {
               throw err;
@@ -261,17 +488,12 @@ export async function automateNotebookLM(
           retries--;
           await page.waitForTimeout(4000);
           console.warn(
-            `[NotebookLM automator] fileChooser attempt failed: ${err.message}. Retrying... (${retries} left)`,
+            `fileChooser attempt failed: ${err.message}. Retrying... (${retries} left)`,
           );
-
-          // If button is gone but we didn't succeed, the modal might have closed
           const stillVisible = await uploadIconBtn
             .isVisible()
             .catch(() => false);
           if (!stillVisible) {
-            console.log(
-              "[NotebookLM automator] Modal closed unexpectedly. Re-opening...",
-            );
             const addSourceBtn = page
               .locator(
                 '.add-source-button, [aria-label="Add source"], button:has-text("Add source")',
@@ -286,15 +508,8 @@ export async function automateNotebookLM(
       }
 
       if (!fileChooserSuccess) {
-        console.warn(
-          "[NotebookLM automator] Unable to trigger file upload dialog after multiple attempts. Likely hit NotebookLM's 50-source limit. Proceeding with currently uploaded sources...",
-        );
-        onStatus?.(
-          `Hit source limit. Proceeding with ${uploadedCount} files...`,
-          undefined,
-          Math.round((uploadedCount / filesToUpload.length) * 100),
-        );
-        break; // Break the batch loop gracefully
+        console.warn("Unable to trigger file upload dialog. Proceeding...");
+        break;
       }
 
       uploadedCount += batch.length;
@@ -303,8 +518,6 @@ export async function automateNotebookLM(
         undefined,
         Math.round((uploadedCount / filesToUpload.length) * 100),
       );
-
-      // reduced wait for fast batches
       await page.waitForTimeout(2000);
     }
 
@@ -315,11 +528,11 @@ export async function automateNotebookLM(
     if (await closeBtn.isVisible().catch(() => false)) {
       await closeBtn.click({ force: true });
     }
-    await page.waitForTimeout(4000);
+    await page.waitForTimeout(15000);
   }
 
-  onStatus?.("Dispatching query...");
-  const architectPrompt = getArchitectPrompt(query);
+  // ── Ask the sub-question ──────────────────────────────────────────────────
+  onStatus?.("Dispatching sub-question...");
 
   const existingResponseSnapshotSnippet: string[] = await page.evaluate(`
     (() => {
@@ -334,7 +547,7 @@ export async function automateNotebookLM(
       const containers = actionButtons
         .map((btn) => btn.closest(".message-content, .model-response, .response-bubble, div"))
         .filter(Boolean);
-      const aiContainers = findDeep('div:has(> button[aria-label*="Copy"]), div:has(> button[aria-label*="Save"]), .model-response');
+      const aiContainers = findDeep('div:has(> button[aria-label*="Copy"]), div:has(> button[aria-label*="Save"]), .model-response, [class*="markdown"], [class*="response-text"]');
       const all = [...new Set([...aiContainers, ...containers])];
       return all.map((el) => el.innerText.trim().substring(0, 200));
     })()
@@ -343,7 +556,7 @@ export async function automateNotebookLM(
   const inputSelector =
     'textarea[placeholder*="Ask"], .chat-input textarea, textarea[aria-label*="Query"]';
   await page.waitForSelector(inputSelector, { timeout: 30000 });
-  await page.fill(inputSelector, architectPrompt);
+  await page.fill(inputSelector, subQuestion);
   await page.keyboard.press("Enter");
 
   onStatus?.("Waiting for AI to respond...");
@@ -375,7 +588,7 @@ export async function automateNotebookLM(
           .map((btn) => btn.closest(".message-content, .model-response, .response-bubble, div"))
           .filter((b) => b !== null);
 
-        const aiResponseContainers = findElementsDeep('div:has(> button[aria-label*="Copy"]), div:has(> button[aria-label*="Save"]), .model-response');
+        const aiResponseContainers = findElementsDeep('div:has(> button[aria-label*="Copy"]), div:has(> button[aria-label*="Save"]), .model-response, [class*="markdown"], [class*="response-text"]');
 
         const candidates = [...new Set([...aiResponseContainers, ...bubblesWithButtons])];
 
@@ -397,18 +610,9 @@ export async function automateNotebookLM(
 
     if (candidate) {
       const rawText = candidate.text;
-      const hasEnd = rawText.includes("ENDOFANS");
 
-      const partial = extractPartial(rawText);
-
-      if (hasEnd) {
-        const finalText = partial ?? cleanScrapedText(rawText);
-        onStatus?.("Capturing final response...", finalText);
-        return cleanScrapedText(finalText);
-      }
-
-      if (partial) {
-        onStatus?.("Generating...", partial);
+      if (isFinalStep) {
+        onStatus?.("Generating...", rawText);
       } else {
         onStatus?.("Synthesizing response...");
       }
@@ -417,7 +621,7 @@ export async function automateNotebookLM(
       if (currentLength === lastSeenLength && !candidate.isGenerating) {
         stableCount++;
         if (stableCount >= STABLE_POLLS_NEEDED) {
-          return cleanScrapedText(partial ?? rawText);
+          return cleanScrapedText(rawText);
         }
       } else {
         stableCount = 0;
