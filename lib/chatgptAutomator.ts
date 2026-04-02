@@ -58,6 +58,50 @@ export async function automateChatGPT(
       if (!result.isGenerating && result.text === lastText && result.text.length > 100) {
         stableCount++;
         if (stableCount >= STABLE_POLLS_NEEDED) {
+          try {
+            await page.bringToFront();
+            await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+            
+            const clickSuccess = await page.evaluate(() => {
+              const messages = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
+              if (messages.length > 0) {
+                const lastMessage = messages[messages.length - 1];
+                function findElementsDeep(selector: string, root: Document | DocumentFragment | Element = document): Element[] {
+                  let els = Array.from(root.querySelectorAll(selector));
+                  for (const el of Array.from(root.querySelectorAll('*'))) {
+                    if (el.shadowRoot) els = els.concat(findElementsDeep(selector, el.shadowRoot));
+                  }
+                  return els;
+                }
+                const copyBtns = findElementsDeep('button[aria-label*="Copy"]', lastMessage) as HTMLElement[];
+                if (copyBtns.length > 0) {
+                  copyBtns[copyBtns.length - 1].click();
+                  return true;
+                }
+              }
+              return false;
+            });
+            
+            if (clickSuccess) {
+              await page.waitForTimeout(600); // Give UI time to push to clipboard
+              const clipboardText = await page.evaluate(async () => {
+                try {
+                  return await navigator.clipboard.readText();
+                } catch (e: any) {
+                  return "ERROR: " + e.message;
+                }
+              });
+              
+              if (clipboardText && clipboardText.startsWith("ERROR: ")) {
+                 console.warn("[ChatGPT Automator] Clipboard API failed:", clipboardText);
+              } else if (clipboardText && clipboardText.length > 50) {
+                return clipboardText.trim();
+              }
+            }
+          } catch (err: any) {
+            console.warn("[ChatGPT Automator] Clipboard copy error, falling back to scraped text:", err.message);
+          }
+          
           return result.text;
         }
       } else {

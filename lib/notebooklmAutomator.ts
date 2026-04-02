@@ -16,14 +16,20 @@ const UI_JUNK_LABELS = [
 
 import { NotebookEntry, NotebookPlan } from "@/lib/types";
 
-// ─── Plan parsing ─────────────────────────────────────────────────────────────
-
 export function parseNotebookPlan(raw: string): NotebookPlan {
   let clean = raw.trim();
   const jsonMatch = clean.match(/\{[\s\S]*\}/);
   if (jsonMatch) {
     clean = jsonMatch[0];
   }
+  
+  // Strip control characters (including literal newlines/tabs inside strings) 
+  // that would otherwise break JSON.parse.
+  clean = clean.replace(/[\x00-\x1F]+/g, " ");
+
+  // Strip // comments that LLMs sometimes leak into their JSON output
+  clean = clean.replace(/\/\/.*$/gm, "");
+
   try {
     const obj = JSON.parse(clean);
     return validatePlan(obj);
@@ -39,7 +45,7 @@ function validatePlan(obj: unknown): NotebookPlan {
   if (!obj || typeof obj !== "object") {
     throw new Error("Invalid response: expected an object.");
   }
-  const plan = obj as NotebookPlan;
+  const plan = obj as any;
 
   if (plan.direct_answer && typeof plan.direct_answer === "string") {
     return plan;
@@ -218,7 +224,7 @@ export async function automateNotebookLM(
       waitUntil: "domcontentloaded",
       timeout: 45000,
     });
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(500);
     url = page.url();
   }
 
@@ -228,7 +234,7 @@ export async function automateNotebookLM(
       waitUntil: "domcontentloaded",
       timeout: 45000,
     });
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(500);
   }
 
   onStatus?.("Connecting to NotebookLM...");
@@ -276,7 +282,7 @@ export async function automateNotebookLM(
     if (!notebookFound) {
       onStatus?.("Opening existing notebook...");
       await matchedElement.click({ force: true });
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(1000);
       try {
         await page.waitForURL((u) => u.href.includes("/notebook/"), {
           timeout: 15000,
@@ -300,7 +306,7 @@ export async function automateNotebookLM(
     await page.waitForURL((u) => u.href.includes("/notebook/"), {
       timeout: 30000,
     });
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(1500);
 
     // Rename notebook
     const titleEditTrigger = page
@@ -311,7 +317,7 @@ export async function automateNotebookLM(
 
     if (await titleEditTrigger.isVisible().catch(() => false)) {
       await titleEditTrigger.click({ force: true });
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(200);
     }
 
     const titleInput = page
@@ -323,12 +329,12 @@ export async function automateNotebookLM(
     if (await titleInput.isVisible({ timeout: 5000 }).catch(() => false)) {
       await titleInput.fill(notebookTitle);
       await page.keyboard.press("Enter");
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(300);
     }
   }
 
   // Wait for the notebook to fully load
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(1000);
 
   // ── Force-replace specified sources BEFORE checking what needs uploading ──
   if (forceReplace && forceReplace.length > 0) {
@@ -346,7 +352,7 @@ export async function automateNotebookLM(
 
       if (deleted) {
         // Give the UI a moment to settle after deletion
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(800);
       } else {
         console.warn(
           `[automateNotebookLM] Could not delete "${baseName}" — will attempt to upload anyway (duplicate may result).`,
@@ -425,7 +431,7 @@ export async function automateNotebookLM(
           await addSourceBtn.isVisible({ timeout: 10000 }).catch(() => false)
         ) {
           await addSourceBtn.click({ force: true });
-          await page.waitForTimeout(2000);
+          await page.waitForTimeout(800);
         }
       }
 
@@ -436,14 +442,14 @@ export async function automateNotebookLM(
         try {
           await uploadIconBtn.waitFor({ state: "visible", timeout: 5000 });
           await uploadIconBtn.scrollIntoViewIfNeeded();
-          await page.waitForTimeout(400);
+          await page.waitForTimeout(200);
 
           const [fileChooser] = await Promise.all([
             page.waitForEvent("filechooser", { timeout: 20000 }),
             uploadIconBtn.click({ force: true, delay: 100 }),
           ]);
 
-          await page.waitForTimeout(500);
+          await page.waitForTimeout(200);
 
           try {
             await fileChooser.setFiles(batch);
@@ -478,7 +484,7 @@ export async function automateNotebookLM(
           }
         } catch (err: any) {
           retries--;
-          await page.waitForTimeout(4000);
+          await page.waitForTimeout(2000);
           console.warn(
             `fileChooser attempt failed: ${err.message}. Retrying... (${retries} left)`,
           );
@@ -493,7 +499,7 @@ export async function automateNotebookLM(
               .first();
             if (await addSourceBtn.isVisible().catch(() => false)) {
               await addSourceBtn.click({ force: true });
-              await page.waitForTimeout(3000);
+              await page.waitForTimeout(1500);
             }
           }
         }
@@ -510,7 +516,7 @@ export async function automateNotebookLM(
         undefined,
         Math.round((uploadedCount / filesToUpload.length) * 100),
       );
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(800);
     }
 
     onStatus?.("Processing uploaded sources...");
@@ -520,7 +526,41 @@ export async function automateNotebookLM(
     if (await closeBtn.isVisible().catch(() => false)) {
       await closeBtn.click({ force: true });
     }
-    await page.waitForTimeout(15000);
+    // Dynamic wait for all files to be processed
+    const startWait = Date.now();
+    let allProcessed = false;
+    
+    onStatus?.("Waiting for UI to render uploaded sources...");
+    while (Date.now() - startWait < 90000) { // Max 90 seconds wait
+      const currentDom = await page.evaluate(() => document.body.innerText || "");
+      allProcessed = true;
+      for (const file of files) {
+        const baseName = path.basename(file);
+        const baseNoExt = baseName.replace(/\.txt$/i, "");
+        if (!currentDom.includes(baseName) && !currentDom.includes(baseNoExt)) {
+          allProcessed = false;
+          break;
+        }
+      }
+      
+      // Also check that NotebookLM doesn't show general "Uploading..." status
+      const isUploading = await page.evaluate(() => {
+        const text = document.body.innerText || "";
+        return text.includes("Uploading") || document.querySelectorAll('mat-progress-spinner, [role="progressbar"]').length > 0;
+      });
+
+      if (allProcessed && !isUploading) {
+        break;
+      }
+      await page.waitForTimeout(800);
+    }
+    
+    if (!allProcessed) {
+       console.warn("[NotebookLM Automator] Timed out waiting for all files to visually appear in UI!");
+    } else {
+       // Extra buffer to let background operations finish
+       await page.waitForTimeout(1000);
+    }
   }
 
   // ── Ask the sub-question ──────────────────────────────────────────────────
@@ -613,6 +653,51 @@ export async function automateNotebookLM(
       if (currentLength === lastSeenLength && !candidate.isGenerating) {
         stableCount++;
         if (stableCount >= STABLE_POLLS_NEEDED) {
+          try {
+            await page.bringToFront();
+            await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+            const clickSuccess = await page.evaluate(() => {
+              function findElementsDeep(selector: string, root: Document | DocumentFragment | Element = document): Element[] {
+                let els = Array.from(root.querySelectorAll(selector));
+                for (const el of Array.from(root.querySelectorAll('*'))) {
+                  if (el.shadowRoot) els = els.concat(findElementsDeep(selector, el.shadowRoot));
+                }
+                return els;
+              }
+              const potentialBtns = findElementsDeep('button') as HTMLElement[];
+              const btns = potentialBtns.filter(b => {
+                 const label = (b.getAttribute('aria-label') || '').toLowerCase();
+                 const text = b.innerText.toLowerCase();
+                 return label.includes('copy') || text.includes('copy_all') || text.includes('content_copy');
+              });
+              if (btns.length > 0) {
+                // Click the last copy button found, representing the latest response
+                btns[btns.length - 1].click();
+                return true;
+              }
+              return false;
+            });
+            
+            if (clickSuccess) {
+              await page.waitForTimeout(300); // Give UI time to push to clipboard
+              const clipboardText = await page.evaluate(async () => {
+                try {
+                  return await navigator.clipboard.readText();
+                } catch (e: any) {
+                  return "ERROR: " + e.message;
+                }
+              });
+              
+              if (clipboardText && clipboardText.startsWith("ERROR: ")) {
+                 console.warn("[NotebookLM Automator] Clipboard API failed:", clipboardText);
+              } else if (clipboardText && clipboardText.length > 50) {
+                return clipboardText.trim();
+              }
+            }
+          } catch (err: any) {
+            console.warn("[NotebookLM Automator] Clipboard copy error, falling back to scraped text:", err.message);
+          }
+          
           return cleanScrapedText(rawText);
         }
       } else {
@@ -621,8 +706,11 @@ export async function automateNotebookLM(
       }
     }
 
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(500);
   }
 
   throw new Error("Analysis timeout (5m)");
 }
+
+
+

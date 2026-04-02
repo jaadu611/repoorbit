@@ -481,12 +481,15 @@ export interface SelectionStore {
 
 export interface NotebookEntry {
   name: string;
+  covers?: string[];
+  reason?: string;
   sub_question: string;
 }
 
 export interface NotebookPlan {
   notebooks?: NotebookEntry[];
   direct_answer?: string;
+  include_meta?: boolean;
 }
 
 export interface JobStatus {
@@ -496,6 +499,7 @@ export interface JobStatus {
   error?: string;
   statusText?: string;
   progress?: number;
+  answerSource?: "planner" | "final" | "chatgpt";
 }
 
 export interface LightFileMetadata {
@@ -534,8 +538,35 @@ export interface GapSearchResult {
   reason: string;
 }
 
-export type RepoLanguage = "c" | "web" | "go" | "rust" | "python" | "java" | "mixed";
-
+export type RepoLanguage =
+  | "c"
+  | "cpp"
+  | "go"
+  | "rust"
+  | "python"
+  | "java"
+  | "ruby"
+  | "c_sharp"
+  | "php"
+  | "swift"
+  | "kotlin"
+  | "dart"
+  | "shell"
+  | "mixed"
+  | "typescript"
+  | "javascript"
+  | "scala"
+  | "haskell"
+  | "elixir"
+  | "clojure"
+  | "perl"
+  | "r"
+  | "julia"
+  | "objective_c"
+  | "fortran"
+  | "assembly"
+  | "lua"
+  | "groovy";
 export type ImportRole = "Entry Point" | `Depth ${number}` | "Utility";
 
 export type QueryIntent =

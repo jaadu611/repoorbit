@@ -2,7 +2,6 @@ import { mkdirSync } from "fs";
 import { writeFile, readFile } from "fs/promises";
 import { join } from "path";
 
-const IMPORT_DEPTH = 99999;
 const FILE_CHAR_LIMIT = 100_000;
 const SPLIT_THRESHOLD_CHARS = 3_000;
 const MIN_RELEVANCE_SCORE_GENERIC = 3;
@@ -14,13 +13,11 @@ import {
   QueryIntent,
   CodeFocus,
   FunctionBlock,
-  ScoredFile,
   Block,
   ExpertPlan,
   SymbolExtraction,
   BidirectionalGraph,
 } from "@/lib/types";
-
 
 function detectRepoLanguage(filesMetadata: any[]): RepoLanguage {
   const extCounts: Record<string, number> = {};
@@ -31,16 +28,37 @@ function detectRepoLanguage(filesMetadata: any[]): RepoLanguage {
   const total = filesMetadata.length || 1;
   const pct = (ext: string) => ((extCounts[ext] ?? 0) / total) * 100;
 
+  if (pct("cpp") + pct("cc") + pct("cxx") > 15) return "cpp";
   if (pct("c") + pct("h") > 20) return "c";
   if (pct("rs") > 15) return "rust";
   if (pct("go") > 15) return "go";
   if (pct("py") > 15) return "python";
-  if (pct("java") + pct("kt") > 15) return "java";
-  if (pct("ts") + pct("tsx") + pct("js") + pct("jsx") > 15) return "web";
+  if (pct("rb") > 15) return "ruby";
+  if (pct("cs") > 15) return "c_sharp";
+  if (pct("php") > 15) return "php";
+  if (pct("swift") > 15) return "swift";
+  if (pct("kt") > 15) return "kotlin";
+  if (pct("java") > 15) return "java";
+  if (pct("dart") > 15) return "dart";
+  if (pct("sh") + pct("bash") > 15) return "shell";
+  if (pct("ts") + pct("tsx") > 15) return "typescript";
+  if (pct("js") + pct("jsx") > 15) return "javascript";
+  if (pct("scala") > 15) return "scala";
+  if (pct("hs") > 15) return "haskell";
+  if (pct("ex") + pct("exs") > 15) return "elixir";
+  if (pct("clj") + pct("cljs") + pct("cljc") > 15) return "clojure";
+  if (pct("pl") + pct("pm") > 15) return "perl";
+  if (pct("r") > 15) return "r";
+  if (pct("jl") > 15) return "julia";
+  if (pct("m") + pct("mm") > 15) return "objective_c";
+  if (pct("f") + pct("f90") + pct("f95") > 15) return "fortran";
+  if (pct("s") + pct("asm") > 15) return "assembly";
+  if (pct("lua") > 15) return "lua";
+  if (pct("groovy") > 15) return "groovy";
   return "mixed";
 }
 
-const TIER2_WEB = new Set([
+const TIER2_JS = new Set([
   "ts",
   "tsx",
   "js",
@@ -75,15 +93,6 @@ const TIER2_SYSTEMS = new Set([
 ]);
 const KERNEL_CONFIG_EXTENSIONS = new Set(["Kconfig", "Makefile", "makefile"]);
 
-const TIER3_EXTENSIONS = new Set([
-  "md",
-  "mdx",
-  "rst",
-  "html",
-  "yaml",
-  "yml",
-  "toml",
-]);
 const TIER4_EXTENSIONS = new Set(["css", "scss", "sass", "less"]);
 
 const ROOT_CONFIG_NAMES = new Set([
@@ -136,15 +145,6 @@ const ROOT_CONFIG_NAMES = new Set([
   "cmakelists.txt",
   "meson.build",
   "build.ninja",
-]);
-
-const SOURCE_EXTENSIONS = new Set([
-  ...TIER2_WEB,
-  ...TIER2_SYSTEMS,
-  ...TIER3_EXTENSIONS,
-  ...TIER4_EXTENSIONS,
-  "json",
-  "toml",
 ]);
 
 const EXCLUDE_PATTERNS: RegExp[] = [
@@ -223,11 +223,6 @@ const STOP_WORDS = new Set([
   "renders",
   "works",
 ]);
-
-
-
-
-
 
 const LINUX_SUBSYSTEMS: Record<string, string> = {
   arch: "arch",
@@ -412,7 +407,6 @@ function extractQueryTokens(query: string): string[] {
 
 // ─── Symbol Extraction (BIG UPGRADE) ──────────────────────────────────────────
 
-
 function extractSymbols(content: string): SymbolExtraction {
   const defined = new Set<string>();
   const used = new Set<string>();
@@ -544,11 +538,6 @@ function clearSymbolIndex(): void {
 }
 
 // ─── Import Resolution ────────────────────────────────────────────────────────
-
-const EXTERNAL_PACKAGE_PATTERNS: RegExp[] = [
-  /^node:/,
-  /^[a-z@][a-z0-9\-_./@]*$/,
-];
 
 const STDLIB_MODULES = new Set([
   "fs",
@@ -756,7 +745,7 @@ function tryResolveExtension(
 ): string | null {
   if (repoFileSet.has(basePath)) return basePath;
   const candidates: string[] = [];
-  if (lang === "web" || lang === "mixed") {
+  if (lang === "typescript" || lang === "javascript" || lang === "mixed") {
     for (const ext of TS_EXTENSIONS) {
       candidates.push(`${basePath}.${ext}`);
       candidates.push(`${basePath}/index.${ext}`);
@@ -859,7 +848,6 @@ function parseRawImports(
 }
 
 // ─── Bidirectional Graph Construction ────────────────────────────────────────
-
 
 function buildBidirectionalGraph(
   filesMetadata: any[],
@@ -1292,13 +1280,13 @@ function selectFilesForQuery(
 function resolveImportDepths(
   seedPaths: string[],
   importGraph: Record<string, string[]>,
-  maxDepth: number,
 ): Map<string, number> {
   const depths = new Map<string, number>();
   for (const seed of seedPaths) depths.set(seed, 0);
   let frontier = [...seedPaths];
 
-  for (let depth = 1; depth <= maxDepth; depth++) {
+  let depth = 1;
+  while (frontier.length > 0) {
     const next: string[] = [];
     for (const p of frontier) {
       for (const dep of importGraph[p] ?? []) {
@@ -1309,7 +1297,7 @@ function resolveImportDepths(
       }
     }
     frontier = next;
-    if (!frontier.length) break;
+    depth++;
   }
   return depths;
 }
@@ -1322,7 +1310,7 @@ function importRoleLabel(depth: number | undefined): ImportRole {
 
 // ─── File tier ────────────────────────────────────────────────────────────────
 
-function fileTier(filePath: string, lang: RepoLanguage = "web"): number {
+function fileTier(filePath: string, lang: RepoLanguage = "typescript"): number {
   if (EXCLUDE_PATTERNS.some((re) => re.test(filePath))) return 0;
 
   const parts = filePath.split("/");
@@ -1350,7 +1338,7 @@ function fileTier(filePath: string, lang: RepoLanguage = "web"): number {
   if (isRoot || isShallowDoc || isKeyConfig || isGitHubWorkflow) return 1;
 
   if (
-    TIER2_WEB.has(extLower) ||
+    TIER2_JS.has(extLower) ||
     TIER2_SYSTEMS.has(ext) ||
     TIER2_SYSTEMS.has(extLower)
   )
@@ -1373,7 +1361,7 @@ function fileTier(filePath: string, lang: RepoLanguage = "web"): number {
   return 0;
 }
 
-function shouldInclude(filePath: string, lang: RepoLanguage = "web"): boolean {
+function shouldInclude(filePath: string, lang: RepoLanguage = "typescript"): boolean {
   return fileTier(filePath, lang) > 0;
 }
 
@@ -2486,7 +2474,7 @@ export async function buildMasterContext(
   dumpAll = true,
   aliases: Record<string, string> = {},
   kHopDepth: number = 2,
-): Promise<string> {
+): Promise<{ content: string; lang: RepoLanguage }> {
   clearKHopCache();
 
   const repoName = repoContext?.meta?.fullName?.split("/").pop() ?? "repo";
@@ -2686,7 +2674,6 @@ export async function buildMasterContext(
     const depthMap = resolveImportDepths(
       [...entryPoints, ...graphlessFiles],
       mergedImportGraph,
-      IMPORT_DEPTH,
     );
 
     if (dumpAll) {
@@ -2888,5 +2875,5 @@ export async function buildMasterContext(
   await writeFile(graphPath, JSON.stringify(finalGraph, null, 2), "utf-8");
 
   const rootManifestContent = await readFile(rootManifestPath, "utf-8");
-  return rootManifestContent;
+  return { content: rootManifestContent, lang };
 }

@@ -17,14 +17,13 @@ import {
 } from "@/lib/prompts";
 import { NextResponse } from "next/server";
 import { BrowserContext } from "playwright";
-
-import { JobStatus, NotebookPlan } from "@/lib/types";
+import { JobStatus, NotebookPlan, RepoLanguage } from "@/lib/types";
 
 export const CONTEXT_DIR_PATH = "/tmp/notebooklm_sources";
 export const NOTEBOOKLM_URL = "https://notebooklm.google.com/";
 
 const GLOBAL_JOBS_KEY = Symbol.for("repoorbit.playwright.jobs");
-export const activeJobs: Map<string, JobStatus> = 
+export const activeJobs: Map<string, JobStatus> =
   (global as any)[GLOBAL_JOBS_KEY] || new Map();
 (global as any)[GLOBAL_JOBS_KEY] = activeJobs;
 
@@ -33,6 +32,7 @@ async function processNotebookPlan(
   plan: NotebookPlan,
   baseDir: string,
   repoName: string,
+  lang?: RepoLanguage,
   onStatus?: (msg: string, partial?: string, progress?: number) => void,
 ): Promise<string> {
   const pages = context.pages();
@@ -91,13 +91,23 @@ async function processNotebookPlan(
 
     let answer = "";
     try {
-      const architectPrompt = getArchitectPrompt(nb.sub_question);
+      const architectPrompt = getArchitectPrompt(
+        nb.sub_question,
+        lang,
+        nb.reason,
+        nb.covers,
+      );
+      const queryPromptPath = path.join(notebookFolder, "QUERY_PROMPT.txt");
+      fs.writeFileSync(queryPromptPath, architectPrompt, "utf-8");
+
       answer = await automateNotebookLM(
         page,
-        orderedFiles,
-        architectPrompt,
+        [queryPromptPath, ...orderedFiles],
+        "Process the instructions in QUERY_PROMPT.txt",
         notebookTitle,
         onStatus,
+        false,
+        [queryPromptPath],
       );
     } catch (err: any) {
       answer = `[Error] ${err.message}`;
@@ -135,7 +145,12 @@ export async function POST(req: Request) {
     const outDir = path.join(CONTEXT_DIR_PATH, owner, repo);
     const gapNBPath = path.join(outDir, "gap_filler_NB.txt");
 
+    if (fs.existsSync(gapNBPath)) {
+      fs.unlinkSync(gapNBPath);
+    }
+
     const processJob = async () => {
+      let repoLang: RepoLanguage | undefined;
       try {
         const setStatus = (
           msg: string,
@@ -217,8 +232,7 @@ export async function POST(req: Request) {
             );
           });
 
-          const MAX_FILES = 3000;
-          const sortedFiles = coreFiles.slice(0, MAX_FILES);
+          const sortedFiles = coreFiles;
 
           const contents = await fetchFileContents(
             owner,
@@ -265,7 +279,7 @@ export async function POST(req: Request) {
           }
 
           setStatus("Chunking and structuring contexts...");
-          await buildMasterContext(
+          const { lang: detectedLang } = await buildMasterContext(
             query,
             metadata,
             importGraph,
@@ -274,6 +288,7 @@ export async function POST(req: Request) {
             outDir,
             true,
           );
+          repoLang = detectedLang;
         }
 
         setStatus("Consulting NotebookLM...");
@@ -287,19 +302,31 @@ export async function POST(req: Request) {
         if (!plannerPage) plannerPage = await context.newPage();
 
         const plannerPromptText = getNotebooklmPlannerPrompt(query);
+        const queryPromptPath = path.join(outDir, "QUERY_PROMPT.txt");
+        fs.writeFileSync(queryPromptPath, plannerPromptText, "utf-8");
+
         const rawPlanString = await automateNotebookLM(
           plannerPage,
-          [manifestPath, metaFilePath],
-          plannerPromptText,
+          [queryPromptPath, manifestPath, metaFilePath],
+          "Process the instructions in QUERY_PROMPT.txt",
           `@${repo} - [Planner]`,
           setStatus,
+          false,
+          [queryPromptPath],
         );
         const notebookPlan = parseNotebookPlan(rawPlanString);
 
         if (notebookPlan.direct_answer) {
+          // Replace triple-backtick code blocks with single backticks (inline code)
+          // so they don't take full-width, as requested by the user.
+          const cleanAnswer = notebookPlan.direct_answer
+            .replace(/```(?:[a-zA-Z]+)?\n([\s\S]*?)```/g, "`$1`")
+            .replace(/```/g, "`")
+            .trim();
           activeJobs.set(taskId, {
             status: "done",
-            result: notebookPlan.direct_answer,
+            result: cleanAnswer,
+            answerSource: "planner",
           });
           return;
         }
@@ -309,7 +336,8 @@ export async function POST(req: Request) {
           notebookPlan,
           outDir,
           repo,
-          setStatus,
+          repoLang,
+          (msg, part, prog) => setStatus(msg, part, prog),
         );
 
         setStatus("Running final phase 3 synthesis...");
@@ -336,7 +364,14 @@ export async function POST(req: Request) {
           }
         } catch (_) {}
 
-        fs.writeFileSync(insightsPath, roadmapHeader + currentInsights, "utf-8");
+        if (fs.existsSync(insightsPath)) {
+          fs.unlinkSync(insightsPath);
+        }
+        fs.writeFileSync(
+          insightsPath,
+          roadmapHeader + currentInsights,
+          "utf-8",
+        );
 
         for (let attempts = 0; attempts <= MAX_GAP_FILLS; attempts++) {
           const sourceFileRegex = /file_\d{3}_NB\d+\.txt/g;
@@ -357,8 +392,27 @@ export async function POST(req: Request) {
           }
           finalPhaseFiles.push(insightsPath);
           if (fs.existsSync(gapNBPath)) finalPhaseFiles.push(gapNBPath);
+          if (notebookPlan.include_meta && fs.existsSync(metaFilePath)) {
+            finalPhaseFiles.push(metaFilePath);
+          }
 
-          const finalPrompt = getFinalPhasePrompt(query, hasGapFilled);
+          // ── Write the full prompt as a source file so the chat input stays small ──
+          // NotebookLM has a hard character limit on the chat textarea. Embedding
+          // the full instruction set + user query into the uploaded sources lets us
+          // send a tiny trigger message instead of a multi-kilobyte string.
+          const finalPhasePrompt = getFinalPhasePrompt(
+            query,
+            repoLang,
+            hasGapFilled,
+          );
+          const queryPromptPath = path.join(outDir, "QUERY_PROMPT.txt");
+          fs.writeFileSync(queryPromptPath, finalPhasePrompt, "utf-8");
+          // Always force-replace so the gap-filled version is fresh each iteration
+          finalPhaseFiles.unshift(queryPromptPath);
+
+          const chatTrigger =
+            "Execute the full instructions from QUERY_PROMPT.txt. Output JSON only.";
+
           let page = context
             .pages()
             .find((p: any) => p.url()?.includes("notebooklm.google.com"));
@@ -367,11 +421,13 @@ export async function POST(req: Request) {
           const structuralJsonResult = await automateNotebookLM(
             page,
             finalPhaseFiles,
-            finalPrompt,
+            chatTrigger,
             finalNotebookTitle,
             setStatus,
             true,
-            hasGapFilled ? [insightsPath, gapNBPath] : undefined,
+            hasGapFilled
+              ? [insightsPath, gapNBPath, queryPromptPath]
+              : [queryPromptPath],
           );
 
           let parsedGap: any = null;
@@ -383,11 +439,20 @@ export async function POST(req: Request) {
             const start = jsonString.indexOf("{");
             const end = jsonString.lastIndexOf("}");
             if (start !== -1 && end !== -1 && end > start) {
-              const resultJson = JSON.parse(jsonString.slice(start, end + 1));
+              const cleanedJson = jsonString
+                .slice(start, end + 1)
+                .replace(/[\x00-\x1F]+/g, " ");
+              const resultJson = JSON.parse(cleanedJson);
+
               if (resultJson.status === "MISSING_CONTEXT")
                 parsedGap = resultJson;
             }
-          } catch (_) {}
+          } catch (parseErr: any) {
+            console.warn(
+              `[FINAL-PHASE] JSON parse failed on attempt ${attempts}:`,
+              parseErr.message,
+            );
+          }
 
           if (!parsedGap || attempts >= MAX_GAP_FILLS) {
             let finalResult = structuralJsonResult;
@@ -395,35 +460,126 @@ export async function POST(req: Request) {
             // Optional: Connect ChatGPT Automator for high-level architectural manual
             try {
               if (structuralJsonResult.trim().startsWith("{")) {
-                setStatus("Requesting Staff-Level Engineering Manual from ChatGPT...");
-                const chatgptPrompt = getStaffEngineerPrompt(query, structuralJsonResult);
-                
-                let chatPage = context.pages().find((p: any) => p.url()?.includes("chatgpt.com"));
+                setStatus(
+                  "Requesting Staff-Level Engineering Manual from ChatGPT...",
+                );
+                const chatgptPrompt = getStaffEngineerPrompt(
+                  query,
+                  structuralJsonResult,
+                );
+
+                let chatPage = context
+                  .pages()
+                  .find((p: any) => p.url()?.includes("chatgpt.com"));
                 if (!chatPage) chatPage = await context.newPage();
-                
-                const manual = await automateChatGPT(chatPage, chatgptPrompt, (msg) => setStatus(`[ChatGPT] ${msg}`));
-                finalResult = `## 📐 Staff-Level Engineering Manual\n\n${manual}\n\n---\n\n## 🛠️ Structural JSON Context (Path A)\n\n${structuralJsonResult}`;
+
+                const manual = await automateChatGPT(
+                  chatPage,
+                  chatgptPrompt,
+                  (msg) => setStatus(`[ChatGPT] ${msg}`),
+                );
+                finalResult = manual;
               }
             } catch (chatgptErr: any) {
-              console.warn("[ChatGPT Automator] Failed to generate manual:", chatgptErr.message);
-              // Fallback to original result if ChatGPT fails
+              console.warn(
+                "[ChatGPT Automator] Failed to generate manual:",
+                chatgptErr.message,
+              );
             }
 
-            activeJobs.set(taskId, { status: "done", result: finalResult });
+            activeJobs.set(taskId, {
+              status: "done",
+              result: finalResult,
+              answerSource: "final",
+            });
             return;
           }
 
-          const { target_symbol, target_file } = parsedGap.missing_link;
-          setStatus(`Gap detected: ${target_symbol}. Scouting sources...`);
+          const { target_symbol, target_file, search_keywords } =
+            parsedGap.missing_link;
 
-          const { gapSourceFiles, gapAnalysisBundle } =
-            generateGapFillerNotebook(outDir, target_symbol, target_file);
+          const gapKeywords: string[] = Array.isArray(search_keywords)
+            ? search_keywords
+            : (search_keywords || "").toString().split(",").filter(Boolean);
+
+          setStatus(
+            `Gap detected: ${Array.isArray(target_symbol) ? target_symbol.join(", ") : target_symbol}. Scouting sources...`,
+          );
+
+          const symbolList: string[] = Array.isArray(target_symbol)
+            ? target_symbol
+            : (target_symbol || "")
+                .toString()
+                .split(",")
+                .map((s: string) => s.trim())
+                .filter(Boolean);
+
+          const mergedSourceFiles = new Set<string>();
+          let mergedBundle = "";
+
+          for (const sym of symbolList) {
+            const { gapSourceFiles: sf, gapAnalysisBundle: ab } =
+              generateGapFillerNotebook(
+                outDir,
+                sym.toString(),
+                (target_file || "").toString(),
+                gapKeywords,
+              );
+            sf.forEach((f) => mergedSourceFiles.add(f));
+            if (ab) mergedBundle += ab + "\n\n";
+          }
+
+          const gapSourceFiles = Array.from(mergedSourceFiles);
+          const gapAnalysisBundle = mergedBundle.trim();
+
           if (gapSourceFiles.length === 0) {
-            activeJobs.set(taskId, { status: "done", result: structuralJsonResult });
+            console.warn(
+              `[GAP-FILLER] No source files found for any symbol in "${target_symbol}". Falling back to ChatGPT synthesis with phase2 insights.`,
+            );
+            let finalResult = currentInsights;
+            try {
+              setStatus(
+                "Gap unresolvable — synthesizing best answer from phase2 insights...",
+              );
+              const chatgptPrompt = getStaffEngineerPrompt(
+                query,
+                currentInsights,
+              );
+              let chatPage = context
+                .pages()
+                .find((p: any) => p.url()?.includes("chatgpt.com"));
+              if (!chatPage) chatPage = await context.newPage();
+              const manual = await automateChatGPT(
+                chatPage,
+                chatgptPrompt,
+                (msg) => setStatus(`[ChatGPT] ${msg}`),
+              );
+              finalResult = manual;
+            } catch (chatgptErr: any) {
+              console.warn(
+                "[ChatGPT Fallback] Failed:",
+                chatgptErr.message,
+                "— returning phase2 insights directly.",
+              );
+            }
+            activeJobs.set(taskId, {
+              status: "done",
+              result: finalResult,
+              answerSource: "chatgpt",
+            });
             return;
           }
 
-          fs.writeFileSync(gapNBPath, gapAnalysisBundle, "utf-8");
+          if (fs.existsSync(gapNBPath)) {
+            const existingGap = fs.readFileSync(gapNBPath, "utf-8");
+            fs.writeFileSync(
+              gapNBPath,
+              existingGap + "\n\n" + gapAnalysisBundle,
+              "utf-8",
+            );
+          } else {
+            fs.writeFileSync(gapNBPath, gapAnalysisBundle, "utf-8");
+          }
           const filesList = gapSourceFiles
             .map((f) => path.basename(f))
             .join(", ");

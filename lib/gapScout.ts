@@ -170,8 +170,10 @@ export function generateGapFillerNotebook(
   const graphPath = path.join(outDir, "graph.json");
   const symbolsPath = path.join(outDir, "symbols.json");
 
-  let importGraph: Record<string, { imports: string[]; imported_by: string[] }> =
-    {};
+  let importGraph: Record<
+    string,
+    { imports: string[]; imported_by: string[] }
+  > = {};
   let symbolIndex: Record<string, { defined_in: string; used_in: string[] }> =
     {};
 
@@ -242,6 +244,33 @@ export function generateGapFillerNotebook(
   }
 
   if (allCandidateFiles.size === 0) {
+    const subTokens = cleanSymbol
+      .split(/[_.\/]/)
+      .flatMap((s) => s.split(/(?=[A-Z])/))
+      .map((t) => t.toLowerCase())
+      .filter((t) => t.length >= 4);
+
+    const uniqueTokens = [...new Set(subTokens)];
+
+    for (const token of uniqueTokens) {
+      const escapedToken = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      conductGlobalSearch(`\\b${escapedToken}\\b`, 120);
+    }
+    if (allCandidateFiles.size === 0) {
+      for (const kw of searchKeywords) {
+        const kwTokens = kw
+          .split(/[\s_.\/]/)
+          .map((t) => t.toLowerCase())
+          .filter((t) => t.length >= 4);
+        for (const token of [...new Set(kwTokens)]) {
+          const escapedToken = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          conductGlobalSearch(`\\b${escapedToken}\\b`, 60);
+        }
+      }
+    }
+  }
+
+  if (allCandidateFiles.size === 0) {
     return { gapSourceFiles: [], gapAnalysisBundle: "" };
   }
 
@@ -266,7 +295,9 @@ export function generateGapFillerNotebook(
           gapAnalysisBundle += `- **Consumers (Imported By):** ${info.imported_by.join(", ")}\n`;
         }
       }
-      const defined = Object.entries(symbolIndex).find(([s, meta]) => meta.defined_in === file);
+      const defined = Object.entries(symbolIndex).find(
+        ([s, meta]) => meta.defined_in === file,
+      );
       if (defined) {
         gapAnalysisBundle += `- **Key Symbols Defined:** ${defined[0]} (and potentially others)\n`;
       }
