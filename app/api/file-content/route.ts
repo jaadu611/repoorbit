@@ -19,7 +19,7 @@ export async function GET(req: Request) {
 
   const filename = filePath.split("/").pop() ?? filePath;
   const analysis = analyzeFile(filename, content);
-  const imports = parseImports(content);
+  const imports = parseImports(content, filename);
   const metrics = {
     lineCount: analysis.lineCount,
     codeLines: analysis.codeLines,

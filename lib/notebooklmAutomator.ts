@@ -14,15 +14,7 @@ const UI_JUNK_LABELS = [
   "share",
 ];
 
-export interface NotebookEntry {
-  name: string;
-  sub_question: string;
-}
-
-export interface NotebookPlan {
-  notebooks?: NotebookEntry[];
-  direct_answer?: string;
-}
+import { NotebookEntry, NotebookPlan } from "@/lib/types";
 
 // ─── Plan parsing ─────────────────────────────────────────────────────────────
 

@@ -1,18 +1,29 @@
 export function getArchitectPrompt(query: string): string {
-  return `You are a Senior Systems Architect performing a deep-dive analysis. Your objective is to resolve the query with high technical density and zero fluff, treating the codebase as a unified system.
+  return `You are a Senior Systems Architect. Analyze the repository as a connected system using the structured graph and file metadata.
 
 Question: ${query}
 
 Instructions:
-- Provide a rigorous technical analysis. Focus on logic flow, data structures, and side effects.
-- Use precise terminology relevant to the project's stack (e.g., hooks, middleware, traits, or goroutines).
-- If the answer involves cross-file dependencies, explicitly map how the modules interact.
-- Structure your response using the following mandatory sections:
 
-[Technical Analysis: Detailed, prose-based breakdown of the implementation logic.]
+* Use the provided call_chains as the PRIMARY execution backbone. Expand them into full step-by-step flows.
+* Use files[].symbols_defined and symbols_used to resolve where logic originates and how it propagates.
+* Follow dependency edges (imports/imported_by) to reconstruct complete chains (including transitive dependencies).
+* Do not isolate files — always explain behavior as part of a multi-file system.
+* Include intermediate nodes even if they are not explicitly mentioned in the query.
+* Track how data/state moves across the chain and where transformations occur.
+* If multiple execution paths exist (eager vs graph, sync vs async), explicitly separate and explain them.
 
-SUMMARY: 
-A concise, high-level synthesis of the architectural findings and their impact on the system.
+Structure:
+
+[Technical Analysis]
+
+* End-to-end execution flow (anchored on call chains)
+* Cross-file interactions (who calls whom and why)
+* Data flow, state transitions, and side effects
+* Key abstractions and their responsibilities
+
+SUMMARY:
+Concise architectural conclusion.
 
 RELEVANT_FILES:
 - [Full path to file 1]
@@ -23,13 +34,13 @@ SOURCE_FILES:
 - [Local chunk filename, e.g., file_001_NB3.txt]
 - [Local chunk filename, e.g., file_002_NB7.txt]
 
-Strict Constraints:
-- Do not provide code blocks unless specifically requested; focus on architectural reasoning.
-- Do not include preambles like "Based on the files provided."
-- RELEVANT_FILES must be real file paths from inside the repo."
-- Do not ask for additional files or offer to search for them. Use only the provided source material.
-- Ensure file paths are absolute relative to the repository root.
-- The SOURCE_FILES section must list the local filenames (e.g., file_001_NB3.txt) of the most relevant chunks that contain the files listed in RELEVANT_FILES. This helps trace which chunks were used.`;
+Constraints:
+
+* No fluff, no preambles
+* No code blocks unless required
+* Do not skip intermediate dependencies in a chain
+* Prefer graph relationships over isolated file interpretation
+* Use only provided context`;
 }
 
 export const DEEPSEEK_CODING_PROMPT = `### ROLE
@@ -71,117 +82,347 @@ If the change is a small patch, you may output a unified diff format.
 USER REQUEST: `;
 
 export function getNotebooklmPlannerPrompt(query: string): string {
-  return `You are the Lead Discovery Architect. Use 00_Root_Manifest.txt for file tree mapping and 01_Meta.txt for high-level context.
+  return `You are a Lead Discovery Architect. Your job is to PLAN the minimal but COMPLETE context required to reconstruct execution flow.
+
+Use:
+
+* 00_Root_Manifest.txt → dependency graph + file structure
+* 01_Meta.txt → high-level context
 
 User Query:
 ${query}
 
 ---
-CRITICAL STRATEGY — THE DUAL-PATH EVALUATION:
 
-1. **PATH A: THE METADATA GATE (DIRECT ANSWER)**
-   Check 01_Meta.txt first. If the query is a high-level question (e.g., "What is the tech stack?", "Summarize the architecture", "Who is the author?", "What are the core features?"), you MUST provide ONLY a "direct_answer".
+DECISION:
 
-2. **PATH B: THE NEIGHBORHOOD TRACE (SURGICAL CODE MAPPING)**
-   If the query requires code-level analysis, implementation, or debugging, execute a "Neighborhood Trace" using 00_Root_Manifest.txt:
-   - **The Core & The Shadow:** Identify "Core" notebooks (Implementation) and "Shadow" notebooks (Type Ancestry, Data Shape, Execution Context).
-   - **RECURSIVE DEPENDENCY:** If Notebook A imports from Notebook B, and Notebook B imports from Notebook C, all THREE are REQUIRED to resolve the logical chain.
-   - **GLOBAL ANCHORS:** Always include the notebook containing core project constants, environment configs, or global types (the "Logical Ground").
-   - **THE ITERATOR RULE:** When answering high-level architecture questions, do not describe functions in isolation. Describe the "Execution Flow" (how data moves from a raw collection into the transformed object), citing both the 'Transformer' and its 'Aggregator' loop.
-   - **NO GHOST TYPES:** Over-fetch slightly on CONTRACTS to ensure 100% type safety.
+PATH A — METADATA:
+If the query is high-level (summary, architecture, stack, purpose), answer directly from 01_Meta.txt.
+
+PATH B — EXECUTION TRACE:
+If code-level reasoning is required, identify the FULL execution graph needed to answer the query.
 
 ---
-OUTPUT REQUIREMENTS:
-- Respond ONLY with a raw JSON object.
-- NO markdown, NO preamble, NO postscript.
 
-STRICT OUTPUT FORMATS (CHOOSE ONLY ONE):
+RULES FOR PATH B (CRITICAL):
+
+* Identify the PRIMARY execution chain (entry → intermediate → terminal).
+* Expand ALL dependencies along that chain:
+  - imports (downstream)
+  - callers (upstream)
+  - transitive dependencies (A → B → C)
+* Select files that define OR use critical symbols in the chain.
+* Include SHARED STATE / GLOBAL anchors (configs, env, root types).
+* Include LOOP DRIVERS / ITERATORS if the logic involves repeated execution (e.g., pipelines, reducers, control flow).
+* Ensure the chain is CONTINUOUS — no missing intermediate nodes.
+* Prefer execution completeness over minimal file count.
 
 ---
-IF PATH A (METADATA):
+
+OUTPUT (JSON ONLY):
+
+IF PATH A:
 {
-  "direct_answer": "Your detailed response based on 01_Meta.txt."
+  "direct_answer": "..."
 }
 
----
-IF PATH B (CODE TRACE):
+IF PATH B:
 {
+  "execution_chains": [
+    {
+      "entry": "file_or_symbol",
+      "path": ["fileA", "fileB", "fileC"],
+      "reason": "Why this chain is required to answer the query"
+    }
+  ],
   "notebooks": [
     {
       "name": "notebook_XX",
-      "sub_question": "Trace [X] and its Stateful Context. If this notebook contains a transformation function (Transformer), identify its Calling Iterator (Aggregator/Iterative Control Flow) in the coupled notebooks to ensure a complete logical signature."
+      "covers": ["fileA", "fileB"],
+      "sub_question": "Explain how this segment contributes to the execution flow and interacts with adjacent nodes."
     }
   ]
 }`;
 }
 
 export function getGapFillerPrompt(symbol: string, reason: string): string {
-  return `You are the Lead Systems Scout performing a logic-gap analysis. Your objective is to bridge a missing link in our architectural understanding.
+  return `You are a Systems Scout resolving a missing link in a codebase using structured graph context.
 
 TARGET_SYMBOL: ${symbol}
 GAP_REASON: ${reason}
 
 Instructions:
-- Provide a rigorous technical analysis of how ${symbol} is used and aggregated. Focus on the 'Calling Iterators' and 'Stateful Accumulators' found in the scouted files.
-- Use precise terminology (e.g., Iterative Control Flow, Data Hydration).
-- Map how the logic flows into or out of ${symbol}.
-- Structure your response using the following mandatory sections:
+
+* Use symbols_defined and symbols_used to locate where ${symbol} originates and how it propagates.
+* Use dependency edges (imports/imported_by) to trace both directions:
+  • Upstream → callers / dependents
+  • Downstream → callees / dependencies
+* If partial call_chains exist, COMPLETE them by inserting missing intermediate nodes.
+* Reconstruct the SMALLEST complete execution chain that resolves the gap (no fragmentation).
+* Ensure continuity: no broken links between files or symbols.
+* Track how data/state flows through ${symbol} and how it influences execution.
+* Include loops, aggregators, or control flow ONLY if they materially affect ${symbol}.
+* Prefer graph-backed relationships over assumptions.
+
+Structure:
 
 [Technical Analysis]
-[Detailed, prose-based breakdown of the implementation logic.]
 
-SUMMARY: 
-A concise, high-level synthesis of the architectural findings and their impact on the system.
+* Role of ${symbol} in the system
+* Completed call chain (upstream → ${symbol} → downstream)
+* Data flow / state transitions
+* Key dependencies and interactions
+
+SUMMARY:
+Concise explanation of how the gap is resolved and how the chain is now complete.
 
 RELEVANT_FILES:
-- [Full path to file 1]
+
+* [absolute repo path]
 
 SOURCE_FILES:
-- [Local chunk filename, e.g., file_001_NB_GAP.txt]
 
-Strict Constraints:
-- Do not provide preambles like "Based on the files provided."
-- RELEVANT_FILES must be real file paths from inside the repo.
-- Do not ask for additional files or offer to search for them. Use only the provided scout material.`;
+* [chunk ids used]
+
+Constraints:
+
+* No preambles
+* No code blocks unless required
+* Do not invent missing links — if unresolved, the chain must remain partial
+* Do not skip intermediate dependencies
+* Use only provided scout context`;
 }
 
 export function getFinalPhasePrompt(q: string, filled = false): string {
   const gap = filled
-    ? `
-### BRIDGED CONTEXT
-'gap_filler_NB.txt' contains the resolved source. 
-1. **Source Primacy:** Prioritize 'gap_filler_NB.txt' over prose.
-2. **Logic Extraction:** Identify stateful reduction (Identity Map, deduplication).
-3. **Loop Termination:** PATH C is locked for resolved symbols.`
+    ? `### BRIDGED CONTEXT
+
+* gap_filler_NB.txt is authoritative for resolved symbols.
+* Prefer it over earlier context.
+* Do not trigger PATH C for already resolved symbols.`
     : "";
 
-  return `Architect: Analyze the query using the context hierarchy.
+  return `You are a Lead Systems Engineer. Process the query using the provided context.
 
 ### QUERY
+
 ${q}
 
-### CONTEXT
-1. **gap_filler_NB.txt**: (Primary) Implementation source.
-2. **00_Root_Manifest.txt**: Structural map.
-3. **phase2_insights.txt**: Triage/Breadcrumbs.
+### CONTEXT PRIORITY
 
-### PATHS
-#### PATH A: CONCEPTUAL (Technical Briefing)
-- **Format:** Markdown. NO JSON.
-- **Trace:** Call-site -> Service -> Hydration.
-- **Precision:** Define "One-to-Many" bridge using 'gap_filler_NB.txt' (e.g., identity map).
-- **Evidence:** Cite file/lines for every claim.
+1. gap_filler_NB.txt (if present)
+2. phase2_insights.txt
+3. 00_Root_Manifest.txt
 
-#### PATH B: OPERATIONAL (JSON)
-- **Target:** Fix/Refactor instructions for coding model.
-- **Schema:** {"intent":"","task_summary":"","deepseek_prompt":"","required_context":[]}
+---
 
-#### PATH C: CONTEXT GAP (JSON)
-- **Trigger:** If loop/aggregator logic is missing (Anchor Rule).
-- **Schema:** {"status":"MISSING_CONTEXT","missing_link":{"target_file":"","target_symbol":"","reason":"","anchor_file":"","search_keywords":[]}}
+### DECISION
+
+PATH A — STRUCTURED CONTEXT (PRIMARY):
+Generate a complete machine-readable representation of the system required to answer the query.
+
+PATH B — OPERATIONAL:
+Use if the query asks to fix, refactor, implement, or modify code.
+
+PATH C — GAP:
+Use ONLY if critical logic or symbols required to construct the structure are missing.
+
+---
+
+### RULES
+
+* DO NOT produce human-readable explanations.
+* ALWAYS prefer structured extraction over summarization.
+* Extract FULL execution structure with CONTINUOUS chains (no missing intermediate nodes).
+* Prioritize PRIMARY execution paths over secondary or rarely used flows.
+* If multiple paths exist, include only those necessary to answer the query.
+* If a required symbol, call chain, or dependency is missing → PATH C.
+* Do not hallucinate missing logic.
+* If context is sufficient → DO NOT use PATH C.
+
+${gap}
+
+---
+
+### OUTPUT
+
+#### PATH A (JSON only — STRUCTURED CONTEXT):
+
+{
+"files": [
+{
+"path": "absolute repo path",
+"role": "entry | core | utility | config | test | unknown",
+"symbols_defined": ["functions/classes/types"],
+"symbols_used": ["external dependencies"],
+"imports": ["resolved file paths"],
+"summary": "concise technical role"
+}
+],
+"call_chains": [
+"entry → moduleA → moduleB → output"
+],
+"key_symbols": [
+{
+"name": "symbol_name",
+"defined_in": "file path",
+"used_in": ["file paths"]
+}
+]
+}
+
+---
+
+#### PATH B (JSON only):
+
+{
+"intent": "REFACTOR | FIX | FEATURE | OTHERS",
+"task": "Short actionable instruction",
+"deepseek_handoff": {
+"goal": "Definition of done",
+"current_logic": "Existing behavior and issue",
+"symbols": ["Key functions/types/constants"]
+},
+"extraction_manifest": [
+{
+"file_path": "absolute repo path",
+"chunk_id": "chunk id",
+"justification": "why needed"
+}
+]
+}
+
+---
+
+#### PATH C (JSON only):
+
+{
+"status": "MISSING_CONTEXT",
+"missing_link": {
+"target_symbol": "name",
+"reason": "why required",
+"search_keywords": ["k1", "k2"]
+}
+}
+
+---
 
 ### CONSTRAINTS
-- **NO PREAMBLES.**
-- **NO HALLUCINATION.**
-${gap}`;
+
+* Output MUST be valid JSON only
+* Response MUST start with { and end with }
+* NO text before or after JSON
+* NO markdown
+* Must be directly parseable by JSON.parse()
+* Use only provided context
+* Do not skip required dependencies`;
+}
+
+export function getStaffEngineerPrompt(query: string, jsonData: string): string {
+  return `You are a Staff-Level Systems Engineer and Technical Educator.
+
+Your task is to transform the provided structured JSON into a clear, deeply insightful, human-readable explanation.
+
+The goal is NOT to restate the JSON — but to reconstruct the system as a coherent mental model.
+
+---
+
+## INPUT
+
+You will receive structured data containing:
+
+- files (roles, responsibilities, imports)
+- call_chains (execution flows)
+- key_symbols (definitions and usages)
+
+---
+
+## OBJECTIVE
+
+Produce a high-quality explanation that answers the original question:
+
+"${query}"
+
+---
+
+## OUTPUT STRUCTURE (MANDATORY)
+
+### 1. End-to-End Execution Flow
+
+- Start from the true entry point (eager or graph mode)
+- Walk step-by-step through the system
+- Expand call chains into real execution narratives
+- Explain how loops are transformed into backward passes (BPTT)
+
+---
+
+### 2. Control Flow Gradient Construction (Core Insight)
+
+- Explain HOW TensorFlow builds gradients for loops
+- Show how backward loops are constructed
+- Explain how iteration state is preserved across steps
+- Clearly explain Backpropagation Through Time (not just mention it)
+
+---
+
+### 3. Cross-File Interactions
+
+- Explain how major files collaborate
+- Group related components (e.g., registry → dispatcher → builder)
+- Show responsibility boundaries between Python, C++, and MLIR layers
+
+---
+
+### 4. Data Flow & State Management
+
+- How tensors move across iterations
+- How intermediate values are stored and reused
+- How GradientTape / TapeContext track operations
+- How execution frames / scopes isolate iterations
+
+---
+
+### 5. Key Abstractions Explained
+
+For each important symbol:
+
+- What it does
+- Why it exists
+- How it connects to the system
+
+---
+
+### 6. Final Mental Model (CRITICAL)
+
+Summarize the system in 5–8 lines:
+
+- How everything fits together
+- What makes TensorFlow’s approach powerful
+- Why this design works for dynamic + static execution
+
+---
+
+## RULES
+
+- DO NOT mention JSON
+- DO NOT list files mechanically
+- DO NOT be shallow
+- DO NOT hallucinate beyond provided data
+- Prefer clarity over verbosity
+- Think like you're explaining to a senior engineer, not a beginner
+
+---
+
+## STYLE
+
+- Precise but readable
+- Structured but not robotic
+- Insightful > verbose
+- Focus on "why" and "how", not just "how"
+
+---
+
+## INPUT DATA
+
+${jsonData}`;
 }

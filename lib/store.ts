@@ -5,37 +5,8 @@ import type {
   FileContext,
   SelectionStore,
   CommitDetail,
+  LightFileMetadata,
 } from "@/lib/types";
-
-export interface LightFileMetadata {
-  path: string;
-  name: string;
-  ext: string;
-  size: number;
-  depth: number;
-  isLarge: boolean;
-  imports: string[];
-  resolvedImports: string[];
-  metrics: {
-    lineCount: number;
-    charCount: number;
-    codeLines: number;
-    commentLines: number;
-    emptyLines: number;
-  };
-  analysis: {
-    exports: string[];
-    todoComments: string[];
-    functionCount: number;
-    classCount: number;
-    logicType: string;
-    isReact: boolean;
-    isTypeScript: boolean;
-    isTest: boolean;
-    isConfig: boolean;
-    hasJsx: boolean;
-  };
-}
 
 export const useSelectionStore = create<
   SelectionStore & {

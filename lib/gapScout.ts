@@ -2,11 +2,7 @@ import path from "path";
 import fs from "fs";
 import { execSync } from "child_process";
 
-interface GapSearchResult {
-  filePath: string;
-  score: number;
-  reason: string;
-}
+import { GapSearchResult } from "@/lib/types";
 
 export function searchGapFiles(
   outDir: string,
@@ -171,6 +167,23 @@ export function generateGapFillerNotebook(
   const escapedSymbol = cleanSymbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const escapedRoot = symRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+  const graphPath = path.join(outDir, "graph.json");
+  const symbolsPath = path.join(outDir, "symbols.json");
+
+  let importGraph: Record<string, { imports: string[]; imported_by: string[] }> =
+    {};
+  let symbolIndex: Record<string, { defined_in: string; used_in: string[] }> =
+    {};
+
+  try {
+    if (fs.existsSync(graphPath)) {
+      importGraph = JSON.parse(fs.readFileSync(graphPath, "utf-8"));
+    }
+    if (fs.existsSync(symbolsPath)) {
+      symbolIndex = JSON.parse(fs.readFileSync(symbolsPath, "utf-8"));
+    }
+  } catch (_) {}
+
   const conductGlobalSearch = (pattern: string, weight: number) => {
     try {
       const matches = execSync(`rg -l "${pattern}" .`, {
@@ -188,6 +201,32 @@ export function generateGapFillerNotebook(
     } catch (_) {}
   };
 
+  // 1. Precise Structural Search
+  const structuralTargets = new Set<string>();
+  if (targetFile) structuralTargets.add(targetFile);
+
+  // Symbol resolution
+  if (symbolIndex[cleanSymbol]) {
+    const definingFile = symbolIndex[cleanSymbol].defined_in;
+    structuralTargets.add(definingFile);
+    conductGlobalSearch(path.basename(definingFile), 1200); // Super high weight for definition
+  }
+
+  if (Object.keys(importGraph).length > 0) {
+    for (const file of structuralTargets) {
+      if (importGraph[file]) {
+        // High weight for neighbors
+        importGraph[file].imports.forEach((dep) => {
+          conductGlobalSearch(path.basename(dep), 800);
+        });
+        importGraph[file].imported_by.forEach((consumer) => {
+          conductGlobalSearch(path.basename(consumer), 800);
+        });
+      }
+    }
+  }
+
+  // 2. Heuristic Search (standard)
   conductGlobalSearch(`\\b${escapedSymbol}\\b`, 1000);
   if (escapedRoot !== escapedSymbol) {
     conductGlobalSearch(`\\b${escapedRoot}\\b`, 500);
@@ -212,6 +251,29 @@ export function generateGapFillerNotebook(
 
   let gapAnalysisBundle = `# GAP-FILLER COMPREHENSIVE HARVEST\n`;
   gapAnalysisBundle += `Target Symbol: ${targetSymbol}\nTarget File: ${targetFile}\nKeywords: ${searchKeywords.join(", ")}\n\n`;
+
+  // 3. Structural Roadmap Header
+  if (structuralTargets.size > 0) {
+    gapAnalysisBundle += `## STRUCTURAL ROADMAP (from dependencies)\n\n`;
+    for (const file of structuralTargets) {
+      gapAnalysisBundle += `### Anchor: ${file}\n`;
+      const info = importGraph[file];
+      if (info) {
+        if (info.imports.length > 0) {
+          gapAnalysisBundle += `- **Dependencies (Imports):** ${info.imports.join(", ")}\n`;
+        }
+        if (info.imported_by.length > 0) {
+          gapAnalysisBundle += `- **Consumers (Imported By):** ${info.imported_by.join(", ")}\n`;
+        }
+      }
+      const defined = Object.entries(symbolIndex).find(([s, meta]) => meta.defined_in === file);
+      if (defined) {
+        gapAnalysisBundle += `- **Key Symbols Defined:** ${defined[0]} (and potentially others)\n`;
+      }
+      gapAnalysisBundle += `\n`;
+    }
+    gapAnalysisBundle += `---\n\n`;
+  }
 
   const gapSourceFiles: string[] = [];
   for (const f of sortedFiles) {

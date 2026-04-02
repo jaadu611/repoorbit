@@ -384,7 +384,7 @@ export interface FullRepoData {
       logicType: string;
     };
   }[];
-  importGraph: Record<string, string[]>;
+  importGraph: Record<string, { imports: string[]; imported_by: string[] }>;
 }
 
 export interface WorkspaceLayoutProps {
@@ -477,4 +477,110 @@ export interface SelectionStore {
   setFolderContext: (ctx: FolderContext) => void;
   setFileContext: (ctx: FileContext) => void;
   resetToRepo: (repoMeta: RepoContext["meta"]) => void;
+}
+
+export interface NotebookEntry {
+  name: string;
+  sub_question: string;
+}
+
+export interface NotebookPlan {
+  notebooks?: NotebookEntry[];
+  direct_answer?: string;
+}
+
+export interface JobStatus {
+  status: "pending" | "done" | "error";
+  result?: string;
+  partialResult?: string;
+  error?: string;
+  statusText?: string;
+  progress?: number;
+}
+
+export interface LightFileMetadata {
+  path: string;
+  name: string;
+  ext: string;
+  size: number;
+  depth: number;
+  isLarge: boolean;
+  imports: string[];
+  resolvedImports: string[];
+  metrics: {
+    lineCount: number;
+    charCount: number;
+    codeLines: number;
+    commentLines: number;
+    emptyLines: number;
+  };
+  analysis: {
+    exports: string[];
+    todoComments: string[];
+    functionCount: number;
+    classCount: number;
+    isReact: boolean;
+    isTypeScript: boolean;
+    isTest: boolean;
+    isConfig: boolean;
+    hasJsx: boolean;
+    logicType: string;
+  };
+}
+
+export interface GapSearchResult {
+  filePath: string;
+  score: number;
+  reason: string;
+}
+
+export type RepoLanguage = "c" | "web" | "go" | "rust" | "python" | "java" | "mixed";
+
+export type ImportRole = "Entry Point" | `Depth ${number}` | "Utility";
+
+export type QueryIntent =
+  | "contributors"
+  | "commits"
+  | "branches"
+  | "issues"
+  | "pulls"
+  | "repo_meta"
+  | "tree"
+  | "code"
+  | "test";
+
+export type CodeFocus = "targeted" | "generic";
+
+export interface FunctionBlock {
+  name: string;
+  startLine: number;
+  endLine: number;
+  text: string;
+}
+
+export interface ScoredFile {
+  file: any;
+  score: number;
+}
+
+export interface Block {
+  group: string;
+  text: string;
+  filePath?: string;
+}
+
+export interface ExpertPlan {
+  files?: string[];
+  intents?: QueryIntent[];
+  focus?: CodeFocus;
+}
+
+export interface SymbolExtraction {
+  defined: string[];
+  used: string[];
+}
+
+export interface BidirectionalGraph {
+  imports: Record<string, string[]>;
+  imported_by: Record<string, string[]>;
 }

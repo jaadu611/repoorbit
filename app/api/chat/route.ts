@@ -5,33 +5,27 @@ import { analyzeFile, fetchFileContents } from "@/lib/github";
 import {
   automateNotebookLM,
   parseNotebookPlan,
-  NotebookPlan,
 } from "@/lib/notebooklmAutomator";
+import { automateChatGPT } from "@/lib/chatgptAutomator";
 import { getOrCreateContext } from "@/lib/browser";
 import { generateGapFillerNotebook } from "@/lib/gapScout";
 import {
-  getFinalPhasePrompt,
   getNotebooklmPlannerPrompt,
+  getFinalPhasePrompt,
   getArchitectPrompt,
+  getStaffEngineerPrompt,
 } from "@/lib/prompts";
 import { NextResponse } from "next/server";
 import { BrowserContext } from "playwright";
+
+import { JobStatus, NotebookPlan } from "@/lib/types";
 
 export const CONTEXT_DIR_PATH = "/tmp/notebooklm_sources";
 export const NOTEBOOKLM_URL = "https://notebooklm.google.com/";
 
 const GLOBAL_JOBS_KEY = Symbol.for("repoorbit.playwright.jobs");
-export const activeJobs: Map<
-  string,
-  {
-    status: "pending" | "done" | "error";
-    result?: string;
-    partialResult?: string;
-    error?: string;
-    statusText?: string;
-    progress?: number;
-  }
-> = (global as any)[GLOBAL_JOBS_KEY] || new Map();
+export const activeJobs: Map<string, JobStatus> = 
+  (global as any)[GLOBAL_JOBS_KEY] || new Map();
 (global as any)[GLOBAL_JOBS_KEY] = activeJobs;
 
 async function processNotebookPlan(
@@ -42,7 +36,7 @@ async function processNotebookPlan(
   onStatus?: (msg: string, partial?: string, progress?: number) => void,
 ): Promise<string> {
   const pages = context.pages();
-  let page = pages.find((p) => p.url().includes("notebooklm.google.com"));
+  let page = pages.find((p) => p.url()?.includes("notebooklm.google.com"));
 
   if (!page) {
     page = await context.newPage();
@@ -223,24 +217,58 @@ export async function POST(req: Request) {
             );
           });
 
+          const MAX_FILES = 3000;
+          const sortedFiles = coreFiles.slice(0, MAX_FILES);
+
           const contents = await fetchFileContents(
             owner,
             repo,
-            coreFiles,
+            sortedFiles,
             defaultBranch || "main",
             setStatus,
           );
-          const metadata = Array.from(contents.entries()).map(([p, c]) => ({
-            path: p,
-            content: c,
-            analysis: analyzeFile(p, c),
-          }));
+
+          const fileSet = new Set<string>(sortedFiles.map((f: any) => f.path));
+
+          const metadata = Array.from(contents.entries()).map(([p, c]) => {
+            // Skip analysis for very large files to avoid RangeError/timeouts
+            const analysis =
+              c.length < 500000
+                ? analyzeFile(p, c, fileSet)
+                : { imports: [] as string[] };
+            return {
+              path: p,
+              content: c,
+              ...analysis,
+            };
+          });
+
+          // Build bidirectional import graph
+          const importGraph: Record<
+            string,
+            { imports: string[]; imported_by: string[] }
+          > = {};
+
+          for (const file of metadata) {
+            importGraph[file.path] = {
+              imports: (file as any).imports || [],
+              imported_by: [],
+            };
+          }
+
+          for (const file in importGraph) {
+            for (const dep of importGraph[file].imports) {
+              if (importGraph[dep]) {
+                importGraph[dep].imported_by.push(file);
+              }
+            }
+          }
 
           setStatus("Chunking and structuring contexts...");
           await buildMasterContext(
             query,
             metadata,
-            {},
+            importGraph,
             repoContext,
             undefined,
             outDir,
@@ -255,7 +283,7 @@ export async function POST(req: Request) {
 
         let plannerPage = context
           .pages()
-          .find((p: any) => p.url().includes("notebooklm.google.com"));
+          .find((p: any) => p.url()?.includes("notebooklm.google.com"));
         if (!plannerPage) plannerPage = await context.newPage();
 
         const plannerPromptText = getNotebooklmPlannerPrompt(query);
@@ -291,7 +319,24 @@ export async function POST(req: Request) {
         let hasGapFilled = false;
         let currentInsights = phase2Insights;
 
-        fs.writeFileSync(insightsPath, currentInsights, "utf-8");
+        const roadmapPath = path.join(outDir, "graph.json");
+        let roadmapHeader = "";
+        try {
+          if (fs.existsSync(roadmapPath)) {
+            const graphData = JSON.parse(fs.readFileSync(roadmapPath, "utf-8"));
+            const entryPoints = Object.keys(graphData)
+              .filter(
+                (p) =>
+                  graphData[p] &&
+                  graphData[p].imported_by &&
+                  graphData[p].imported_by.length === 0,
+              )
+              .slice(0, 5);
+            roadmapHeader = `### SYSTEM ROADMAP\n\nPrimary Entry Points: ${entryPoints.join(", ")}\n(Full bidirectional graph available in 01_Meta.txt and graph.json)\n\n---\n\n`;
+          }
+        } catch (_) {}
+
+        fs.writeFileSync(insightsPath, roadmapHeader + currentInsights, "utf-8");
 
         for (let attempts = 0; attempts <= MAX_GAP_FILLS; attempts++) {
           const sourceFileRegex = /file_\d{3}_NB\d+\.txt/g;
@@ -316,10 +361,10 @@ export async function POST(req: Request) {
           const finalPrompt = getFinalPhasePrompt(query, hasGapFilled);
           let page = context
             .pages()
-            .find((p: any) => p.url().includes("notebooklm.google.com"));
+            .find((p: any) => p.url()?.includes("notebooklm.google.com"));
           if (!page) page = await context.newPage();
 
-          const ultimateResult = await automateNotebookLM(
+          const structuralJsonResult = await automateNotebookLM(
             page,
             finalPhaseFiles,
             finalPrompt,
@@ -331,7 +376,7 @@ export async function POST(req: Request) {
 
           let parsedGap: any = null;
           try {
-            let jsonString = ultimateResult
+            let jsonString = structuralJsonResult
               .replace(/```(?:json)?\s*/gi, "")
               .replace(/```/g, "")
               .trim();
@@ -345,7 +390,26 @@ export async function POST(req: Request) {
           } catch (_) {}
 
           if (!parsedGap || attempts >= MAX_GAP_FILLS) {
-            activeJobs.set(taskId, { status: "done", result: ultimateResult });
+            let finalResult = structuralJsonResult;
+
+            // Optional: Connect ChatGPT Automator for high-level architectural manual
+            try {
+              if (structuralJsonResult.trim().startsWith("{")) {
+                setStatus("Requesting Staff-Level Engineering Manual from ChatGPT...");
+                const chatgptPrompt = getStaffEngineerPrompt(query, structuralJsonResult);
+                
+                let chatPage = context.pages().find((p: any) => p.url()?.includes("chatgpt.com"));
+                if (!chatPage) chatPage = await context.newPage();
+                
+                const manual = await automateChatGPT(chatPage, chatgptPrompt, (msg) => setStatus(`[ChatGPT] ${msg}`));
+                finalResult = `## 📐 Staff-Level Engineering Manual\n\n${manual}\n\n---\n\n## 🛠️ Structural JSON Context (Path A)\n\n${structuralJsonResult}`;
+              }
+            } catch (chatgptErr: any) {
+              console.warn("[ChatGPT Automator] Failed to generate manual:", chatgptErr.message);
+              // Fallback to original result if ChatGPT fails
+            }
+
+            activeJobs.set(taskId, { status: "done", result: finalResult });
             return;
           }
 
@@ -355,7 +419,7 @@ export async function POST(req: Request) {
           const { gapSourceFiles, gapAnalysisBundle } =
             generateGapFillerNotebook(outDir, target_symbol, target_file);
           if (gapSourceFiles.length === 0) {
-            activeJobs.set(taskId, { status: "done", result: ultimateResult });
+            activeJobs.set(taskId, { status: "done", result: structuralJsonResult });
             return;
           }
 

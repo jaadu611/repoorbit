@@ -1,3 +1,5 @@
+import path from "path";
+import fs from "fs";
 import { RepoContext, RepoTreeEntry, CommitDetail } from "./types";
 
 export async function fetchFileContents(
@@ -11,13 +13,18 @@ export async function fetchFileContents(
   const CHUNK_SIZE = 100;
   const CONCURRENCY = 50;
 
-  const token = process.env.GITHUB_TOKEN || process.env.NEXT_PUBLIC_GITHUB_TOKEN;
+  const token =
+    process.env.GITHUB_TOKEN || process.env.NEXT_PUBLIC_GITHUB_TOKEN;
   const allChunks = [];
   for (let i = 0; i < files.length; i += CHUNK_SIZE) {
     allChunks.push(files.slice(i, i + CHUNK_SIZE));
   }
 
-  for (let blockIndex = 0; blockIndex < allChunks.length; blockIndex += CONCURRENCY) {
+  for (
+    let blockIndex = 0;
+    blockIndex < allChunks.length;
+    blockIndex += CONCURRENCY
+  ) {
     const batchedChunks = allChunks.slice(blockIndex, blockIndex + CONCURRENCY);
     const upperLimit = Math.min(blockIndex + CONCURRENCY, allChunks.length);
     const filesFetched = Math.min(upperLimit * CHUNK_SIZE, files.length);
@@ -137,20 +144,20 @@ function buildStackFlags(paths: string[]) {
     ),
     hasDocker: has(
       (p) =>
-        p.includes("dockerfile") ||
+        p?.includes("dockerfile") ||
         p === "docker-compose.yml" ||
         p === "docker-compose.yaml",
     ),
-    hasTailwind: has((p) => p.includes("tailwind.config")),
-    hasNextjs: has((p) => p.includes("next.config")),
-    hasVite: has((p) => p.includes("vite.config")),
-    hasWebpack: has((p) => p.includes("webpack.config")),
-    hasPrisma: has((p) => p.endsWith("schema.prisma")),
+    hasTailwind: has((p) => p?.includes("tailwind.config")),
+    hasNextjs: has((p) => p?.includes("next.config")),
+    hasVite: has((p) => p?.includes("vite.config")),
+    hasWebpack: has((p) => p?.includes("webpack.config")),
+    hasPrisma: has((p) => p?.endsWith("schema.prisma")),
     hasEnvFile: has(
       (p) => p === ".env" || p === ".env.example" || p === ".env.local",
     ),
-    hasGitActions: has((p) => p.startsWith(".github/workflows")),
-    hasTests: has((p) => /test|spec|__tests__|jest|vitest/.test(p)),
+    hasGitActions: has((p) => !!p?.startsWith(".github/workflows")),
+    hasTests: has((p) => !!(p && /test|spec|__tests__|jest|vitest/.test(p))),
     hasReadme: has((p) => p === "readme.md"),
     architecture: has((p) => p.includes("next.config"))
       ? "Next.js"
@@ -241,17 +248,74 @@ export async function fetchFileContent(
   }
 }
 
-export function parseImports(content: string): string[] {
-  const results: string[] = [];
-  const importRegex = /(?:import|from)\s+['"]([^'"]+)['"]/g;
-  const requireRegex = /require\(['"]([^'"]+)['"]\)/g;
-  let m: RegExpExecArray | null;
-  while ((m = importRegex.exec(content)) !== null) results.push(m[1]);
-  while ((m = requireRegex.exec(content)) !== null) results.push(m[1]);
-  return results.filter((i) => i.startsWith(".") || i.startsWith("/"));
+function resolveImportPath(
+  importPath: string,
+  fromFile: string,
+  fileSet?: Set<string>,
+): string | null {
+  if (!importPath || !fileSet) return null;
+
+  // ignore external libs (only resolve relative or alias-like for now)
+  if (!importPath.startsWith(".") && !importPath.startsWith("@")) return null;
+
+  const baseDir = path.dirname(fromFile);
+  let resolved = importPath.startsWith("@/")
+    ? importPath.replace("@/", "")
+    : path.join(baseDir, importPath);
+
+  // Normalize path (remove leading /, preserve relative)
+  if (resolved.startsWith("/")) resolved = resolved.slice(1);
+
+  const extensions = [".ts", ".tsx", ".js", ".jsx", ".py"];
+
+  // Direct match
+  for (const ext of extensions) {
+    const full = resolved + ext;
+    if (fileSet.has(full)) return full;
+  }
+
+  // Index fallback
+  for (const ext of extensions) {
+    const indexFile = path.join(resolved, "index" + ext);
+    if (fileSet.has(indexFile)) return indexFile;
+  }
+
+  return null;
 }
 
-export function analyzeFile(filename: string, content: string) {
+export function parseImports(
+  content: string,
+  filePath: string,
+  fileSet?: Set<string>,
+): string[] {
+  const imports = new Set<string>();
+
+  const patterns = [
+    /import\s+.*?\s+from\s+['"](.*?)['"]/g,
+    /require\(['"](.*?)['"]\)/g,
+    /import\(['"](.*?)['"]\)/g,
+    /export\s+\*\s+from\s+['"](.*?)['"]/g,
+    /export\s+{[^}]+}\s+from\s+['"](.*?)['"]/g,
+  ];
+
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(content)) !== null) {
+      const raw = match[1];
+      const resolved = resolveImportPath(raw, filePath, fileSet);
+      if (resolved) imports.add(resolved);
+    }
+  }
+
+  return Array.from(imports);
+}
+
+export function analyzeFile(
+  filename: string,
+  content: string,
+  fileSet?: Set<string>,
+) {
+  const imports = parseImports(content, filename, fileSet);
   const lines = content.split("\n");
   const functionCount = (content.match(/\bfunction\b|\b=>\s*[{(]/g) ?? [])
     .length;
@@ -289,6 +353,7 @@ export function analyzeFile(filename: string, content: string) {
     isTest,
     isConfig,
     isTypeScript,
+    imports,
     hasJsx,
     lineCount: lines.length,
     codeLines,

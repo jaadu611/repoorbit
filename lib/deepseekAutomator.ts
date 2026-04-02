@@ -4,14 +4,7 @@ import * as path from "path";
 import * as os from "os";
 import { DEEPSEEK_CODING_PROMPT } from "./prompts";
 
-export interface NotebookEntry {
-  name: string;
-  sub_question: string;
-}
-
-export interface NotebookPlan {
-  notebooks: NotebookEntry[];
-}
+import { NotebookEntry, NotebookPlan } from "@/lib/types";
 
 export async function askDeepseek(
   page: Page,
@@ -420,16 +413,18 @@ function validatePlan(obj: unknown): NotebookPlan {
   if (
     !obj ||
     typeof obj !== "object" ||
-    !Array.isArray((obj as any).notebooks)
+    (!Array.isArray((obj as any).notebooks) && typeof (obj as any).direct_answer !== "string")
   ) {
     throw new Error(
-      "Invalid NotebookPlan shape: expected { notebooks: [...] }",
+      "Invalid NotebookPlan shape: expected { notebooks: [...] } or { direct_answer: '...' }",
     );
   }
 
   const plan = obj as NotebookPlan;
 
-  if (plan.notebooks.length === 0) {
+  if (plan.direct_answer) return plan;
+
+  if (!plan.notebooks || plan.notebooks.length === 0) {
     throw new Error("NotebookPlan has zero notebooks.");
   }
 
