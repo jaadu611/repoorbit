@@ -20,42 +20,82 @@ import {
 } from "@/lib/types";
 
 function detectRepoLanguage(filesMetadata: any[]): RepoLanguage {
-  const extCounts: Record<string, number> = {};
-  for (const f of filesMetadata) {
-    const ext = (f.path as string).split(".").pop()?.toLowerCase() ?? "";
-    extCounts[ext] = (extCounts[ext] ?? 0) + 1;
-  }
-  const total = filesMetadata.length || 1;
-  const pct = (ext: string) => ((extCounts[ext] ?? 0) / total) * 100;
+  if (!filesMetadata || filesMetadata.length === 0) return "mixed";
 
-  if (pct("cpp") + pct("cc") + pct("cxx") > 15) return "cpp";
-  if (pct("c") + pct("h") > 20) return "c";
-  if (pct("rs") > 15) return "rust";
-  if (pct("go") > 15) return "go";
-  if (pct("py") > 15) return "python";
-  if (pct("rb") > 15) return "ruby";
-  if (pct("cs") > 15) return "c_sharp";
-  if (pct("php") > 15) return "php";
-  if (pct("swift") > 15) return "swift";
-  if (pct("kt") > 15) return "kotlin";
-  if (pct("java") > 15) return "java";
-  if (pct("dart") > 15) return "dart";
-  if (pct("sh") + pct("bash") > 15) return "shell";
-  if (pct("ts") + pct("tsx") > 15) return "typescript";
-  if (pct("js") + pct("jsx") > 15) return "javascript";
-  if (pct("scala") > 15) return "scala";
-  if (pct("hs") > 15) return "haskell";
-  if (pct("ex") + pct("exs") > 15) return "elixir";
-  if (pct("clj") + pct("cljs") + pct("cljc") > 15) return "clojure";
-  if (pct("pl") + pct("pm") > 15) return "perl";
-  if (pct("r") > 15) return "r";
-  if (pct("jl") > 15) return "julia";
-  if (pct("m") + pct("mm") > 15) return "objective_c";
-  if (pct("f") + pct("f90") + pct("f95") > 15) return "fortran";
-  if (pct("s") + pct("asm") > 15) return "assembly";
-  if (pct("lua") > 15) return "lua";
-  if (pct("groovy") > 15) return "groovy";
-  return "mixed";
+  const extCounts: Record<string, number> = {};
+
+  // 1. Map extensions to language groups
+  const languageGroups: Record<string, string[]> = {
+    cpp: ["cpp", "cc", "cxx", "hpp", "h++"],
+    c: ["c", "h"],
+    rust: ["rs"],
+    go: ["go"],
+    python: ["py"],
+    ruby: ["rb"],
+    c_sharp: ["cs"],
+    php: ["php"],
+    swift: ["swift"],
+    kotlin: ["kt", "kts"],
+    java: ["java"],
+    dart: ["dart"],
+    shell: ["sh", "bash", "zsh"],
+    typescript: ["ts", "tsx"],
+    javascript: ["js", "jsx", "mjs"],
+    scala: ["scala"],
+    haskell: ["hs"],
+    elixir: ["ex", "exs"],
+    clojure: ["clj", "cljs", "cljc"],
+    perl: ["pl", "pm"],
+    r: ["r"],
+    julia: ["jl"],
+    objective_c: ["m", "mm"],
+    fortran: ["f", "f90", "f95"],
+    assembly: ["s", "asm"],
+    lua: ["lua"],
+    groovy: ["groovy"],
+  };
+
+  // 2. Count extensions, ignoring common noise (node_modules, .git, etc)
+  let validFileCount = 0;
+  for (const f of filesMetadata) {
+    const path = (f.path as string).toLowerCase();
+
+    // Skip dependencies and hidden files to find "real" source code
+    if (
+      path.includes("node_modules/") ||
+      path.includes("vendor/") ||
+      path.startsWith(".")
+    ) {
+      continue;
+    }
+
+    const ext = path.split(".").pop() ?? "";
+    extCounts[ext] = (extCounts[ext] ?? 0) + 1;
+    validFileCount++;
+  }
+
+  if (validFileCount === 0) return "mixed";
+
+  // 3. Calculate the total weight for each group
+  let topLanguage: RepoLanguage = "mixed";
+  let maxPercentage = 0;
+
+  for (const [langName, extensions] of Object.entries(languageGroups)) {
+    const groupCount = extensions.reduce(
+      (sum, ext) => sum + (extCounts[ext] ?? 0),
+      0,
+    );
+    const percentage = (groupCount / validFileCount) * 100;
+
+    // 4. Update the "Winner" if this group is more significant
+    if (percentage > maxPercentage) {
+      maxPercentage = percentage;
+      topLanguage = langName as RepoLanguage;
+    }
+  }
+
+  // 5. Threshold check: if the top language is less than 10% of the repo, call it "mixed"
+  return maxPercentage > 10 ? topLanguage : "mixed";
 }
 
 const TIER2_JS = new Set([
@@ -1361,7 +1401,10 @@ function fileTier(filePath: string, lang: RepoLanguage = "typescript"): number {
   return 0;
 }
 
-function shouldInclude(filePath: string, lang: RepoLanguage = "typescript"): boolean {
+function shouldInclude(
+  filePath: string,
+  lang: RepoLanguage = "typescript",
+): boolean {
   return fileTier(filePath, lang) > 0;
 }
 

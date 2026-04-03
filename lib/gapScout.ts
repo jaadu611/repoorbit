@@ -158,6 +158,12 @@ export function generateGapFillerNotebook(
   targetSymbol: string,
   targetFile?: string,
   searchKeywords: string[] = [],
+  /**
+   * The last file/symbol in the chain before the gap broke continuity
+   * (from PATH C missing_link.last_known_node). Used as a high-weight
+   * anchor alongside targetFile to bias the scout toward the right neighbourhood.
+   */
+  lastKnownNode?: string,
 ): { gapSourceFiles: string[]; gapAnalysisBundle: string } {
   const allCandidateFiles = new Set<string>();
   const scores = new Map<string, number>();
@@ -206,6 +212,10 @@ export function generateGapFillerNotebook(
   // 1. Precise Structural Search
   const structuralTargets = new Set<string>();
   if (targetFile) structuralTargets.add(targetFile);
+  // If the orchestrator gave us the last-known-good node in the chain, treat
+  // it as an equally important anchor — the gap is almost certainly in its
+  // immediate neighbourhood.
+  if (lastKnownNode) structuralTargets.add(lastKnownNode);
 
   // Symbol resolution
   if (symbolIndex[cleanSymbol]) {
@@ -279,7 +289,11 @@ export function generateGapFillerNotebook(
     .slice(0, 15);
 
   let gapAnalysisBundle = `# GAP-FILLER COMPREHENSIVE HARVEST\n`;
-  gapAnalysisBundle += `Target Symbol: ${targetSymbol}\nTarget File: ${targetFile}\nKeywords: ${searchKeywords.join(", ")}\n\n`;
+  gapAnalysisBundle += `Target Symbol: ${targetSymbol}\nTarget File: ${targetFile ?? "unknown"}\n`;
+  if (lastKnownNode) {
+    gapAnalysisBundle += `Last Known Node (chain break point): ${lastKnownNode}\n`;
+  }
+  gapAnalysisBundle += `Keywords: ${searchKeywords.join(", ")}\n\n`;
 
   // 3. Structural Roadmap Header
   if (structuralTargets.size > 0) {

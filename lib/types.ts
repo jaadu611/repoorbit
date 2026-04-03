@@ -484,12 +484,89 @@ export interface NotebookEntry {
   covers?: string[];
   reason?: string;
   sub_question: string;
+  /** The file/symbol where the previous notebook's chain ended — the explicit handoff point. */
+  handoff_from?: string;
 }
 
 export interface NotebookPlan {
   notebooks?: NotebookEntry[];
   direct_answer?: string;
   include_meta?: boolean;
+}
+
+// ─── Final Phase (PATH A) rich output types ───────────────────────────────────
+
+export type NeighbourhoodType =
+  | "primary"
+  | "upstream"
+  | "downstream"
+  | "lateral"
+  | "shared_anchor";
+
+export interface FinalPhaseFile {
+  path: string;
+  role: "entry" | "orchestrator" | "core" | "utility" | "config" | "shared_state" | "error_handler" | "test" | "unknown";
+  neighbourhood_type: NeighbourhoodType;
+  symbols_defined: string[];
+  symbols_used: string[];
+  imports: string[];
+  /** Files that import THIS file. */
+  imported_by: string[];
+  summary: string;
+}
+
+export interface FinalPhaseKeySymbol {
+  name: string;
+  defined_in: string;
+  used_in: string[];
+  /** Position in the execution chain. */
+  chain_position: "entry" | "mid" | "terminal";
+}
+
+export interface BoundaryTransition {
+  from: string;
+  to: string;
+  /** Type/shape/event/protocol of what is passed. */
+  payload: string;
+  /** How the payload travels: function call, event, queue, HTTP, shared memory, etc. */
+  mechanism: string;
+}
+
+export interface FinalPhaseSystemDynamics {
+  context: string;
+  concurrency: string;
+  memory: string;
+  hardware_ffi: string;
+}
+
+export interface FinalPhaseErrorResilience {
+  error_paths: string[];
+  fallback_mechanisms: string;
+  safety_boundaries: string;
+}
+
+/** The full structured JSON returned by getFinalPhasePrompt PATH A. */
+export interface FinalPhaseResult {
+  files: FinalPhaseFile[];
+  call_chains: string[];
+  key_symbols: FinalPhaseKeySymbol[];
+  boundary_transitions: BoundaryTransition[];
+  system_dynamics: FinalPhaseSystemDynamics;
+  error_resilience: FinalPhaseErrorResilience;
+  /** Chain nodes or symbols that could not be resolved from provided context. */
+  coverage_gaps: string[];
+}
+
+/** PATH C gap shape — now includes last_known_node for smarter gap scouting. */
+export interface MissingContextResult {
+  status: "MISSING_CONTEXT";
+  missing_link: {
+    target_symbol: string | string[];
+    reason: string;
+    search_keywords: string[];
+    /** The last file/symbol in the chain before the gap. Used to seed the gap scout. */
+    last_known_node?: string;
+  };
 }
 
 export interface JobStatus {

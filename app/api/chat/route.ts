@@ -17,7 +17,13 @@ import {
 } from "@/lib/prompts";
 import { NextResponse } from "next/server";
 import { BrowserContext } from "playwright";
-import { JobStatus, NotebookPlan, RepoLanguage } from "@/lib/types";
+import {
+  JobStatus,
+  NotebookPlan,
+  RepoLanguage,
+  FinalPhaseResult,
+  MissingContextResult,
+} from "@/lib/types";
 
 export const CONTEXT_DIR_PATH = "/tmp/notebooklm_sources";
 export const NOTEBOOKLM_URL = "https://notebooklm.google.com/";
@@ -57,16 +63,29 @@ async function processNotebookPlan(
 
   for (let i = 0; i < total; i++) {
     const nb = plan.notebooks[i];
-    const notebookFolder = path.join(baseDir, nb.name);
+
+    // ── Normalize notebook name to the on-disk folder format ─────────────────
+    // The planner may return a descriptive name like
+    // "notebook_01_tf_function_entry_and_orchestration".  The context builder
+    // always creates folders as "notebook_01", "notebook_02", etc.
+    // Extract the numeric prefix so we always resolve the correct folder,
+    // regardless of what suffix the model appended.
+    const numMatch = nb.name.match(/notebook[_-]?(\d+)/i);
+    const resolvedFolderName = numMatch
+      ? `notebook_${numMatch[1].padStart(2, "0")}`
+      : nb.name;
+    const notebookFolder = path.join(baseDir, resolvedFolderName);
 
     onStatus?.(
-      `Querying ${nb.name} (${i + 1}/${total})...`,
+      `Querying ${resolvedFolderName} (${i + 1}/${total})...`,
       undefined,
       Math.round(((i + 1) / total) * 100),
     );
 
     if (!fs.existsSync(notebookFolder)) {
-      answers.push(`### ${nb.name}\n[ERROR] Folder does not exist.\n`);
+      answers.push(
+        `### ${resolvedFolderName}\n[ERROR] Folder "${resolvedFolderName}" does not exist (planner name: "${nb.name}").\n`,
+      );
       continue;
     }
 
@@ -83,10 +102,14 @@ async function processNotebookPlan(
     ].map((f) => path.join(notebookFolder, f));
 
     if (orderedFiles.length === 0) {
-      answers.push(`### ${nb.name}\n[ERROR] No source files found.\n`);
+      answers.push(
+        `### ${resolvedFolderName}\n[ERROR] No source files found in "${notebookFolder}".\n`,
+      );
       continue;
     }
 
+    // Use the full descriptive name as the NotebookLM title so it's human-readable,
+    // but keep resolvedFolderName as the key for all file-system operations.
     const notebookTitle = `@${repoName} - ${nb.name}`;
 
     let answer = "";
@@ -113,7 +136,7 @@ async function processNotebookPlan(
       answer = `[Error] ${err.message}`;
     }
 
-    answers.push(`### ${nb.name}\n\n${answer}\n`);
+    answers.push(`### ${resolvedFolderName}\n\n${answer}\n`);
 
     if (i < total - 1) {
       await page.goto(NOTEBOOKLM_URL, {
@@ -352,15 +375,41 @@ export async function POST(req: Request) {
         try {
           if (fs.existsSync(roadmapPath)) {
             const graphData = JSON.parse(fs.readFileSync(roadmapPath, "utf-8"));
-            const entryPoints = Object.keys(graphData)
-              .filter(
-                (p) =>
-                  graphData[p] &&
-                  graphData[p].imported_by &&
-                  graphData[p].imported_by.length === 0,
-              )
+            const entries = Object.entries(graphData) as [
+              string,
+              { imports: string[]; imported_by: string[] },
+            ][];
+
+            const entryPoints = entries
+              .filter(([, info]) => info.imported_by.length === 0)
+              .map(([p]) => p)
               .slice(0, 5);
-            roadmapHeader = `### SYSTEM ROADMAP\n\nPrimary Entry Points: ${entryPoints.join(", ")}\n(Full bidirectional graph available in 01_Meta.txt and graph.json)\n\n---\n\n`;
+
+            const sinks = entries
+              .filter(([, info]) => info.imports.length === 0)
+              .map(([p]) => p)
+              .slice(0, 5);
+
+            const hubFiles = entries
+              .sort(
+                ([, a], [, b]) =>
+                  b.imported_by.length - a.imported_by.length,
+              )
+              .slice(0, 5)
+              .map(([p, info]) => `${p} (${info.imported_by.length} consumers)`);
+
+            roadmapHeader = [
+              `### SYSTEM ROADMAP`,
+              ``,
+              `**Primary Entry Points (no upstream imports):** ${entryPoints.join(", ") || "none detected"}`,
+              `**Terminal Sinks (no imports):** ${sinks.join(", ") || "none detected"}`,
+              `**Most-Consumed Hub Files:** ${hubFiles.join("; ") || "none detected"}`,
+              `**Total files in dependency graph:** ${entries.length}`,
+              `(Full bidirectional graph available in graph.json and 00_Root_Manifest.txt)`,
+              ``,
+              `---`,
+              ``,
+            ].join("\n");
           }
         } catch (_) {}
 
@@ -430,7 +479,8 @@ export async function POST(req: Request) {
               : [queryPromptPath],
           );
 
-          let parsedGap: any = null;
+          let parsedGap: MissingContextResult | null = null;
+          let parsedPathA: FinalPhaseResult | null = null;
           try {
             let jsonString = structuralJsonResult
               .replace(/```(?:json)?\s*/gi, "")
@@ -444,8 +494,24 @@ export async function POST(req: Request) {
                 .replace(/[\x00-\x1F]+/g, " ");
               const resultJson = JSON.parse(cleanedJson);
 
-              if (resultJson.status === "MISSING_CONTEXT")
-                parsedGap = resultJson;
+              if (resultJson.status === "MISSING_CONTEXT") {
+                parsedGap = resultJson as MissingContextResult;
+              } else if (resultJson.files || resultJson.call_chains) {
+                // PATH A structured result — capture for diagnostics / downstream use
+                parsedPathA = resultJson as FinalPhaseResult;
+
+                // Log any soft coverage gaps (nodes that couldn't be resolved but
+                // did NOT break chain continuity — these are NOT gap-fill triggers).
+                if (
+                  parsedPathA.coverage_gaps &&
+                  parsedPathA.coverage_gaps.length > 0
+                ) {
+                  console.info(
+                    `[FINAL-PHASE] PATH A coverage gaps (non-breaking):`,
+                    parsedPathA.coverage_gaps,
+                  );
+                }
+              }
             }
           } catch (parseErr: any) {
             console.warn(
@@ -495,15 +561,28 @@ export async function POST(req: Request) {
             return;
           }
 
-          const { target_symbol, target_file, search_keywords } =
-            parsedGap.missing_link;
+          const {
+            target_symbol,
+            search_keywords,
+            last_known_node,
+          } = parsedGap.missing_link;
+
+          // target_file: prefer last_known_node (richer anchor), fall back to missing_link.target_file if present
+          const target_file =
+            last_known_node ||
+            (parsedGap.missing_link as any).target_file ||
+            "";
 
           const gapKeywords: string[] = Array.isArray(search_keywords)
             ? search_keywords
-            : (search_keywords || "").toString().split(",").filter(Boolean);
+            : [];
 
           setStatus(
-            `Gap detected: ${Array.isArray(target_symbol) ? target_symbol.join(", ") : target_symbol}. Scouting sources...`,
+            `Gap detected: ${
+              Array.isArray(target_symbol)
+                ? target_symbol.join(", ")
+                : target_symbol
+            }${last_known_node ? ` (last known node: ${last_known_node})` : ""}. Scouting sources...`,
           );
 
           const symbolList: string[] = Array.isArray(target_symbol)
@@ -522,8 +601,9 @@ export async function POST(req: Request) {
               generateGapFillerNotebook(
                 outDir,
                 sym.toString(),
-                (target_file || "").toString(),
+                target_file.toString(),
                 gapKeywords,
+                last_known_node,
               );
             sf.forEach((f) => mergedSourceFiles.add(f));
             if (ab) mergedBundle += ab + "\n\n";
