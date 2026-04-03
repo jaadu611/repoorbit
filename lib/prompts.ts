@@ -359,59 +359,77 @@ export function getFinalPhasePrompt(
 * Do not trigger PATH C for already resolved symbols.`
     : "";
 
-  return `You are a Lead Systems Engineer performing deep structured context extraction. Your goal is NOT just to find the direct answer — it is to extract a COMPLETE, CONTINUOUS representation of the entire execution neighbourhood surrounding the query, so that the downstream analyst has everything needed to produce a comprehensive, unbroken explanation.
+  return `You are a Lead Systems Engineer performing deep structured context extraction.
+
+Your PRIMARY responsibility is to ensure the execution graph is COMPLETE and CONTINUOUS before producing any final structured output.
+
+---
 
 ### QUERY
 
 ${q}
 
+---
+
 ### CONTEXT PRIORITY
 
-1. gap_filler_NB.txt (if present — authoritative for resolved gaps)
-2. phase2_insights.txt (primary execution analysis)
-3. 00_Root_Manifest.txt (structural backbone and dependency graph)
+1. gap_filler_NB.txt (if present — authoritative)
+2. phase2_insights.txt (execution analysis)
+3. 00_Root_Manifest.txt (graph structure)
+
+---
+
+### CRITICAL PRE-CHECK (MANDATORY — DO THIS FIRST)
+
+Before choosing ANY path, you MUST validate:
+
+1. Does the execution chain have a clear ENTRY POINT?
+2. Are ALL intermediate transitions present (no jumps)?
+3. Are ALL critical symbols resolved (no undefined nodes)?
+4. Do call chains form ONE connected graph (no isolated islands)?
+5. Does phase2_insights.txt explicitly mention missing files, gaps, or unknown flows?
+
+IF ANY of the above is TRUE:
+→ YOU MUST RETURN PATH C
+
+DO NOT PROCEED TO PATH A
 
 ---
 
 ### DECISION
 
-PATH A — STRUCTURED CONTEXT EXTRACTION (PRIMARY):
-Extract a complete machine-readable representation of the FULL execution neighbourhood: not just the direct chain, but all upstream callers, downstream dependencies, lateral siblings, shared state anchors, and error paths. This must form one continuous, gap-free graph.
+PATH A — STRUCTURED CONTEXT (ONLY IF PRE-CHECK PASSES):
+Return FULL execution neighbourhood graph.
 
 PATH B — OPERATIONAL:
-Use ONLY if the query explicitly asks to fix, refactor, implement, or modify code.
+Only if query is asking for code modification.
 
 PATH C — GAP:
-Use ONLY if a symbol or file that is CRITICAL to forming a continuous chain is completely absent from all provided context AND cannot be inferred from graph relationships.
+Triggered if:
+* Any missing file breaks execution continuity
+* phase2_insights.txt mentions missing logic
+* Any symbol in call chain is unresolved
+* Entry point cannot be confidently identified
 
 ---
 
-### EXTRACTION RULES
+### EXTRACTION RULES (FOR PATH A ONLY)
 
-NEIGHBOUR SATURATION (mandatory for PATH A):
-  * UPSTREAM: For every primary file, trace its callers and importers at least 2 hops up. Include entry points, orchestrators, and schedulers.
-  * DOWNSTREAM: Expand all imports and callees — direct and transitive — until you reach leaf utilities or external boundaries.
-  * LATERAL: Identify siblings in the same module that share config, global state, or data sources. Include them in the file list even if not in the primary chain.
-  * SHARED STATE: Any global config, env schema, root type, or singleton that ANY extracted node reads or writes — extract it and document the interaction.
+NEIGHBOUR SATURATION:
+* Expand upstream ≥2 hops
+* Expand downstream fully
+* Include lateral siblings
+* Include ALL shared state
 
-CALL CHAIN CONTINUITY (mandatory):
-  * call_chains must be COMPLETE — every intermediate node explicitly listed between entry and terminal output.
-  * Every transition in the chain must be capturable: if a → b → c, the call_chains entry must be "a → b → c", not "a → c".
-  * If multiple execution paths exist (branches, async flows, error divergence), each must be represented as a separate call_chain entry.
-  * The union of all call_chains must form one connected graph — no island chains.
+CALL CHAIN CONTINUITY:
+* No skipped nodes
+* No partial chains
+* No inferred jumps
 
-SYMBOL RESOLUTION:
-  * Extract ALL symbols relevant to the query's execution neighbourhood, not just the ones on the primary path.
-  * For each symbol, capture: where it is defined, in which files it is used, and at what stage of the chain it appears.
+STRICT RULE:
+If you cannot explicitly name every step → it is a GAP
 
-SYSTEMS DYNAMICS:
-  * For each file, describe the concurrency model active at that point (sync, async, threaded, actor, etc.).
-  * Document memory ownership or resource lifecycle at every boundary crossing.
-  * Flag any hardware, OS, or FFI interaction and explain its timing constraints.
-
-ERROR RESILIENCE:
-  * Extract ALL error paths — not just the happy path.
-  * For each error path, capture: where the failure originates, how it propagates, where it is caught, and what recovery or fallback occurs.
+---
 
 ${gap}
 
@@ -419,104 +437,57 @@ ${gap}
 
 ### OUTPUT
 
-#### PATH A (JSON only — STRUCTURED CONTEXT):
+#### PATH A (JSON ONLY):
 
 {
-"files": [
-{
-  "path": "absolute repo path",
-  "role": "entry | orchestrator | core | utility | config | shared_state | error_handler | test | unknown",
-  "neighbourhood_type": "primary | upstream | downstream | lateral | shared_anchor",
-  "symbols_defined": ["all functions, classes, types, constants defined here"],
-  "symbols_used": ["all external symbols this file consumes"],
-  "imports": ["all resolved file paths this file imports"],
-  "imported_by": ["all resolved file paths that import this file"],
-  "summary": "concise technical role AND how this file connects to its neighbours"
-}
-],
-"call_chains": [
-  "entryPoint → intermediateA → intermediateB → intermediateC → terminalOutput",
-  "entryPoint → errorBranch → errorHandler → fallback"
-],
-"key_symbols": [
-{
-  "name": "symbol_name",
-  "defined_in": "file path",
-  "used_in": ["all file paths where this symbol is consumed"],
-  "chain_position": "entry | mid | terminal"
-}
-],
-"boundary_transitions": [
-{
-  "from": "file_a path",
-  "to": "file_b path",
-  "payload": "what is passed: type/shape/event/protocol",
-  "mechanism": "function call | event | queue | shared memory | HTTP | etc."
-}
-],
-"system_dynamics": {
-  "context": "Specialized for ${lang || "General Systems"}",
-  "concurrency": "threading/async model across the chain",
-  "memory": "ownership and lifecycle across boundaries",
-  "hardware_ffi": "any hardware or FFI interactions and their constraints"
-},
-"error_resilience": {
-  "error_paths": ["origin → propagation → handler → recovery, for each failure class"],
-  "fallback_mechanisms": "fallback strategies and circuit breakers",
-  "safety_boundaries": "what the system guarantees after each failure class"
-},
-"coverage_gaps": [
-  "any chain node or symbol that could not be resolved from provided context"
-]
+"files": [...],
+"call_chains": [...],
+"key_symbols": [...],
+"boundary_transitions": [...],
+"system_dynamics": {...},
+"error_resilience": {...},
+"coverage_gaps": [...]
 }
 
 ---
 
-#### PATH B (JSON only):
+#### PATH B (JSON ONLY):
 
 {
-"intent": "REFACTOR | FIX | FEATURE | OTHERS",
-"task": "Short actionable instruction",
-"deepseek_handoff": {
-  "goal": "Definition of done",
-  "current_logic": "Existing behaviour and issue",
-  "symbols": ["Key functions/types/constants"]
-},
-"extraction_manifest": [
-{
-  "file_path": "absolute repo path",
-  "chunk_id": "chunk id",
-  "justification": "why needed"
-}
-]
+"intent": "...",
+"task": "...",
+"deepseek_handoff": {...},
+"extraction_manifest": [...]
 }
 
 ---
 
-#### PATH C (JSON only):
+#### PATH C (JSON ONLY):
 
 {
 "status": "MISSING_CONTEXT",
 "missing_link": {
   "target_symbol": "name",
-  "reason": "why this symbol is critical to chain continuity",
+  "reason": "why this breaks execution continuity",
   "search_keywords": ["k1", "k2"],
-  "last_known_node": "the last file/symbol in the chain before the gap"
+  "last_known_node": "last resolvable node before gap"
 }
 }
 
 ---
 
-### CONSTRAINTS
+### HARD CONSTRAINTS
 
-  * Output MUST be valid JSON only.
-  * Response MUST start with { and end with }.
-  * NO text before or after JSON.
-  * NO markdown.
-  * Must be directly parseable by JSON.parse().
-  * Use only provided context — do not hallucinate behaviour.
-  * Do not skip required dependencies or neighbours.
-  * PATH C must only be used if the gap is CHAIN-BREAKING — a missing neighbour that does not break continuity is a coverage_gap, not a PATH C trigger.`;
+* You MUST perform PRE-CHECK before deciding output
+* If ANY doubt exists → choose PATH C
+* DO NOT assume missing logic
+* DO NOT compress chains
+* DO NOT infer hidden nodes
+
+* Output MUST be valid JSON only
+* Must start with { and end with }
+* No markdown
+* No extra text`;
 }
 
 export function getStaffEngineerPrompt(
