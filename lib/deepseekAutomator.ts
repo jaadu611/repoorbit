@@ -2,16 +2,17 @@ import { Page } from "playwright";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { DEEPSEEK_CODING_PROMPT } from "./prompts";
 
-import { NotebookEntry, NotebookPlan } from "@/lib/types";
+import { NotebookPlan } from "@/lib/types";
 
 export async function askDeepseek(
   page: Page,
   query: string,
   manifestContent: string,
+  contextDir: string,
   onStatus?: (msg: string, partial?: string, progress?: number) => void,
-): Promise<NotebookPlan> {
+  outDir: string = "",
+): Promise<string> {
   const url = page.url();
   if (!url.includes("chat.deepseek.com")) {
     onStatus?.("Navigating to Deepseek...");
@@ -22,36 +23,131 @@ export async function askDeepseek(
     await page.waitForTimeout(3000);
   }
 
-  onStatus?.("Preparing manifest file for upload...");
-  const tmpPath = path.join(os.tmpdir(), `manifest_${Date.now()}.txt`);
-  fs.writeFileSync(tmpPath, manifestContent, "utf-8");
-
-  try {
-    onStatus?.("Uploading manifest to Deepseek...");
-    await uploadFileToDeepseek(page, tmpPath);
-  } finally {
-    try {
-      fs.unlinkSync(tmpPath);
-    } catch {}
+  // Create a unique session directory for this specific run
+  const sessionDir = path.join(os.tmpdir(), `deepseek_upload_${Date.now()}`);
+  if (!fs.existsSync(sessionDir)) {
+    fs.mkdirSync(sessionDir, { recursive: true });
   }
 
-  onStatus?.("Sending query to Deepseek...");
-  const message = buildPrompt(query);
+  const allTmpPaths: string[] = [];
 
-  await typeAndSubmit(page, message);
+  // ── 1. Stage Context Files (from deepseek_context folder) ────────────────
+  if (fs.existsSync(contextDir)) {
+    const contextFiles = fs
+      .readdirSync(contextDir)
+      .filter((f) => f.endsWith(".js") || f.endsWith(".txt"))
+      .sort((a, b) => {
+        if (a === "context.js") return -1;
+        if (b === "context.js") return 1;
+        return a.localeCompare(b);
+      });
+
+    for (const fileName of contextFiles) {
+      const content = fs.readFileSync(path.join(contextDir, fileName), "utf-8");
+      const tmpPath = path.join(sessionDir, fileName);
+      fs.writeFileSync(tmpPath, content, "utf-8");
+      allTmpPaths.push(tmpPath);
+      console.log(`[Deepseek] Staged Context: ${fileName}`);
+    }
+  }
+
+  // ── 2. Stage Structural Metadata ─────────────────────────────────────────
+  //
+  // FIXED: metadata files live in outDir (/tmp/notebooklm_sources/<owner>/<repo>/)
+  // NOT in process.cwd() (the Next.js project root).
+  // outDir is passed in from route.ts and is the same directory that contains
+  // the notebook folders, graph.json, symbols.json, and the manifests.
+  //
+  // Priority order for manifest: annotated version first (has relevance scores),
+  // fall back to raw manifest if annotated doesn't exist yet.
+
+  const metadataBase = outDir && fs.existsSync(outDir) ? outDir : process.cwd();
+
+  const rootMetadata = [
+    "00_Root_Manifest_Annotated.txt",
+    "graph.json",
+    "symbols.json",
+  ];
+
+  for (const fileName of rootMetadata) {
+    const filePath = path.join(metadataBase, fileName);
+    if (fs.existsSync(filePath)) {
+      const content = fs.readFileSync(filePath, "utf-8");
+      const tmpPath = path.join(sessionDir, fileName);
+      fs.writeFileSync(tmpPath, content, "utf-8");
+      allTmpPaths.push(tmpPath);
+      console.log(
+        `[Deepseek] Staged Metadata: ${fileName} (from ${metadataBase})`,
+      );
+    } else {
+      // If annotated manifest not found, try raw manifest as fallback
+      if (fileName === "00_Root_Manifest_Annotated.txt") {
+        const fallback = path.join(metadataBase, "00_Root_Manifest.txt");
+        if (fs.existsSync(fallback)) {
+          const content = fs.readFileSync(fallback, "utf-8");
+          const tmpPath = path.join(
+            sessionDir,
+            "00_Root_Manifest_Annotated.txt",
+          );
+          fs.writeFileSync(tmpPath, content, "utf-8");
+          allTmpPaths.push(tmpPath);
+          console.log(
+            `[Deepseek] Staged Metadata: 00_Root_Manifest.txt as fallback (from ${metadataBase})`,
+          );
+        } else {
+          console.error(
+            `[Deepseek] CRITICAL: Neither annotated nor raw manifest found in ${metadataBase}`,
+          );
+        }
+      } else {
+        console.error(
+          `[Deepseek] CRITICAL: ${fileName} NOT FOUND at ${filePath}`,
+        );
+      }
+    }
+  }
+
+  // ── 4. Stage Session Manifest ────────────────────────────────────────────
+  const manifestTmpPath = path.join(sessionDir, "manifest.txt");
+  fs.writeFileSync(manifestTmpPath, manifestContent, "utf-8");
+  allTmpPaths.push(manifestTmpPath);
+  console.log(`[Deepseek] Staged Session Manifest → manifest.txt`);
+
+  // ── 5. Single Atomic Upload ──────────────────────────────────────────────
+  onStatus?.(`Uploading ${allTmpPaths.length} file(s) to Deepseek...`);
+  await uploadFilesToDeepseek(page, allTmpPaths);
+
+  // ── 6. Send Query ────────────────────────────────────────────────────────
+  onStatus?.("Sending query to Deepseek...");
+  await typeAndSubmit(page, query);
 
   onStatus?.("Waiting for Deepseek to respond...");
-
   const rawText = await waitForDeepseekCompletion(page, onStatus);
 
-  onStatus?.("Parsing Deepseek response...");
-  return parseNotebookPlan(rawText);
+  return rawText;
 }
 
-async function uploadFileToDeepseek(
+export function cleanupDeepseekTempFiles(paths: string[]): void {
+  for (const p of paths) {
+    try {
+      if (fs.existsSync(p)) {
+        fs.unlinkSync(p);
+        console.log(`[Deepseek] Cleaned up temp file: ${p}`);
+      }
+    } catch (e) {
+      console.warn(`[Deepseek] Could not delete temp file ${p}:`, e);
+    }
+  }
+}
+
+// ── Single multi-file upload ──────────────────────────────────────────────────
+
+async function uploadFilesToDeepseek(
   page: Page,
-  filePath: string,
+  filePaths: string[],
 ): Promise<void> {
+  if (filePaths.length === 0) return;
+
   const attachSelectors = [
     'button[aria-label*="attach" i]',
     'button[aria-label*="upload" i]',
@@ -59,7 +155,6 @@ async function uploadFileToDeepseek(
     'label[for*="file" i]',
     'button[data-testid*="attach" i]',
     'button svg[data-icon="paperclip"]',
-    'button:has(svg[viewBox]) ~ input[type="file"]',
   ];
 
   let fileInput = await page.$('input[type="file"]');
@@ -98,32 +193,22 @@ async function uploadFileToDeepseek(
 
   if (!fileInput) {
     throw new Error(
-      "Could not find a file input on DeepSeek to upload the manifest. " +
-        "Skipping file upload — manifest will not be attached.",
+      "Could not find a file input on DeepSeek. Context will not be attached.",
     );
   }
 
-  await fileInput.setInputFiles(filePath);
+  // Pass all paths at once — Playwright handles multi-file upload atomically
+  await fileInput.setInputFiles(filePaths);
 
-  // Wait for upload indicator to appear and then disappear (upload complete)
   try {
-    // Wait up to 15s for an upload progress/success indicator
     await page.waitForSelector(
       '[class*="upload"], [class*="attach"], [class*="file-preview"], [aria-label*="uploaded" i]',
-      { timeout: 15000 },
+      { timeout: 20000 },
     );
-    // Then wait for it to settle (no spinner)
-    await page.waitForTimeout(1500);
-  } catch {
-    // No upload indicator found — just wait a moment and continue
     await page.waitForTimeout(2000);
+  } catch {
+    await page.waitForTimeout(3000);
   }
-}
-
-// ─── Prompt builder ───────────────────────────────────────────────────────────
-
-function buildPrompt(query: string): string {
-  return `${DEEPSEEK_CODING_PROMPT}${query}`;
 }
 
 // ─── Input & submit ───────────────────────────────────────────────────────────
@@ -143,17 +228,14 @@ async function typeAndSubmit(page: Page, message: string): Promise<void> {
     await page.keyboard.press("Control+a");
     await page.keyboard.press("Delete");
     await page.waitForTimeout(100);
-    // Use clipboard paste for speed and to avoid contenteditable quirks
     await page.evaluate((text) => {
       const el = document.querySelector(
         '#chat-input, textarea, [contenteditable="true"]',
       ) as HTMLElement;
       if (el) {
         el.focus();
-        // For contenteditable
         if (el.getAttribute("contenteditable") !== null) {
           el.innerText = text;
-          // Dispatch input event so React/Vue pick up the change
           el.dispatchEvent(new Event("input", { bubbles: true }));
         }
       }
@@ -166,10 +248,6 @@ async function typeAndSubmit(page: Page, message: string): Promise<void> {
 
 // ─── Response polling ─────────────────────────────────────────────────────────
 
-/**
- * Polls until DeepSeek's last assistant bubble has been unchanged for
- * STABLE_POLLS_NEEDED consecutive 1-second ticks AND the Stop button is gone.
- */
 async function waitForDeepseekCompletion(
   page: Page,
   onStatus?: (msg: string, partial?: string, progress?: number) => void,
@@ -180,7 +258,6 @@ async function waitForDeepseekCompletion(
   let stableCount = 0;
   const STABLE_POLLS_NEEDED = 5;
 
-  // Give DeepSeek a moment to start generating before we poll
   await page.waitForTimeout(2000);
 
   while (Date.now() - startTime < timeoutMs) {
@@ -188,7 +265,6 @@ async function waitForDeepseekCompletion(
       text: string;
       isGenerating: boolean;
     } | null>(() => {
-      // ── Is DeepSeek still generating? ────────────────────────────────────
       const isGenerating =
         Array.from(
           document.querySelectorAll('button, div[role="button"]'),
@@ -205,17 +281,11 @@ async function waitForDeepseekCompletion(
           '.ds-loading, [class*="loading"], [class*="generating"], [class*="spinner"]',
         ) !== null;
 
-      // ── Find the last assistant message ───────────────────────────────────
-      // Priority order: most specific → most generic
       const selectors = [
-        // DeepSeek v2+ role attribute
         '[data-message-author-role="assistant"]',
-        // DeepSeek classic markdown wrapper
         ".ds-markdown",
-        // Common markdown renderers, excluding user bubbles
         '.markdown-body:not([class*="user"])',
         '.prose:not([class*="user"])',
-        // Any element with "assistant" in its class/data
         '[class*="assistant"]',
       ];
 
@@ -229,11 +299,8 @@ async function waitForDeepseekCompletion(
       }
 
       if (!lastBubble) return null;
-
-      // Grab innerText (rendered text, not raw HTML)
       const text = lastBubble.innerText?.trim() ?? "";
       if (!text) return null;
-
       return { text, isGenerating };
     });
 
@@ -256,7 +323,6 @@ async function waitForDeepseekCompletion(
     await page.waitForTimeout(1000);
   }
 
-  // If we timed out but have something, return it rather than throwing
   if (lastSeenText.length > 0) {
     onStatus?.("Deepseek timed out — using partial response.");
     return lastSeenText;
@@ -269,16 +335,8 @@ async function waitForDeepseekCompletion(
 
 // ─── Response parser ──────────────────────────────────────────────────────────
 
-/**
- * Extracts a NotebookPlan from DeepSeek's raw response. Handles:
- *   - Clean JSON
- *   - ```json ... ``` or ```typescript ... ``` fenced blocks
- *   - JS/TS variable assignments:  const X = { ... }  or  HARDCODED_PLAN = { ... }
- *   - JSON object embedded anywhere in prose
- */
 export function parseNotebookPlan(raw: string): NotebookPlan {
   const attempts: Array<() => NotebookPlan | null> = [
-    // 1. Clean JSON string
     () => {
       try {
         return validatePlan(JSON.parse(raw.trim()));
@@ -286,22 +344,15 @@ export function parseNotebookPlan(raw: string): NotebookPlan {
         return null;
       }
     },
-
-    // 2. ```json ... ``` or ``` ... ``` fence (any language tag)
     () => {
       const m = raw.match(/```(?:[a-z]*)?\s*([\s\S]*?)```/i);
       if (!m) return null;
-      // Strip JS/TS variable assignment inside the fence
-      const inner = stripAssignment(m[1].trim());
       try {
-        return validatePlan(JSON.parse(inner));
+        return validatePlan(JSON.parse(stripAssignment(m[1].trim())));
       } catch {
         return null;
       }
     },
-
-    // 3. JS/TS variable assignment outside a fence:
-    //    const PLAN = { ... }  /  let x = { ... }  /  HARDCODED_PLAN = { ... }
     () => {
       const m = raw.match(
         /(?:const|let|var)?\s*\w+\s*=\s*(\{[\s\S]*"notebooks"[\s\S]*\})/,
@@ -313,17 +364,13 @@ export function parseNotebookPlan(raw: string): NotebookPlan {
         return null;
       }
     },
-
-    // 4. Bare JSON object containing "notebooks" anywhere in the text
     () => {
-      // Find the first '{' that introduces the notebooks object
       const start = raw.indexOf('{"notebooks"');
       const altStart = raw.indexOf('{ "notebooks"');
       const idx = [start, altStart]
         .filter((i) => i >= 0)
         .sort((a, b) => a - b)[0];
       if (idx === undefined || idx < 0) return null;
-      // Walk forward to find the matching closing brace
       const slice = extractBalancedObject(raw, idx);
       if (!slice) return null;
       try {
@@ -332,8 +379,6 @@ export function parseNotebookPlan(raw: string): NotebookPlan {
         return null;
       }
     },
-
-    // 5. Any JSON object in the text (broadest fallback)
     () => {
       const idx = raw.indexOf("{");
       if (idx < 0) return null;
@@ -358,7 +403,6 @@ export function parseNotebookPlan(raw: string): NotebookPlan {
   );
 }
 
-/** Strips  `const FOO =` / `let foo =` / `PLAN =`  prefix from a string. */
 function stripAssignment(s: string): string {
   return s
     .replace(/^(?:(?:const|let|var)\s+)?\w+\s*=\s*/, "")
@@ -366,10 +410,6 @@ function stripAssignment(s: string): string {
     .replace(/;$/, "");
 }
 
-/**
- * Extracts the balanced `{ ... }` object starting at `startIdx` in `text`.
- * Returns null if braces don't balance within the string.
- */
 function extractBalancedObject(text: string, startIdx: number): string | null {
   let depth = 0;
   let inString = false;
@@ -378,7 +418,6 @@ function extractBalancedObject(text: string, startIdx: number): string | null {
 
   for (let i = startIdx; i < text.length; i++) {
     const ch = text[i];
-
     if (escape) {
       escape = false;
       continue;
@@ -387,12 +426,10 @@ function extractBalancedObject(text: string, startIdx: number): string | null {
       escape = true;
       continue;
     }
-
     if (inString) {
       if (ch === quoteChar) inString = false;
       continue;
     }
-
     if (ch === '"' || ch === "'") {
       inString = true;
       quoteChar = ch;
@@ -407,13 +444,12 @@ function extractBalancedObject(text: string, startIdx: number): string | null {
   return null;
 }
 
-// ─── Validator ────────────────────────────────────────────────────────────────
-
 function validatePlan(obj: unknown): NotebookPlan {
   if (
     !obj ||
     typeof obj !== "object" ||
-    (!Array.isArray((obj as any).notebooks) && typeof (obj as any).direct_answer !== "string")
+    (!Array.isArray((obj as any).notebooks) &&
+      typeof (obj as any).direct_answer !== "string")
   ) {
     throw new Error(
       "Invalid NotebookPlan shape: expected { notebooks: [...] } or { direct_answer: '...' }",
@@ -421,9 +457,7 @@ function validatePlan(obj: unknown): NotebookPlan {
   }
 
   const plan = obj as NotebookPlan;
-
   if (plan.direct_answer) return plan;
-
   if (!plan.notebooks || plan.notebooks.length === 0) {
     throw new Error("NotebookPlan has zero notebooks.");
   }

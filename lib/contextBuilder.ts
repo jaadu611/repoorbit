@@ -1,4 +1,4 @@
-import { mkdirSync } from "fs";
+import fs, { mkdirSync } from "fs";
 import { writeFile, readFile } from "fs/promises";
 import { join } from "path";
 
@@ -565,16 +565,13 @@ function extractCSymbols(content: string): string[] {
   return [...syms];
 }
 
-const symbolIndex: Record<
+let _repoorbit_symbol_index: Record<
   string,
-  {
-    defined_in: string;
-    used_in: string[];
-  }
-> = {};
+  { defined_in: string; used_by_files: string }
+> = Object.create(null);
 
 function clearSymbolIndex(): void {
-  for (const key in symbolIndex) delete symbolIndex[key];
+  _repoorbit_symbol_index = Object.create(null);
 }
 
 // ─── Import Resolution ────────────────────────────────────────────────────────
@@ -906,14 +903,16 @@ function buildBidirectionalGraph(
     if (!graph.imports[filePath]) graph.imports[filePath] = [];
     if (!graph.imported_by[filePath]) graph.imported_by[filePath] = [];
 
+    if (isDocFile(filePath)) continue;
+
     const content = safeContent(file);
     const { defined, used } = extractSymbols(content);
 
     // Build symbol index
     for (const sym of defined) {
-      symbolIndex[sym] = {
+      _repoorbit_symbol_index[sym] = {
         defined_in: filePath,
-        used_in: [],
+        used_by_files: "",
       };
     }
 
@@ -927,12 +926,18 @@ function buildBidirectionalGraph(
     const filePath = file.path as string;
     const used = (file as any).symbolsUsed || [];
     for (const sym of used) {
-      if (symbolIndex[sym] && symbolIndex[sym].defined_in !== filePath) {
-        if (!symbolIndex[sym].used_in) {
-          symbolIndex[sym].used_in = [];
+      const entry = _repoorbit_symbol_index[sym];
+      if (entry && entry.defined_in !== filePath) {
+        if (!entry.used_by_files) {
+          entry.used_by_files = "";
         }
-        if (!symbolIndex[sym].used_in.includes(filePath)) {
-          symbolIndex[sym].used_in.push(filePath);
+        const currentUsages = entry.used_by_files
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        if (!currentUsages.includes(filePath)) {
+          currentUsages.push(filePath);
+          entry.used_by_files = currentUsages.join(", ");
         }
       }
     }
@@ -1725,32 +1730,67 @@ function getCIncludeGraphSummary(
   return `## C Include Graph (selected files)\n\nLocal #include relationships among included files:\n\n${entries.join("\n")}`;
 }
 
-// ─── Function block parsing ───────────────────────────────────────────────────
-
 function parseFunctionBlocks(content: string): FunctionBlock[] {
   const lines = content.split("\n");
   const blocks: FunctionBlock[] = [];
-  const startRe =
+
+  // ES6 patterns (existing)
+  const es6StartRe =
     /^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s*\*?\s*(\w+)|class\s+(\w+)|const\s+(\w+)\s*=|let\s+(\w+)\s*=|var\s+(\w+)\s*=)/;
+
+  const commonjsStartRe =
+    /^(?:[\w$]+(?:\.(?:prototype|exports))?\.\w+|[\w$]+\[[\w'"]+\]|module\.exports)\s*=\s*(?:async\s+)?function/;
+
   const decoratorRe = /^@\w+/;
+
+  const isBlockStart = (line: string) => {
+    const trimmed = line.trim();
+    return es6StartRe.test(trimmed) || commonjsStartRe.test(trimmed);
+  };
+
+  const extractName = (line: string): string => {
+    const trimmed = line.trim();
+
+    // CommonJS: proto.handle = function handle / proto.handle = function(
+    const cjsNamed = trimmed.match(
+      /^([\w$]+(?:\.(?:prototype|exports))?\.\w+|[\w$]+\[[\w'"]+\]|module\.exports)\s*=\s*(?:async\s+)?function\s*(\w+)?/,
+    );
+    if (cjsNamed) {
+      // Prefer the explicit function name (m[2]), fall back to the LHS property name
+      if (cjsNamed[2]) return cjsNamed[2];
+      const lhs = cjsNamed[1];
+      // e.g. "proto.handle" -> "handle", "Router.prototype.process_params" -> "process_params"
+      return lhs.split(".").pop() ?? lhs;
+    }
+
+    // ES6 patterns
+    const es6 = es6StartRe.exec(trimmed);
+    if (es6)
+      return es6[1] ?? es6[2] ?? es6[3] ?? es6[4] ?? es6[5] ?? "anonymous";
+
+    return "anonymous";
+  };
 
   let i = 0;
   while (i < lines.length) {
+    // Skip decorators
     let decoratorStart: number | null = null;
     while (i < lines.length && decoratorRe.test(lines[i].trim())) {
       if (decoratorStart === null) decoratorStart = i;
       i++;
     }
-    const m = startRe.exec(lines[i]?.trim() ?? "");
-    if (!m) {
+
+    if (i >= lines.length) break;
+
+    if (!isBlockStart(lines[i])) {
       i++;
       continue;
     }
 
-    const name = m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5] ?? "anonymous";
+    const name = extractName(lines[i]);
     const blockStart = decoratorStart ?? i;
-    let depth = 0,
-      hasOpenedBrace = false;
+    let depth = 0;
+    let hasOpenedBrace = false;
     let inString: string | null = null;
     let inTemplateBraceDepth = 0;
     let j = i;
@@ -2249,17 +2289,13 @@ function getFileContext(
 
   if (content.length > FILE_CHAR_LIMIT) {
     if (blocks.length === 0) {
-      const len = content.length;
-      const s1 = content.slice(0, Math.floor(len * 0.1));
-      const s2 = content.slice(Math.floor(len * 0.4), Math.floor(len * 0.6));
-      const s3 = content.slice(Math.floor(len * 0.9));
-      content =
-        s1 +
-        "\n\n[... TRUNCATED SAMPLING WINDOW ...]\n\n" +
-        s2 +
-        "\n\n[... TRUNCATED SAMPLING WINDOW ...]\n\n" +
-        s3;
-      return [...headerParts, "", `\`\`\`${ext}`, content, "```"].join("\n");
+      const cut = content.lastIndexOf("\n", FILE_CHAR_LIMIT);
+      const truncated =
+        content.slice(0, cut > 0 ? cut : FILE_CHAR_LIMIT) +
+        `\n\n[TRUNCATED: file exceeds ${FILE_CHAR_LIMIT.toLocaleString()} characters. ` +
+        `Showing first ${FILE_CHAR_LIMIT.toLocaleString()} characters only. ` +
+        `If critical symbols are missing from this excerpt, declare PATH C so the gap filler can extract them.]`;
+      return [...headerParts, "", `\`\`\`${ext}`, truncated, "```"].join("\n");
     } else {
       blocks = prioritizeBlocks(blocks);
     }
@@ -2404,7 +2440,7 @@ async function writeNotebookFolder(
 }
 
 function getSymbolIndexSummary(): string {
-  const symbols = Object.keys(symbolIndex).sort();
+  const symbols = Object.keys(_repoorbit_symbol_index).sort();
   if (symbols.length === 0) return "";
 
   const lines = [
@@ -2413,10 +2449,10 @@ function getSymbolIndexSummary(): string {
     "Do NOT hallucinate definitions. If a symbol is listed here, the mapped file is the authoritative source.\n",
   ];
   for (const sym of symbols) {
-    const entry = symbolIndex[sym];
+    const entry = _repoorbit_symbol_index[sym];
     const usages =
-      entry.used_in.length > 0
-        ? ` (Consumed by: ${entry.used_in.slice(0, 10).join(", ")}${entry.used_in.length > 10 ? "..." : ""})`
+      entry.used_by_files.length > 0
+        ? ` (Consumed by: ${entry.used_by_files.split(", ").slice(0, 10).join(", ")}${entry.used_by_files.split(", ").length > 10 ? "..." : ""})`
         : " (No detected external consumers)";
     lines.push(`- **${sym}**: defined in \`${entry.defined_in}\`${usages}`);
   }
@@ -2465,7 +2501,7 @@ async function writeRootManifest(
     `Mode: ${droppedTiers.length > 0 ? "BUDGET-CONSTRAINED (dropped tiers: " + droppedTiers.join(",") + ")" : "FULL (all source files)"}`,
     `Total files considered: ${allCandidatesCount}`,
     `Total source files selected: ${totalSourceFiles}`,
-    `Split into ${folderInfos.length} notebooks (max 49 files per notebook)`,
+    `Split into ${folderInfos.length} notebooks (max 48 files per notebook)`,
     "",
   ];
 
@@ -2498,6 +2534,17 @@ async function writeRootManifest(
     }
     lines.push("");
   }
+
+  lines.push("## Source Mirror");
+  lines.push("Raw source files are available in the source_mirror/ directory.");
+  lines.push("These are the original unprocessed files from the repository.");
+  lines.push(
+    "When a file is listed in a notebook above, its raw source is at:",
+  );
+  lines.push("  source_mirror/<original_path>");
+  lines.push("Example: src/permit.js → source_mirror/src/permit.js");
+  lines.push("");
+
   lines.push("END OF MANIFEST");
 
   const rootManifestPath = join(outputDir, "00_Root_Manifest.txt");
@@ -2818,16 +2865,16 @@ export async function buildMasterContext(
 
     for (let i = 0; i < sortedFiles.length; i++) {
       const file = sortedFiles[i];
-      const notebookIdx = Math.floor(i / 49);
+      const notebookIdx = Math.floor(i / 48);
       const deps = (mergedImportGraph[file.path] ?? []).slice().sort();
       const crossDeps: string[] = [];
 
       for (const depPath of deps) {
         const depGlobalIdx = globalFileIndexMap.get(depPath);
         if (depGlobalIdx !== undefined) {
-          const depNotebookIdx = Math.floor(depGlobalIdx / 49);
+          const depNotebookIdx = Math.floor(depGlobalIdx / 48);
           if (depNotebookIdx !== notebookIdx) {
-            const depLocalIdx = depGlobalIdx % 49;
+            const depLocalIdx = depGlobalIdx % 48;
             const depLocalFileName = `file_${String(depLocalIdx + 1).padStart(3, "0")}_NB${depNotebookIdx + 1}.txt`;
             const depNotebookName = `notebook_${String(depNotebookIdx + 1).padStart(2, "0")}`;
             crossDeps.push(
@@ -2848,7 +2895,7 @@ export async function buildMasterContext(
 
     for (let i = 0; i < sortedFiles.length; i++) {
       const file = sortedFiles[i];
-      const notebookIdx = Math.floor(i / 49);
+      const notebookIdx = Math.floor(i / 48);
       const notebookName = `notebook_${String(notebookIdx + 1).padStart(2, "0")}`;
       const crossDeps = fileCrossDeps.get(i) ?? [];
 
@@ -2892,7 +2939,18 @@ export async function buildMasterContext(
     pushMeta(depLines.join("\n"));
   }
 
-  const batches = splitSourceBlocksIntoBatches(sourceBlocks, 49);
+  const mirrorDir = join(outputDir, "source_mirror");
+  if (!fs.existsSync(mirrorDir)) mkdirSync(mirrorDir, { recursive: true });
+  for (const file of filesMetadata) {
+    if (!file.path || file.type === "folder" || file.type === "tree") continue;
+    const rawPath = join(mirrorDir, file.path);
+    if (fs.existsSync(rawPath) && fs.statSync(rawPath).isDirectory()) continue;
+    const rawDir = join(rawPath, "..");
+    if (!fs.existsSync(rawDir)) mkdirSync(rawDir, { recursive: true });
+    await writeFile(rawPath, safeContent(file), "utf-8");
+  }
+
+  const batches = splitSourceBlocksIntoBatches(sourceBlocks, 48);
   const folderInfos = [];
   for (let i = 0; i < batches.length; i++) {
     const info = await writeNotebookFolder(batches[i], i, outputDir);
@@ -2900,7 +2958,17 @@ export async function buildMasterContext(
   }
 
   const symbolsPath = join(outputDir, "symbols.json");
-  await writeFile(symbolsPath, JSON.stringify(symbolIndex, null, 2), "utf-8");
+  const serializedSymbolIndex = Object.fromEntries(
+    Object.entries(_repoorbit_symbol_index).map(([sym, data]) => [
+      sym,
+      { defined_in: data.defined_in, used_by_files: data.used_by_files },
+    ]),
+  );
+  await writeFile(
+    symbolsPath,
+    JSON.stringify(serializedSymbolIndex, null, 2),
+    "utf-8",
+  );
 
   const { rootManifestPath } = await writeRootManifest(
     metaTexts,

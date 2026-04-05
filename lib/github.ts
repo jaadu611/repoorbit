@@ -1,5 +1,4 @@
 import path from "path";
-import fs from "fs";
 import { RepoContext, RepoTreeEntry, CommitDetail } from "./types";
 
 export async function fetchFileContents(
@@ -15,6 +14,7 @@ export async function fetchFileContents(
 
   const token =
     process.env.GITHUB_TOKEN || process.env.NEXT_PUBLIC_GITHUB_TOKEN;
+
   const allChunks = [];
   for (let i = 0; i < files.length; i += CHUNK_SIZE) {
     allChunks.push(files.slice(i, i + CHUNK_SIZE));
@@ -69,6 +69,82 @@ export async function fetchFileContents(
         } catch (err: any) {}
       }),
     );
+  }
+
+  const droppedFiles = files.filter((f: any) => !result.has(f.path));
+
+  if (droppedFiles.length > 0) {
+    onStatus?.(
+      `Fetching ${droppedFiles.length} large/binary file(s) via REST fallback...`,
+      undefined,
+      undefined,
+    );
+
+    const REST_CONCURRENCY = 5;
+
+    for (let i = 0; i < droppedFiles.length; i += REST_CONCURRENCY) {
+      const batch = droppedFiles.slice(i, i + REST_CONCURRENCY);
+      const batchNum = Math.floor(i / REST_CONCURRENCY) + 1;
+      const totalBatches = Math.ceil(droppedFiles.length / REST_CONCURRENCY);
+      const batchStart = Date.now();
+
+      await Promise.all(
+        batch.map(async (f: any) => {
+          const fileStart = Date.now();
+          try {
+            const url =
+              `https://api.github.com/repos/${owner}/${repo}/contents/` +
+              `${encodeURIComponent(f.path)}?ref=${encodeURIComponent(ref)}`;
+
+            const res = await fetch(url, {
+              headers: {
+                Accept: "application/vnd.github.raw",
+                "User-Agent": "RepoOrbit",
+                "X-GitHub-Api-Version": "2022-11-28",
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+              },
+            });
+
+            if (!res.ok) {
+              const errBody = await res.text().catch(() => "(unreadable)");
+              console.warn(
+                `[REST]   X ${f.path} -- non-OK: ${errBody.slice(0, 200)}`,
+              );
+              return; // still silently skip -- best effort
+            }
+
+            const text = await res.text();
+
+            if (text) {
+              result.set(f.path, text);
+            }
+          } catch (err: any) {
+            // Best-effort -- log but don't throw
+            console.warn(
+              `[REST]   X EXCEPTION ${f.path} after ${Date.now() - fileStart}ms:`,
+              err.message,
+            );
+          }
+        }),
+      );
+    }
+
+    const recovered = droppedFiles.filter((f: any) => result.has(f.path));
+    if (recovered.length > 0) {
+      onStatus?.(
+        `REST fallback recovered ${recovered.length}/${droppedFiles.length} file(s): ${recovered.map((f: any) => f.path).join(", ")}`,
+        undefined,
+        undefined,
+      );
+    }
+
+    const stillMissing = droppedFiles.filter((f: any) => !result.has(f.path));
+    if (stillMissing.length > 0) {
+      console.warn(
+        `[fetchFileContents] ${stillMissing.length} file(s) could not be fetched by either GraphQL or REST:`,
+        stillMissing.map((f: any) => f.path),
+      );
+    }
   }
 
   return result;
@@ -255,7 +331,6 @@ function resolveImportPath(
 ): string | null {
   if (!importPath || !fileSet) return null;
 
-  // ignore external libs (only resolve relative or alias-like for now)
   if (!importPath.startsWith(".") && !importPath.startsWith("@")) return null;
 
   const baseDir = path.dirname(fromFile);
@@ -263,18 +338,15 @@ function resolveImportPath(
     ? importPath.replace("@/", "")
     : path.join(baseDir, importPath);
 
-  // Normalize path (remove leading /, preserve relative)
   if (resolved.startsWith("/")) resolved = resolved.slice(1);
 
   const extensions = [".ts", ".tsx", ".js", ".jsx", ".py"];
 
-  // Direct match
   for (const ext of extensions) {
     const full = resolved + ext;
     if (fileSet.has(full)) return full;
   }
 
-  // Index fallback
   for (const ext of extensions) {
     const indexFile = path.join(resolved, "index" + ext);
     if (fileSet.has(indexFile)) return indexFile;
@@ -434,7 +506,6 @@ export const getRepoData = async (owner: string, repo: string) => {
       `https://api.github.com/repos/${owner}/${repo}/branches?per_page=30`,
       { headers: getHeaders(), ...withCache },
     ),
-
     fetch(
       `https://api.github.com/repos/${owner}/${repo}/issues?state=open&per_page=30&pulls=false`,
       { headers: getHeaders(), ...withCache },

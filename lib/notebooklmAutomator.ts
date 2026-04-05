@@ -22,8 +22,8 @@ export function parseNotebookPlan(raw: string): NotebookPlan {
   if (jsonMatch) {
     clean = jsonMatch[0];
   }
-  
-  // Strip control characters (including literal newlines/tabs inside strings) 
+
+  // Strip control characters (including literal newlines/tabs inside strings)
   // that would otherwise break JSON.parse.
   clean = clean.replace(/[\x00-\x1F]+/g, " ");
 
@@ -529,37 +529,67 @@ export async function automateNotebookLM(
     // Dynamic wait for all files to be processed
     const startWait = Date.now();
     let allProcessed = false;
-    
-    onStatus?.("Waiting for UI to render uploaded sources...");
-    while (Date.now() - startWait < 90000) { // Max 90 seconds wait
-      const currentDom = await page.evaluate(() => document.body.innerText || "");
-      allProcessed = true;
-      for (const file of files) {
-        const baseName = path.basename(file);
-        const baseNoExt = baseName.replace(/\.txt$/i, "");
-        if (!currentDom.includes(baseName) && !currentDom.includes(baseNoExt)) {
-          allProcessed = false;
-          break;
-        }
-      }
-      
-      // Also check that NotebookLM doesn't show general "Uploading..." status
-      const isUploading = await page.evaluate(() => {
-        const text = document.body.innerText || "";
-        return text.includes("Uploading") || document.querySelectorAll('mat-progress-spinner, [role="progressbar"]').length > 0;
-      });
 
-      if (allProcessed && !isUploading) {
+    onStatus?.("Waiting for UI to render uploaded sources...");
+    while (Date.now() - startWait < 40000) {
+      // Max 90 seconds wait
+      const { presentFiles, isUploading } = await page.evaluate((allFiles) => {
+        function getAllText(root = document.body) {
+          let text = root.innerText || "";
+          const walker = document.createTreeWalker(
+            root,
+            NodeFilter.SHOW_ELEMENT,
+          );
+          let node;
+          while ((node = walker.nextNode())) {
+            if ((node as HTMLElement).shadowRoot) {
+              text += " " + getAllText((node as HTMLElement).shadowRoot as any);
+            }
+          }
+          return text;
+        }
+
+        const currentText = getAllText();
+        const found = allFiles.filter((f) => {
+          const parts = f.split(/[\/\\]/);
+          const baseName = parts[parts.length - 1];
+          const baseNoExt = baseName.replace(/\.txt$/i, "");
+
+          // Truncation check: matches first 10 chars or full name
+          const truncated =
+            baseNoExt.length > 12 ? baseNoExt.substring(0, 10) : baseNoExt;
+
+          return (
+            currentText.includes(baseName) ||
+            currentText.includes(baseNoExt) ||
+            currentText.includes(truncated)
+          );
+        });
+
+        const uploading =
+          currentText.includes("Uploading") ||
+          document.querySelectorAll(
+            'mat-progress-spinner, [role="progressbar"]',
+          ).length > 0;
+
+        return { presentFiles: found.length, isUploading: uploading };
+      }, files);
+
+      allProcessed = presentFiles === files.length;
+
+      // If most files are present and uploading spinner is gone, or after 15s if all files are finally in DOM
+      if (allProcessed && (!isUploading || Date.now() - startWait > 15000)) {
         break;
       }
-      await page.waitForTimeout(800);
+      await page.waitForTimeout(1000);
     }
-    
+
     if (!allProcessed) {
-       console.warn("[NotebookLM Automator] Timed out waiting for all files to visually appear in UI!");
+      console.warn(
+        `[NotebookLM Automator] Timed out waiting for all files. Found ${allProcessed} of ${files.length}. Proceeding anyway.`,
+      );
     } else {
-       // Extra buffer to let background operations finish
-       await page.waitForTimeout(1000);
+      await page.waitForTimeout(1500);
     }
   }
 
@@ -655,20 +685,32 @@ export async function automateNotebookLM(
         if (stableCount >= STABLE_POLLS_NEEDED) {
           try {
             await page.bringToFront();
-            await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+            await page
+              .context()
+              .grantPermissions(["clipboard-read", "clipboard-write"]);
             const clickSuccess = await page.evaluate(() => {
-              function findElementsDeep(selector: string, root: Document | DocumentFragment | Element = document): Element[] {
+              function findElementsDeep(
+                selector: string,
+                root: Document | DocumentFragment | Element = document,
+              ): Element[] {
                 let els = Array.from(root.querySelectorAll(selector));
-                for (const el of Array.from(root.querySelectorAll('*'))) {
-                  if (el.shadowRoot) els = els.concat(findElementsDeep(selector, el.shadowRoot));
+                for (const el of Array.from(root.querySelectorAll("*"))) {
+                  if (el.shadowRoot)
+                    els = els.concat(findElementsDeep(selector, el.shadowRoot));
                 }
                 return els;
               }
-              const potentialBtns = findElementsDeep('button') as HTMLElement[];
-              const btns = potentialBtns.filter(b => {
-                 const label = (b.getAttribute('aria-label') || '').toLowerCase();
-                 const text = b.innerText.toLowerCase();
-                 return label.includes('copy') || text.includes('copy_all') || text.includes('content_copy');
+              const potentialBtns = findElementsDeep("button") as HTMLElement[];
+              const btns = potentialBtns.filter((b) => {
+                const label = (
+                  b.getAttribute("aria-label") || ""
+                ).toLowerCase();
+                const text = b.innerText.toLowerCase();
+                return (
+                  label.includes("copy") ||
+                  text.includes("copy_all") ||
+                  text.includes("content_copy")
+                );
               });
               if (btns.length > 0) {
                 // Click the last copy button found, representing the latest response
@@ -677,7 +719,7 @@ export async function automateNotebookLM(
               }
               return false;
             });
-            
+
             if (clickSuccess) {
               await page.waitForTimeout(300); // Give UI time to push to clipboard
               const clipboardText = await page.evaluate(async () => {
@@ -687,17 +729,23 @@ export async function automateNotebookLM(
                   return "ERROR: " + e.message;
                 }
               });
-              
+
               if (clipboardText && clipboardText.startsWith("ERROR: ")) {
-                 console.warn("[NotebookLM Automator] Clipboard API failed:", clipboardText);
+                console.warn(
+                  "[NotebookLM Automator] Clipboard API failed:",
+                  clipboardText,
+                );
               } else if (clipboardText && clipboardText.length > 50) {
                 return clipboardText.trim();
               }
             }
           } catch (err: any) {
-            console.warn("[NotebookLM Automator] Clipboard copy error, falling back to scraped text:", err.message);
+            console.warn(
+              "[NotebookLM Automator] Clipboard copy error, falling back to scraped text:",
+              err.message,
+            );
           }
-          
+
           return cleanScrapedText(rawText);
         }
       } else {
@@ -711,6 +759,3 @@ export async function automateNotebookLM(
 
   throw new Error("Analysis timeout (5m)");
 }
-
-
-

@@ -2,18 +2,17 @@ import { buildMasterContext } from "@/lib/contextBuilder";
 import path from "path";
 import fs from "fs";
 import { analyzeFile, fetchFileContents } from "@/lib/github";
-import {
-  automateNotebookLM,
-  parseNotebookPlan,
-} from "@/lib/notebooklmAutomator";
+import { automateNotebookLM } from "@/lib/notebooklmAutomator";
 import { automateChatGPT } from "@/lib/chatgptAutomator";
 import { getOrCreateContext } from "@/lib/browser";
 import { generateGapFillerNotebook } from "@/lib/gapScout";
+import { askDeepseek } from "@/lib/deepseekAutomator";
+import { buildDeepseekContext } from "@/lib/deepseekContextBuilder";
 import {
-  getNotebooklmPlannerPrompt,
   getFinalPhasePrompt,
   getArchitectPrompt,
   getStaffEngineerPrompt,
+  getDeepseekCodingPrompt,
 } from "@/lib/prompts";
 import { NextResponse } from "next/server";
 import { BrowserContext } from "playwright";
@@ -28,10 +27,393 @@ import {
 export const CONTEXT_DIR_PATH = "/tmp/notebooklm_sources";
 export const NOTEBOOKLM_URL = "https://notebooklm.google.com/";
 
+const SUPPORTED_EXTENSIONS = new Set([
+  ".pdf",
+  ".txt",
+  ".md",
+  ".docx",
+  ".csv",
+  ".pptx",
+  ".epub",
+  ".avif",
+  ".bmp",
+  ".gif",
+  ".ico",
+  ".jp2",
+  ".png",
+  ".webp",
+  ".tif",
+  ".tiff",
+  ".heic",
+  ".heif",
+  ".jpeg",
+  ".jpg",
+  ".jpe",
+  ".3g2",
+  ".3gp",
+  ".aac",
+  ".aif",
+  ".aifc",
+  ".aiff",
+  ".amr",
+  ".au",
+  ".avi",
+  ".cda",
+  ".m4a",
+  ".mid",
+  ".mp3",
+  ".mp4",
+  ".mpeg",
+  ".ogg",
+  ".opus",
+  ".ra",
+  ".ram",
+  ".snd",
+  ".wav",
+  ".wma",
+]);
+
 const GLOBAL_JOBS_KEY = Symbol.for("repoorbit.playwright.jobs");
 export const activeJobs: Map<string, JobStatus> =
   (global as any)[GLOBAL_JOBS_KEY] || new Map();
 (global as any)[GLOBAL_JOBS_KEY] = activeJobs;
+
+// ─── Notebook relevance scorer ────────────────────────────────────────────────
+
+const SCORER_STOP_WORDS = new Set([
+  "the",
+  "a",
+  "an",
+  "is",
+  "in",
+  "it",
+  "of",
+  "to",
+  "and",
+  "or",
+  "for",
+  "on",
+  "with",
+  "this",
+  "that",
+  "from",
+  "are",
+  "was",
+  "be",
+  "by",
+  "at",
+  "as",
+  "we",
+  "i",
+  "my",
+  "our",
+  "your",
+  "its",
+  "have",
+  "has",
+  "had",
+  "not",
+  "do",
+  "does",
+  "did",
+  "can",
+  "could",
+  "would",
+  "should",
+  "will",
+  "may",
+  "might",
+  "how",
+  "what",
+  "where",
+  "when",
+  "which",
+  "who",
+  "why",
+  "there",
+  "here",
+  "after",
+  "before",
+  "under",
+  "over",
+  "about",
+]);
+
+const CORE_SOURCE_BONUS_RE = /^(lib|src|core|internal|pkg|cmd|server)\//;
+const TEST_FILE_PENALTY_RE = /\.(test|spec)\.[a-z]+$|\/test\/|\/tests?\//;
+
+function isNeverRelevant(filePath: string): boolean {
+  const p = filePath.toLowerCase();
+  if (p.startsWith(".github/") || p === ".github") return true;
+  if (p.startsWith("docs/")) return true;
+  if (p.startsWith("build/")) return true;
+  if (p.startsWith("scripts/")) return true;
+  if (p.startsWith("examples/") && !p.includes("benchmark")) return true;
+  if (p.endsWith(".yml") || p.endsWith(".yaml")) return true;
+  if (p.endsWith(".md")) return true;
+  if (p.endsWith(".json") && !p.endsWith("package.json")) return true;
+  return false;
+}
+
+function extractQueryTokens(query: string): Set<string> {
+  const tokens = new Set<string>();
+  const normalized = query.toLowerCase().replace(/[^a-z0-9\s_./-]/g, " ");
+
+  for (const m of normalized.matchAll(/\b[\w-]+\/[\w-]+(?:\.[a-z]{1,5})?\b/g)) {
+    tokens.add(m[0]);
+  }
+  for (const m of query.matchAll(/\b[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*\b/g)) {
+    tokens.add(m[0].toLowerCase());
+  }
+  for (const m of query.matchAll(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+){1,}\b/g)) {
+    tokens.add(m[0]);
+  }
+  for (const w of normalized.split(/\s+/)) {
+    const clean = w.replace(/[^a-z0-9]/g, "");
+    if (clean.length >= 3 && !SCORER_STOP_WORDS.has(clean)) {
+      tokens.add(clean);
+    }
+  }
+
+  return tokens;
+}
+
+interface NotebookScore {
+  notebookName: string;
+  score: number;
+  tier: "HIGH" | "MEDIUM" | "LOW";
+  matchedFiles: string[];
+  totalFiles: number;
+}
+
+function scoreNotebooksForQuery(
+  outDir: string,
+  query: string,
+): NotebookScore[] {
+  const tokens = extractQueryTokens(query);
+  const scores: NotebookScore[] = [];
+
+  const manifestPath = path.join(outDir, "00_Root_Manifest.txt");
+  if (!fs.existsSync(manifestPath)) {
+    console.error("[SCORER] 00_Root_Manifest.txt not found at:", manifestPath);
+    return [];
+  }
+
+  const manifestContent = fs.readFileSync(manifestPath, "utf-8");
+
+  // FIX: \r? handles both CRLF (Windows) and LF (Unix) line endings.
+  // The old regex /^## (notebook_\d+)$/gm failed on CRLF because $
+  // matched before \r, so "## notebook_01\r" did not match.
+  const notebookMatches = manifestContent.matchAll(/^## (notebook_\d+)\r?$/gm);
+  const notebookNames: string[] = [];
+  for (const m of notebookMatches) {
+    notebookNames.push(m[1]);
+  }
+
+  // FALLBACK: if manifest regex found nothing, scan disk directly.
+  // Handles edge cases where manifest format has drifted.
+  if (notebookNames.length === 0) {
+    console.warn(
+      "[SCORER] No notebook names found via manifest regex — scanning disk",
+    );
+    try {
+      const entries = fs.readdirSync(outDir);
+      for (const entry of entries) {
+        if (/^notebook_\d+$/.test(entry)) {
+          const fullPath = path.join(outDir, entry);
+          if (fs.statSync(fullPath).isDirectory()) {
+            notebookNames.push(entry);
+          }
+        }
+      }
+      notebookNames.sort();
+    } catch (e) {
+      console.error("[SCORER] Failed to scan disk for notebooks:", e);
+    }
+  }
+
+  if (notebookNames.length === 0) {
+    console.error(
+      "[SCORER] No notebooks found in manifest or on disk. outDir:",
+      outDir,
+    );
+    return [];
+  }
+
+  for (const notebookName of notebookNames) {
+    const localManifestPath = path.join(
+      outDir,
+      notebookName,
+      "00_manifest.txt",
+    );
+    if (!fs.existsSync(localManifestPath)) continue;
+
+    const localManifest = fs.readFileSync(localManifestPath, "utf-8");
+
+    const fileEntries: string[] = [];
+    for (const m of localManifest.matchAll(/^file_\d+_NB\d+\.txt -> (.+)$/gm)) {
+      fileEntries.push(m[1].trim());
+    }
+
+    let notebookScore = 0;
+    const matchedFilesWithScore: { path: string; score: number }[] = [];
+
+    for (const filePath of fileEntries) {
+      if (isNeverRelevant(filePath)) continue;
+
+      const filePathLower = filePath.toLowerCase();
+      let fileScore = 0;
+
+      if (tokens.size > 0) {
+        for (const token of tokens) {
+          if (filePathLower.includes(token)) {
+            fileScore += 10;
+          }
+        }
+      }
+
+      if (fileScore > 0 || CORE_SOURCE_BONUS_RE.test(filePath)) {
+        const lineMatch = localManifest.match(
+          new RegExp(
+            `(file_\\d+_NB\\d+\\.txt) -> ${filePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+          ),
+        );
+        if (lineMatch) {
+          const txtFilePath = path.join(outDir, notebookName, lineMatch[1]);
+          if (fs.existsSync(txtFilePath)) {
+            const content = fs.readFileSync(txtFilePath, "utf-8").toLowerCase();
+            if (tokens.size > 0) {
+              for (const token of tokens) {
+                const occurrences = (
+                  content.match(new RegExp(`\\b${token}\\b`, "g")) ?? []
+                ).length;
+                fileScore += Math.min(occurrences, 5) * 3;
+              }
+            } else {
+              // No tokens — give core source files a base score so they surface
+              fileScore += 10;
+            }
+          }
+        }
+      }
+
+      if (CORE_SOURCE_BONUS_RE.test(filePath)) {
+        fileScore = Math.round(fileScore * 1.5);
+      }
+      if (TEST_FILE_PENALTY_RE.test(filePath) && fileScore > 0) {
+        fileScore = Math.round(fileScore * 0.4);
+      }
+
+      if (fileScore > 0) {
+        notebookScore += fileScore;
+        matchedFilesWithScore.push({ path: filePath, score: fileScore });
+      }
+    }
+
+    let tier: "HIGH" | "MEDIUM" | "LOW";
+    if (notebookScore >= 200) tier = "HIGH";
+    else if (notebookScore >= 50) tier = "MEDIUM";
+    else tier = "LOW";
+
+    const matchedFiles = matchedFilesWithScore
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 8)
+      .map((f) => f.path);
+
+    scores.push({
+      notebookName,
+      score: notebookScore,
+      tier,
+      matchedFiles,
+      totalFiles: fileEntries.length,
+    });
+  }
+
+  return scores.sort((a, b) => b.score - a.score);
+}
+
+function buildQueryRelevanceSection(
+  scores: NotebookScore[],
+  query: string,
+): string {
+  if (scores.length === 0) return "";
+
+  const queryPreview = query.length > 100 ? query.slice(0, 100) + "..." : query;
+
+  const lines: string[] = [
+    `## QUERY RELEVANCE ANALYSIS`,
+    `Query: "${queryPreview}"`,
+    ``,
+    `The following notebooks have been pre-scored for relevance to this query.`,
+    `Use this as your PRIMARY signal for notebook assignment.`,
+    `HIGH relevance notebooks contain the files most likely needed to answer the query.`,
+    `Do NOT assign LOW relevance notebooks as primary sources for code questions.`,
+    ``,
+  ];
+
+  for (const s of scores) {
+    const matchedStr =
+      s.matchedFiles.length > 0
+        ? s.matchedFiles.join(", ")
+        : "no directly matched files";
+    lines.push(
+      `- ${s.notebookName} [${s.tier}] score:${s.score} — relevant files: ${matchedStr}`,
+    );
+  }
+
+  lines.push(``);
+  lines.push(
+    `PLANNER INSTRUCTION: Your notebook assignments in the "covers" array MUST`,
+  );
+  lines.push(
+    `prioritize HIGH-scored notebooks. For each HIGH notebook, write a sub_question`,
+  );
+  lines.push(
+    `that is SPECIFIC to the query — not a general architectural overview.`,
+  );
+  lines.push(
+    `If the query mentions a bug or fix, the sub_question must ask about that`,
+  );
+  lines.push(`specific bug in the context of the files in that notebook.`);
+
+  return lines.join("\n");
+}
+
+function deriveNotebookPlan(
+  scores: NotebookScore[],
+  query: string,
+): NotebookPlan {
+  // 1. Try to get all HIGH notebooks
+  let selected = scores.filter((s) => s.tier === "HIGH");
+
+  // 2. If no HIGH, take the top 3 MEDIUM notebooks (increased from 2)
+  if (selected.length === 0) {
+    selected = scores.filter((s) => s.tier === "MEDIUM").slice(0, 3);
+  }
+
+  // 3. FALLBACK: If still empty or all are LOW, take the top 5 (increased from 2)
+  if (selected.length === 0 && scores.length > 0) {
+    console.warn(
+      "[PLANNER] All notebooks scored LOW — using top 5 by score as fallback",
+    );
+    selected = scores.slice(0, 5);
+  }
+
+  // 4. Increase global limit to 5 notebooks total
+  selected = selected.slice(0, 5);
+
+  return {
+    include_meta: false,
+    notebooks: selected.map((s) => ({
+      name: s.notebookName,
+      covers: s.matchedFiles, // This list is controlled by the Scorer
+      reason: `Scorer assigned ${s.tier} tier (score: ${s.score}). Top matched files: ${s.matchedFiles.slice(0, 3).join(", ")}`,
+      sub_question: query,
+    })),
+  };
+}
+
+// ─── processNotebookPlan ──────────────────────────────────────────────────────
 
 async function processNotebookPlan(
   context: BrowserContext,
@@ -64,16 +446,10 @@ async function processNotebookPlan(
   for (let i = 0; i < total; i++) {
     const nb = plan.notebooks[i];
 
-    // ── Normalize notebook name to the on-disk folder format ─────────────────
-    // The planner may return a descriptive name like
-    // "notebook_01_tf_function_entry_and_orchestration".  The context builder
-    // always creates folders as "notebook_01", "notebook_02", etc.
-    // Extract the numeric prefix so we always resolve the correct folder,
-    // regardless of what suffix the model appended.
     const numMatch = nb.name.match(/notebook[_-]?(\d+)/i);
     const resolvedFolderName = numMatch
       ? `notebook_${numMatch[1].padStart(2, "0")}`
-      : nb.name;
+      : `notebook_${String(i + 1).padStart(2, "0")}`;
     const notebookFolder = path.join(baseDir, resolvedFolderName);
 
     onStatus?.(
@@ -95,37 +471,37 @@ async function processNotebookPlan(
       .sort();
 
     const manifestFile = allTxts.find((f) => f === "00_manifest.txt");
-    const sourceFiles = allTxts.filter((f) => f !== "00_manifest.txt");
+    const sourceFiles = allTxts.filter(
+      (f) => f !== "00_manifest.txt" && f !== "QUERY_PROMPT.txt",
+    );
     const orderedFiles = [
       ...sourceFiles,
       ...(manifestFile ? [manifestFile] : []),
     ].map((f) => path.join(notebookFolder, f));
+    const finalOrderedFiles = [...orderedFiles];
 
-    if (orderedFiles.length === 0) {
+    if (finalOrderedFiles.length === 0) {
       answers.push(
         `### ${resolvedFolderName}\n[ERROR] No source files found in "${notebookFolder}".\n`,
       );
       continue;
     }
 
-    // Use the full descriptive name as the NotebookLM title so it's human-readable,
-    // but keep resolvedFolderName as the key for all file-system operations.
     const notebookTitle = `@${repoName} - ${nb.name}`;
+    const queryPromptPath = path.join(notebookFolder, "QUERY_PROMPT.txt");
 
     let answer = "";
     try {
       const architectPrompt = getArchitectPrompt(
         nb.sub_question,
-        lang,
         nb.reason,
         nb.covers,
       );
-      const queryPromptPath = path.join(notebookFolder, "QUERY_PROMPT.txt");
       fs.writeFileSync(queryPromptPath, architectPrompt, "utf-8");
 
       answer = await automateNotebookLM(
         page,
-        [queryPromptPath, ...orderedFiles],
+        [queryPromptPath, ...finalOrderedFiles],
         "Process the instructions in QUERY_PROMPT.txt",
         notebookTitle,
         onStatus,
@@ -158,19 +534,24 @@ export async function GET(req: Request) {
   return NextResponse.json(activeJobs.get(taskId) || { status: "pending" });
 }
 
+// ─── POST handler ─────────────────────────────────────────────────────────────
+
 export async function POST(req: Request) {
   try {
     const { query, repoContext, owner, repo, tree, defaultBranch } =
       await req.json();
+
     const taskId = Math.random().toString(36).substring(7);
     activeJobs.set(taskId, { status: "pending" });
 
     const outDir = path.join(CONTEXT_DIR_PATH, owner, repo);
     const gapNBPath = path.join(outDir, "gap_filler_NB.txt");
+    const insightsPath = path.join(outDir, "phase2_insights.txt");
+    const queryPromptPath = path.join(outDir, "QUERY_PROMPT.txt");
 
-    if (fs.existsSync(gapNBPath)) {
-      fs.unlinkSync(gapNBPath);
-    }
+    [gapNBPath, insightsPath, queryPromptPath].forEach((file) => {
+      if (fs.existsSync(file)) fs.unlinkSync(file);
+    });
 
     const processJob = async () => {
       let repoLang: RepoLanguage | undefined;
@@ -191,6 +572,7 @@ export async function POST(req: Request) {
           }
         };
 
+        // ── First-run: fetch repo and build notebook folders ───────────────
         if (!fs.existsSync(outDir)) {
           fs.mkdirSync(outDir, { recursive: true });
           setStatus("Resolving repository tree...");
@@ -234,6 +616,7 @@ export async function POST(req: Request) {
               ".log",
               ".DS_Store",
               ".eslintcache",
+              ".sketch",
             ];
             const ignoredNames = [
               ".playwright-auth.json",
@@ -255,49 +638,37 @@ export async function POST(req: Request) {
             );
           });
 
-          const sortedFiles = coreFiles;
-
           const contents = await fetchFileContents(
             owner,
             repo,
-            sortedFiles,
+            coreFiles,
             defaultBranch || "main",
             setStatus,
           );
 
-          const fileSet = new Set<string>(sortedFiles.map((f: any) => f.path));
+          const fileSet = new Set<string>(coreFiles.map((f: any) => f.path));
 
           const metadata = Array.from(contents.entries()).map(([p, c]) => {
-            // Skip analysis for very large files to avoid RangeError/timeouts
             const analysis =
               c.length < 500000
                 ? analyzeFile(p, c, fileSet)
                 : { imports: [] as string[] };
-            return {
-              path: p,
-              content: c,
-              ...analysis,
-            };
+            return { path: p, content: c, ...analysis };
           });
 
-          // Build bidirectional import graph
           const importGraph: Record<
             string,
             { imports: string[]; imported_by: string[] }
           > = {};
-
           for (const file of metadata) {
             importGraph[file.path] = {
               imports: (file as any).imports || [],
               imported_by: [],
             };
           }
-
           for (const file in importGraph) {
             for (const dep of importGraph[file].imports) {
-              if (importGraph[dep]) {
-                importGraph[dep].imported_by.push(file);
-              }
+              if (importGraph[dep]) importGraph[dep].imported_by.push(file);
             }
           }
 
@@ -314,46 +685,56 @@ export async function POST(req: Request) {
           repoLang = detectedLang;
         }
 
-        setStatus("Consulting NotebookLM...");
         const context = await getOrCreateContext();
         const manifestPath = path.join(outDir, "00_Root_Manifest.txt");
         const metaFilePath = path.join(outDir, "01_Meta.txt");
 
-        let plannerPage = context
-          .pages()
-          .find((p: any) => p.url()?.includes("notebooklm.google.com"));
-        if (!plannerPage) plannerPage = await context.newPage();
+        // ── Score notebooks for this query ────────────────────────────────
+        setStatus("Scoring notebooks for query relevance...");
+        const notebookScores = scoreNotebooksForQuery(outDir, query);
 
-        const plannerPromptText = getNotebooklmPlannerPrompt(query);
-        const queryPromptPath = path.join(outDir, "QUERY_PROMPT.txt");
-        fs.writeFileSync(queryPromptPath, plannerPromptText, "utf-8");
-
-        const rawPlanString = await automateNotebookLM(
-          plannerPage,
-          [queryPromptPath, manifestPath, metaFilePath],
-          "Process the instructions in QUERY_PROMPT.txt",
-          `@${repo} - [Planner]`,
-          setStatus,
-          false,
-          [queryPromptPath],
+        console.log("[SCORER] outDir:", outDir);
+        console.log(
+          "[SCORER] scores:",
+          JSON.stringify(
+            notebookScores.map((s) => ({
+              name: s.notebookName,
+              tier: s.tier,
+              score: s.score,
+            })),
+          ),
         );
-        const notebookPlan = parseNotebookPlan(rawPlanString);
 
-        if (notebookPlan.direct_answer) {
-          // Replace triple-backtick code blocks with single backticks (inline code)
-          // so they don't take full-width, as requested by the user.
-          const cleanAnswer = notebookPlan.direct_answer
-            .replace(/```(?:[a-zA-Z]+)?\n([\s\S]*?)```/g, "`$1`")
-            .replace(/```/g, "`")
-            .trim();
+        const relevanceSection = buildQueryRelevanceSection(
+          notebookScores,
+          query,
+        );
+        const annotatedManifestPath = path.join(
+          outDir,
+          "00_Root_Manifest_Annotated.txt",
+        );
+        const rawManifest = fs.readFileSync(manifestPath, "utf-8");
+        fs.writeFileSync(
+          annotatedManifestPath,
+          relevanceSection + "\n\n---\n\n" + rawManifest,
+          "utf-8",
+        );
+
+        // ── Derive notebook plan from scorer ──────────────────────────────
+        setStatus("Deriving notebook plan from relevance scores...");
+        const notebookPlan = deriveNotebookPlan(notebookScores, query);
+
+        if (!notebookPlan.notebooks || notebookPlan.notebooks.length === 0) {
           activeJobs.set(taskId, {
-            status: "done",
-            result: cleanAnswer,
-            answerSource: "planner",
+            status: "error",
+            error:
+              "Scorer found no relevant notebooks for this query. The repo may need to be re-fetched.",
           });
           return;
         }
 
+        // ── Phase 2: query each selected notebook ─────────────────────────
+        setStatus("Consulting NotebookLM...");
         const phase2Insights = await processNotebookPlan(
           context,
           notebookPlan,
@@ -363,12 +744,14 @@ export async function POST(req: Request) {
           (msg, part, prog) => setStatus(msg, part, prog),
         );
 
+        // ── Phase 3: final synthesis loop with gap fill ───────────────────
         setStatus("Running final phase 3 synthesis...");
-        const insightsPath = path.join(outDir, "phase2_insights.txt");
+        const finalInsightsPath = path.join(outDir, "phase2_insights.txt");
         const finalNotebookTitle = `@${repo} - [final answer]`;
         const MAX_GAP_FILLS = 3;
         let hasGapFilled = false;
         let currentInsights = phase2Insights;
+        const filledSymbols = new Set<string>();
 
         const roadmapPath = path.join(outDir, "graph.json");
         let roadmapHeader = "";
@@ -392,11 +775,12 @@ export async function POST(req: Request) {
 
             const hubFiles = entries
               .sort(
-                ([, a], [, b]) =>
-                  b.imported_by.length - a.imported_by.length,
+                ([, a], [, b]) => b.imported_by.length - a.imported_by.length,
               )
               .slice(0, 5)
-              .map(([p, info]) => `${p} (${info.imported_by.length} consumers)`);
+              .map(
+                ([p, info]) => `${p} (${info.imported_by.length} consumers)`,
+              );
 
             roadmapHeader = [
               `### SYSTEM ROADMAP`,
@@ -413,11 +797,9 @@ export async function POST(req: Request) {
           }
         } catch (_) {}
 
-        if (fs.existsSync(insightsPath)) {
-          fs.unlinkSync(insightsPath);
-        }
+        if (fs.existsSync(finalInsightsPath)) fs.unlinkSync(finalInsightsPath);
         fs.writeFileSync(
-          insightsPath,
+          finalInsightsPath,
           roadmapHeader + currentInsights,
           "utf-8",
         );
@@ -439,24 +821,52 @@ export async function POST(req: Request) {
               if (fs.existsSync(filePath)) finalPhaseFiles.push(filePath);
             }
           }
-          finalPhaseFiles.push(insightsPath);
+
+          // [PINNING] Also include pinned source files from ALL notebooks in the plan,
+          // but ONLY for the final phase answer. Convert to .txt if unsupported.
+          const sourceMirrorDir = path.join(outDir, "source_mirror");
+          if (fs.existsSync(sourceMirrorDir)) {
+            const txtPinnedDir = path.join(outDir, "txt_pinned");
+            if (!fs.existsSync(txtPinnedDir)) {
+              fs.mkdirSync(txtPinnedDir, { recursive: true });
+            }
+
+            const pinnedSet = new Set<string>();
+            for (const nb of notebookPlan.notebooks) {
+              for (const coveredFile of nb.covers ?? []) {
+                const mirrorPath = path.join(sourceMirrorDir, coveredFile);
+                if (fs.existsSync(mirrorPath) && !pinnedSet.has(mirrorPath)) {
+                  if (fs.statSync(mirrorPath).isDirectory()) continue;
+                  const ext = path.extname(coveredFile).toLowerCase();
+                  if (SUPPORTED_EXTENSIONS.has(ext)) {
+                    finalPhaseFiles.push(mirrorPath);
+                    console.log(
+                      `[NOTEBOOK-FINAL] Pinning source mirror file: ${coveredFile}`,
+                    );
+                  } else {
+                    const safeName = coveredFile.replace(/[\/\\]/g, "_");
+                    const txtPath = path.join(txtPinnedDir, `${safeName}.txt`);
+                    if (!fs.existsSync(txtPath)) {
+                      fs.copyFileSync(mirrorPath, txtPath);
+                    }
+                    finalPhaseFiles.push(txtPath);
+                    console.log(
+                      `[NOTEBOOK-FINAL] Pinning source mirror file (converted to .txt): ${coveredFile} -> ${path.basename(txtPath)}`,
+                    );
+                  }
+                  pinnedSet.add(mirrorPath);
+                }
+              }
+            }
+          }
+          finalPhaseFiles.push(finalInsightsPath);
           if (fs.existsSync(gapNBPath)) finalPhaseFiles.push(gapNBPath);
           if (notebookPlan.include_meta && fs.existsSync(metaFilePath)) {
             finalPhaseFiles.push(metaFilePath);
           }
 
-          // ── Write the full prompt as a source file so the chat input stays small ──
-          // NotebookLM has a hard character limit on the chat textarea. Embedding
-          // the full instruction set + user query into the uploaded sources lets us
-          // send a tiny trigger message instead of a multi-kilobyte string.
-          const finalPhasePrompt = getFinalPhasePrompt(
-            query,
-            repoLang,
-            hasGapFilled,
-          );
-          const queryPromptPath = path.join(outDir, "QUERY_PROMPT.txt");
+          const finalPhasePrompt = getFinalPhasePrompt(query, hasGapFilled);
           fs.writeFileSync(queryPromptPath, finalPhasePrompt, "utf-8");
-          // Always force-replace so the gap-filled version is fresh each iteration
           finalPhaseFiles.unshift(queryPromptPath);
 
           const chatTrigger =
@@ -474,9 +884,7 @@ export async function POST(req: Request) {
             finalNotebookTitle,
             setStatus,
             true,
-            hasGapFilled
-              ? [insightsPath, gapNBPath, queryPromptPath]
-              : [queryPromptPath],
+            [finalInsightsPath, gapNBPath, queryPromptPath],
           );
 
           let parsedGap: MissingContextResult | null = null;
@@ -496,16 +904,311 @@ export async function POST(req: Request) {
 
               if (resultJson.status === "MISSING_CONTEXT") {
                 parsedGap = resultJson as MissingContextResult;
-              } else if (resultJson.files || resultJson.call_chains) {
-                // PATH A structured result — capture for diagnostics / downstream use
+              } else if (
+                resultJson.files ||
+                resultJson.call_chains ||
+                resultJson.intent === "FIX"
+              ) {
                 parsedPathA = resultJson as FinalPhaseResult;
 
-                // Log any soft coverage gaps (nodes that couldn't be resolved but
-                // did NOT break chain continuity — these are NOT gap-fill triggers).
-                if (
-                  parsedPathA.coverage_gaps &&
-                  parsedPathA.coverage_gaps.length > 0
-                ) {
+                if (resultJson.intent === "FIX") {
+                  setStatus("Building precise code context for Deepseek...");
+
+                  const rootManifestContent = fs.existsSync(manifestPath)
+                    ? fs.readFileSync(manifestPath, "utf-8")
+                    : "// [WARNING] Root manifest not found.";
+
+                  const dsPromptString = getDeepseekCodingPrompt({
+                    task: resultJson.task || "",
+                    focusAreas: resultJson.target_areas || [],
+                    userQuery: query,
+                    strategy: resultJson.extraction_strategy,
+                    failureFocus: resultJson.failure_focus || [],
+                  });
+
+                  let deepPage = context
+                    .pages()
+                    .find((p: any) => p.url()?.includes("chat.deepseek.com"));
+                  if (!deepPage) deepPage = await context.newPage();
+
+                  const MAX_DS_GAP_FILLS = 2;
+                  const dsFilledSymbols = new Set<string>();
+                  let currentPathBJson = resultJson;
+
+                  for (
+                    let dsAttempt = 0;
+                    dsAttempt <= MAX_DS_GAP_FILLS;
+                    dsAttempt++
+                  ) {
+                    const { contextDir: dsContextDir } = buildDeepseekContext(
+                      currentPathBJson,
+                      outDir,
+                    );
+
+                    setStatus(
+                      dsAttempt === 0
+                        ? "Routing Path B payload to Deepseek..."
+                        : `Deepseek gap fill attempt ${dsAttempt} — retrying with enriched context...`,
+                    );
+
+                    let dsRaw = "";
+                    try {
+                      dsRaw = await askDeepseek(
+                        deepPage,
+                        dsPromptString,
+                        rootManifestContent,
+                        dsContextDir,
+                        (msg, partial, prog) =>
+                          setStatus(`[Deepseek] ${msg}`, partial, prog),
+                        outDir,
+                      );
+                    } catch (dsErr: any) {
+                      console.warn("[Deepseek] Failed:", dsErr.message);
+                      activeJobs.set(taskId, {
+                        status: "error",
+                        error: dsErr.message,
+                      });
+                      return;
+                    }
+
+                    // ── Check if DeepSeek needs more context ───────────────
+                    let dsNeedsMore = false;
+                    try {
+                      const cleanedDs = dsRaw
+                        .replace(/```(?:json)?\s*/gi, "")
+                        .replace(/```/g, "")
+                        .trim();
+                      const dsStart = cleanedDs.indexOf("{");
+                      const dsEnd = cleanedDs.lastIndexOf("}");
+                      if (dsStart !== -1 && dsEnd !== -1 && dsEnd > dsStart) {
+                        const dsParsed = JSON.parse(
+                          cleanedDs.slice(dsStart, dsEnd + 1),
+                        );
+
+                        if (
+                          dsParsed.status === "NEED_MORE_CONTEXT" &&
+                          Array.isArray(dsParsed.missing_symbols) &&
+                          dsParsed.missing_symbols.length > 0 &&
+                          dsAttempt < MAX_DS_GAP_FILLS
+                        ) {
+                          dsNeedsMore = true;
+                          const symbolsToFetch: Array<{
+                            name: string;
+                            source_file: string;
+                          }> = dsParsed.missing_symbols;
+
+                          setStatus(
+                            `Deepseek requested: ${symbolsToFetch.map((s: any) => s.name).join(", ")} — fetching...`,
+                          );
+
+                          // ── Stub detection helpers ────────────────────────────────────────────
+                          const STUB_SIGNALS = [
+                            /throw new Error\(['"`]Not implemented/i,
+                            /\/\/ stub/i,
+                            /\/\/ not implemented/i,
+                            /^\s*\/\/ \[GAP FILE TOO LARGE/m,
+                            /^\s*\/\/ \[WHOLE-FILE FALLBACK\]/m,
+                          ];
+
+                          function isStubContent(content: string): boolean {
+                            // If the meaningful non-comment, non-whitespace lines are very few
+                            const meaningfulLines = content
+                              .split("\n")
+                              .filter(
+                                (l) => l.trim() && !l.trim().startsWith("//"),
+                              );
+                            if (meaningfulLines.length < 5) return true;
+                            return STUB_SIGNALS.some((re) => re.test(content));
+                          }
+
+                          // ── Accumulate gap bundles, skip stubs ────────────────────────────────
+                          const gapBundles: string[] = [];
+                          const skippedStubs: string[] = [];
+
+                          for (const sym of symbolsToFetch) {
+                            if (
+                              sym.name.includes("/") ||
+                              sym.name.match(/\.[jt]sx?$/)
+                            ) {
+                              const baseName = path
+                                .basename(sym.name)
+                                .replace(/\.[jt]sx?$/, "");
+                              sym.name =
+                                baseName.charAt(0).toUpperCase() +
+                                baseName.slice(1);
+                              console.warn(
+                                `[DS-GAP] Normalized path-as-name → "${sym.name}"`,
+                              );
+                            }
+                            const symKey =
+                              `${sym.name}|${sym.source_file}`.toLowerCase();
+                            if (dsFilledSymbols.has(symKey)) {
+                              console.warn(
+                                `[DS-GAP] Already filled "${sym.name}" — skipping.`,
+                              );
+                              continue;
+                            }
+                            dsFilledSymbols.add(symKey);
+
+                            console.log("[DS-GAP] outDir:", outDir);
+                            console.log("[DS-GAP] sym.name:", sym.name);
+                            console.log(
+                              "[DS-GAP] sym.source_file:",
+                              sym.source_file,
+                            );
+                            console.log(
+                              "[DS-GAP] source_mirror exists:",
+                              fs.existsSync(path.join(outDir, "source_mirror")),
+                            );
+                            console.log(
+                              "[DS-GAP] target file exists:",
+                              fs.existsSync(
+                                path.join(
+                                  outDir,
+                                  "source_mirror",
+                                  sym.source_file,
+                                ),
+                              ),
+                            );
+
+                            const { gapAnalysisBundle } =
+                              generateGapFillerNotebook(
+                                outDir,
+                                sym.name,
+                                sym.source_file,
+                                [],
+                                sym.source_file,
+                                currentPathBJson.context_files || [],
+                              );
+
+                            if (!gapAnalysisBundle) {
+                              console.warn(
+                                `[DS-GAP] No bundle generated for "${sym.name}".`,
+                              );
+                              continue;
+                            }
+
+                            if (isStubContent(gapAnalysisBundle)) {
+                              console.warn(
+                                `[DS-GAP] Stub detected for "${sym.name}" in ${sym.source_file} — skipping to avoid loop.`,
+                              );
+                              skippedStubs.push(
+                                `${sym.name} (${sym.source_file}): stub or not implemented`,
+                              );
+                              continue;
+                            }
+
+                            gapBundles.push(
+                              `// Gap-filled: ${sym.name} from ${sym.source_file}\n\n${gapAnalysisBundle}`,
+                            );
+                            console.log(
+                              `[DS-GAP] Accepted gap bundle for "${sym.name}"`,
+                            );
+                          }
+
+                          // ── If everything was stubs, abort the gap fill loop ─────────────────
+                          if (gapBundles.length === 0) {
+                            console.warn(
+                              `[DS-GAP] All requested symbols were stubs or already filled. Forcing final output.`,
+                            );
+                            dsNeedsMore = false;
+
+                            const stubNote =
+                              skippedStubs.length > 0
+                                ? `\n\n// [GAP-FILL ABORTED] The following symbols resolved to stubs (not implemented) and cannot be filled:\n` +
+                                  skippedStubs
+                                    .map((s) => `// - ${s}`)
+                                    .join("\n")
+                                : "";
+
+                            // Append stub note to context.js so DeepSeek sees why we stopped
+                            const ctxPath = path.join(
+                              outDir,
+                              "deepseek_context",
+                              "context.js",
+                            );
+                            if (fs.existsSync(ctxPath)) {
+                              fs.appendFileSync(ctxPath, stubNote, "utf-8");
+                            }
+
+                            // Don't loop again — fall through to final output with what we have
+                            activeJobs.set(taskId, {
+                              status: "done",
+                              result: dsRaw,
+                              answerSource: "final",
+                            });
+                            return;
+                          }
+
+                          // ── Write gap_filler.txt into deepseek_context/ ───────────────────────
+                          const dsContextDir = path.join(
+                            outDir,
+                            "deepseek_context",
+                          );
+                          fs.mkdirSync(dsContextDir, { recursive: true });
+
+                          const gapFillerPath = path.join(
+                            dsContextDir,
+                            "gap_filler.txt",
+                          );
+                          const existingGapContent = fs.existsSync(
+                            gapFillerPath,
+                          )
+                            ? fs.readFileSync(gapFillerPath, "utf-8") + "\n\n"
+                            : "";
+
+                          fs.writeFileSync(
+                            gapFillerPath,
+                            existingGapContent + gapBundles.join("\n\n---\n\n"),
+                            "utf-8",
+                          );
+                          console.log(
+                            `[DS-GAP] Wrote gap_filler.txt to ${dsContextDir}`,
+                          );
+
+                          // ── Update context_files for next round ──────────────────────────────
+                          const newContextFiles = [
+                            ...new Set([
+                              ...(currentPathBJson.context_files || []),
+                              ...symbolsToFetch
+                                .map((s: any) => s.source_file)
+                                .filter(Boolean),
+                            ]),
+                          ];
+                          currentPathBJson = {
+                            ...currentPathBJson,
+                            context_files: newContextFiles,
+                          };
+                        }
+                      }
+                    } catch {
+                      // Not JSON or not NEED_MORE_CONTEXT — treat as final output
+                    }
+
+                    if (!dsNeedsMore) {
+                      activeJobs.set(taskId, {
+                        status: "done",
+                        result:
+                          typeof dsRaw === "string"
+                            ? dsRaw
+                            : JSON.stringify(dsRaw, null, 2),
+                        answerSource: "final",
+                      });
+                      return;
+                    }
+                  }
+
+                  // Exhausted DeepSeek gap fill attempts
+                  activeJobs.set(taskId, {
+                    status: "done",
+                    result:
+                      "DeepSeek requested more context but gap fill limit was reached. Check deepseek_context/ folder.",
+                    answerSource: "final",
+                  });
+                  return;
+                }
+
+                if (parsedPathA.coverage_gaps?.length > 0) {
                   console.info(
                     `[FINAL-PHASE] PATH A coverage gaps (non-breaking):`,
                     parsedPathA.coverage_gaps,
@@ -523,7 +1226,6 @@ export async function POST(req: Request) {
           if (!parsedGap || attempts >= MAX_GAP_FILLS) {
             let finalResult = structuralJsonResult;
 
-            // Optional: Connect ChatGPT Automator for high-level architectural manual
             try {
               if (structuralJsonResult.trim().startsWith("{")) {
                 setStatus(
@@ -531,7 +1233,9 @@ export async function POST(req: Request) {
                 );
                 const chatgptPrompt = getStaffEngineerPrompt(
                   query,
-                  structuralJsonResult,
+                  parsedPathA
+                    ? JSON.stringify(parsedPathA, null, 2)
+                    : structuralJsonResult,
                 );
 
                 let chatPage = context
@@ -561,13 +1265,10 @@ export async function POST(req: Request) {
             return;
           }
 
-          const {
-            target_symbol,
-            search_keywords,
-            last_known_node,
-          } = parsedGap.missing_link;
+          // ── Gap fill ───────────────────────────────────────────────────
+          const { target_symbol, search_keywords, last_known_node } =
+            parsedGap.missing_link;
 
-          // target_file: prefer last_known_node (richer anchor), fall back to missing_link.target_file if present
           const target_file =
             last_known_node ||
             (parsedGap.missing_link as any).target_file ||
@@ -593,8 +1294,51 @@ export async function POST(req: Request) {
                 .map((s: string) => s.trim())
                 .filter(Boolean);
 
+          const gapKey =
+            symbolList
+              .map((s) => s.trim().toLowerCase())
+              .sort()
+              .join("|") +
+            "|" +
+            (target_file || "").toLowerCase();
+
+          if (filledSymbols.has(gapKey)) {
+            console.warn(
+              `[GAP-FILLER] Symbol "${target_symbol}" was already gap-filled. Forcing synthesis.`,
+            );
+            let finalResult = currentInsights;
+            try {
+              const chatgptPrompt = getStaffEngineerPrompt(
+                query,
+                currentInsights,
+              );
+              let chatPage = context
+                .pages()
+                .find((p: any) => p.url()?.includes("chatgpt.com"));
+              if (!chatPage) chatPage = await context.newPage();
+              finalResult = await automateChatGPT(
+                chatPage,
+                chatgptPrompt,
+                (msg) => setStatus(`[ChatGPT] ${msg}`),
+              );
+            } catch {
+              /* use currentInsights as fallback */
+            }
+            activeJobs.set(taskId, {
+              status: "done",
+              result: finalResult,
+              answerSource: "chatgpt",
+            });
+            return;
+          }
+          filledSymbols.add(gapKey);
+
           const mergedSourceFiles = new Set<string>();
           let mergedBundle = "";
+
+          const plannerContextFiles: string[] = (
+            notebookPlan.notebooks ?? []
+          ).flatMap((nb) => nb.covers ?? []);
 
           for (const sym of symbolList) {
             const { gapSourceFiles: sf, gapAnalysisBundle: ab } =
@@ -604,6 +1348,7 @@ export async function POST(req: Request) {
                 target_file.toString(),
                 gapKeywords,
                 last_known_node,
+                plannerContextFiles,
               );
             sf.forEach((f) => mergedSourceFiles.add(f));
             if (ab) mergedBundle += ab + "\n\n";
@@ -614,12 +1359,12 @@ export async function POST(req: Request) {
 
           if (gapSourceFiles.length === 0) {
             console.warn(
-              `[GAP-FILLER] No source files found for any symbol in "${target_symbol}". Falling back to ChatGPT synthesis with phase2 insights.`,
+              `[GAP-FILLER] No source files found for "${target_symbol}". Falling back to ChatGPT.`,
             );
             let finalResult = currentInsights;
             try {
               setStatus(
-                "Gap unresolvable — synthesizing best answer from phase2 insights...",
+                "Gap unresolvable — synthesizing from phase2 insights...",
               );
               const chatgptPrompt = getStaffEngineerPrompt(
                 query,
@@ -636,11 +1381,7 @@ export async function POST(req: Request) {
               );
               finalResult = manual;
             } catch (chatgptErr: any) {
-              console.warn(
-                "[ChatGPT Fallback] Failed:",
-                chatgptErr.message,
-                "— returning phase2 insights directly.",
-              );
+              console.warn("[ChatGPT Fallback] Failed:", chatgptErr.message);
             }
             activeJobs.set(taskId, {
               status: "done",
@@ -660,13 +1401,15 @@ export async function POST(req: Request) {
           } else {
             fs.writeFileSync(gapNBPath, gapAnalysisBundle, "utf-8");
           }
+
           const filesList = gapSourceFiles
             .map((f) => path.basename(f))
             .join(", ");
-          const breadcrumb = `\n\n### [GAP-FILLER ATTEMPT]\n- **Target**: ${target_symbol}\n- **Status**: Full source extracted to gap_filler_NB.txt.\n- **Summary**: Identified patterns in ${filesList}.\n`;
+          const breadcrumb = `\n\n### [GAP-FILLER ATTEMPT ${attempts + 1}]\n- **Target**: ${target_symbol}\n- **Status**: Full source extracted to gap_filler_NB.txt.\n- **Resolved Files**: ${filesList}.\n- **IMPORTANT FOR AI**: The implementation of \`${target_symbol}\` is now in gap_filler_NB.txt. Do NOT declare a gap for this symbol again.\n`;
 
-          currentInsights = fs.readFileSync(insightsPath, "utf-8") + breadcrumb;
-          fs.writeFileSync(insightsPath, currentInsights, "utf-8");
+          currentInsights =
+            fs.readFileSync(finalInsightsPath, "utf-8") + breadcrumb;
+          fs.writeFileSync(finalInsightsPath, currentInsights, "utf-8");
           hasGapFilled = true;
         }
       } catch (err: any) {
@@ -674,9 +1417,13 @@ export async function POST(req: Request) {
       }
     };
 
-    processJob().catch(() => {});
-    return NextResponse.json({ success: true, taskId });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    processJob().catch((err) => console.error("[PROCESS-JOB] Fatal:", err));
+    return NextResponse.json({ status: "accepted", taskId });
+  } catch (error: any) {
+    console.error("[API-CHAT] Uncaught Route Error:", error);
+    return NextResponse.json(
+      { error: error.message, status: "error", details: error.stack },
+      { status: 500 },
+    );
   }
 }

@@ -518,7 +518,7 @@ export interface FinalPhaseFile {
 export interface FinalPhaseKeySymbol {
   name: string;
   defined_in: string;
-  used_in: string[];
+  used_by_files: string; // comma-separated
   /** Position in the execution chain. */
   chain_position: "entry" | "mid" | "terminal";
 }
@@ -530,6 +530,8 @@ export interface BoundaryTransition {
   payload: string;
   /** How the payload travels: function call, event, queue, HTTP, shared memory, etc. */
   mechanism: string;
+  /** What can go wrong at this boundary and how it is handled. */
+  failure_modes: string[];
 }
 
 export interface FinalPhaseSystemDynamics {
@@ -553,6 +555,19 @@ export interface FinalPhaseResult {
   boundary_transitions: BoundaryTransition[];
   system_dynamics: FinalPhaseSystemDynamics;
   error_resilience: FinalPhaseErrorResilience;
+  /** Trace the primary data object(s) lifecycle, transformations, and side effects. */
+  state_data_flow?: {
+    data_objects: string[];
+    transformations: string[];
+    side_effects: string[];
+  };
+  /** Key abstractions (interfaces, traits, abstract classes) and their concrete implementations. */
+  key_abstractions?: {
+    name: string;
+    description: string;
+    implementations: string[];
+    reason_for_existence: string;
+  }[];
   /** Chain nodes or symbols that could not be resolved from provided context. */
   coverage_gaps: string[];
 }
