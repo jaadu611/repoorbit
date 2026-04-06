@@ -12,6 +12,7 @@ export async function askDeepseek(
   contextDir: string,
   onStatus?: (msg: string, partial?: string, progress?: number) => void,
   outDir: string = "",
+  isFirstTurn: boolean = true,
 ): Promise<string> {
   const url = page.url();
   if (!url.includes("chat.deepseek.com")) {
@@ -52,66 +53,135 @@ export async function askDeepseek(
   }
 
   // ── 2. Stage Structural Metadata ─────────────────────────────────────────
-  //
-  // FIXED: metadata files live in outDir (/tmp/notebooklm_sources/<owner>/<repo>/)
-  // NOT in process.cwd() (the Next.js project root).
-  // outDir is passed in from route.ts and is the same directory that contains
-  // the notebook folders, graph.json, symbols.json, and the manifests.
-  //
-  // Priority order for manifest: annotated version first (has relevance scores),
-  // fall back to raw manifest if annotated doesn't exist yet.
+  if (isFirstTurn) {
+    const metadataBase = outDir && fs.existsSync(outDir) ? outDir : process.cwd();
 
-  const metadataBase = outDir && fs.existsSync(outDir) ? outDir : process.cwd();
+    // graph.json is excluded — 68k+ lines for Postgres, irrelevant for function-level fixes.
+    // Dependency info is already embedded in context.js via // --- Source: ... --- headers.
+    const rootMetadata = [
+      "00_Root_Manifest_Annotated.txt",
+      "symbols.json",
+    ];
 
-  const rootMetadata = [
-    "00_Root_Manifest_Annotated.txt",
-    "graph.json",
-    "symbols.json",
-  ];
+    // ── Determine query-relevant symbols from the already-written context.js ─
+    // This lets us filter symbols.json to only entries that are actually in scope.
+    const contextJsPath = path.join(outDir, "deepseek_context", "context.js");
+    const querySymbols = new Set<string>();
+    if (fs.existsSync(contextJsPath)) {
+      try {
+        const ctxText = fs.readFileSync(contextJsPath, "utf-8");
+        // Extract symbol names from comment headers: "// --- Symbol: "foo" | ..."
+        for (const m of ctxText.matchAll(/\/\/ --- Symbol: "([^"]+)"/g)) {
+          if (m[1]) querySymbols.add(m[1].toLowerCase());
+        }
+        // Also extract source file names to pull their symbols
+        for (const m of ctxText.matchAll(/\/\/ --- (?:Raw )?Source: ([^\s]+) ---/g)) {
+          if (m[1]) querySymbols.add(m[1].toLowerCase().replace(/\.[^.]+$/, ""));
+        }
+      } catch {}
+    }
 
-  for (const fileName of rootMetadata) {
-    const filePath = path.join(metadataBase, fileName);
-    if (fs.existsSync(filePath)) {
-      const content = fs.readFileSync(filePath, "utf-8");
-      const tmpPath = path.join(sessionDir, fileName);
-      fs.writeFileSync(tmpPath, content, "utf-8");
-      allTmpPaths.push(tmpPath);
-      console.log(
-        `[Deepseek] Staged Metadata: ${fileName} (from ${metadataBase})`,
-      );
-    } else {
-      // If annotated manifest not found, try raw manifest as fallback
-      if (fileName === "00_Root_Manifest_Annotated.txt") {
-        const fallback = path.join(metadataBase, "00_Root_Manifest.txt");
-        if (fs.existsSync(fallback)) {
-          const content = fs.readFileSync(fallback, "utf-8");
-          const tmpPath = path.join(
-            sessionDir,
-            "00_Root_Manifest_Annotated.txt",
-          );
-          fs.writeFileSync(tmpPath, content, "utf-8");
-          allTmpPaths.push(tmpPath);
-          console.log(
-            `[Deepseek] Staged Metadata: 00_Root_Manifest.txt as fallback (from ${metadataBase})`,
-          );
+    for (const fileName of rootMetadata) {
+      const filePath = path.join(metadataBase, fileName);
+      if (fs.existsSync(filePath)) {
+        let content = fs.readFileSync(filePath, "utf-8");
+
+        // --- SYMBOLS.JSON: Filter to query-relevant entries only ---
+        if (fileName === "symbols.json") {
+          try {
+            const syms = JSON.parse(content);
+            const filtered: string[] = [];
+            const MAX_SYMBOLS = 500;
+
+            for (const [name, data] of Object.entries(syms) as [string, any][]) {
+              if (filtered.length >= MAX_SYMBOLS) break;
+
+              const pathStr = (data.defined_in || "") as string;
+
+              // Always skip noise paths
+              if (
+                pathStr.includes("/test/") ||
+                pathStr.includes("/tests/") ||
+                pathStr.includes("/expected/") ||
+                pathStr.includes("/doc/") ||
+                pathStr.endsWith(".out") ||
+                pathStr.endsWith(".sgml") ||
+                pathStr.endsWith(".txt")
+              ) continue;
+
+              // Always skip numeric names
+              if (/^\d+$/.test(name)) continue;
+
+              // If we know the query symbols — only include relevant ones
+              if (querySymbols.size > 0) {
+                const lowerName = name.toLowerCase();
+                const lowerPath = pathStr.toLowerCase().replace(/\.[^.]+$/, "");
+                const isRelevant =
+                  querySymbols.has(lowerName) ||
+                  [...querySymbols].some(qs =>
+                    lowerPath.includes(qs) || lowerName.includes(qs)
+                  );
+                if (!isRelevant) continue;
+              }
+
+              filtered.push(`${name}: ${pathStr}`);
+            }
+
+            if (filtered.length === 0) {
+              filtered.push("// No query-relevant symbols found in this turn.");
+            }
+            content = filtered.join("\n");
+            console.log(
+              `[Deepseek] Filtered symbols.json to ${filtered.length} query-relevant entries (query symbols: ${[...querySymbols].join(", ") || "all"})`,
+            );
+          } catch (e) {
+            console.warn(`[Deepseek] Failed to filter symbols.json: ${e}`);
+          }
+        }
+
+        const fileNameToUpload = fileName === "symbols.json" ? "symbols.txt" : fileName;
+        const tmpPath = path.join(sessionDir, fileNameToUpload);
+        fs.writeFileSync(tmpPath, content, "utf-8");
+        allTmpPaths.push(tmpPath);
+        console.log(
+          `[Deepseek] Staged Metadata: ${fileName} (from ${metadataBase})`,
+        );
+      } else {
+        // If annotated manifest not found, try raw manifest as fallback
+        if (fileName === "00_Root_Manifest_Annotated.txt") {
+          const fallback = path.join(metadataBase, "00_Root_Manifest.txt");
+          if (fs.existsSync(fallback)) {
+            const content = fs.readFileSync(fallback, "utf-8");
+            const tmpPath = path.join(
+              sessionDir,
+              "00_Root_Manifest_Annotated.txt",
+            );
+            fs.writeFileSync(tmpPath, content, "utf-8");
+            allTmpPaths.push(tmpPath);
+            console.log(
+              `[Deepseek] Staged Metadata: 00_Root_Manifest.txt as fallback (from ${metadataBase})`,
+            );
+          } else {
+            console.error(
+              `[Deepseek] CRITICAL: Neither annotated nor raw manifest found in ${metadataBase}`,
+            );
+          }
         } else {
           console.error(
-            `[Deepseek] CRITICAL: Neither annotated nor raw manifest found in ${metadataBase}`,
+            `[Deepseek] CRITICAL: ${fileName} NOT FOUND at ${filePath}`,
           );
         }
-      } else {
-        console.error(
-          `[Deepseek] CRITICAL: ${fileName} NOT FOUND at ${filePath}`,
-        );
       }
     }
-  }
 
-  // ── 4. Stage Session Manifest ────────────────────────────────────────────
-  const manifestTmpPath = path.join(sessionDir, "manifest.txt");
-  fs.writeFileSync(manifestTmpPath, manifestContent, "utf-8");
-  allTmpPaths.push(manifestTmpPath);
-  console.log(`[Deepseek] Staged Session Manifest → manifest.txt`);
+
+
+    // ── 4. Stage Session Manifest ────────────────────────────────────────────
+    const manifestTmpPath = path.join(sessionDir, "manifest.txt");
+    fs.writeFileSync(manifestTmpPath, manifestContent, "utf-8");
+    allTmpPaths.push(manifestTmpPath);
+    console.log(`[Deepseek] Staged Session Manifest → manifest.txt`);
+  }
 
   // ── 5. Single Atomic Upload ──────────────────────────────────────────────
   onStatus?.(`Uploading ${allTmpPaths.length} file(s) to Deepseek...`);

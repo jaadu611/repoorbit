@@ -83,101 +83,14 @@ export function buildDeepseekContext(
   );
   extractedBlocks.push(`// MISSION CONTEXT: ${pathBJson.intent || "FIX"}`);
   extractedBlocks.push(
-    `// =============================================================================`,
-  );
-  extractedBlocks.push(`// TASK: ${pathBJson.task || "Not specified"}`);
-  extractedBlocks.push(`// PROBLEM: ${pathBJson.problem || "Not specified"}`);
-  extractedBlocks.push(
-    `// EXPECTED BEHAVIOR: ${pathBJson.expected_behavior || "Not specified"}`,
+    `// =============================================================================\n`,
   );
 
-  if (pathBJson.target_areas?.length > 0) {
-    extractedBlocks.push(`//`);
-    extractedBlocks.push(`// FOCUS AREAS:`);
-    pathBJson.target_areas.forEach((area: string) =>
-      extractedBlocks.push(`//   - ${area}`),
-    );
-  }
 
   // =========================================================================
-  // SECTION 2: Extraction Strategy
+  // SECTION 2: Logic Extraction (Removed - DeepSeek handles natively)
   // =========================================================================
-  if (pathBJson.extraction_strategy) {
-    const strat = pathBJson.extraction_strategy;
-    extractedBlocks.push(`//`);
-    extractedBlocks.push(`// EXTRACTION STRATEGY:`);
 
-    if (strat.entry_points?.length > 0) {
-      extractedBlocks.push(`//   Entry Points:`);
-      strat.entry_points.forEach((ep: string) =>
-        extractedBlocks.push(`//     - ${ep}`),
-      );
-    }
-    if (strat.trace_directions?.length > 0) {
-      extractedBlocks.push(`//   Trace Directions:`);
-      strat.trace_directions.forEach((td: string) =>
-        extractedBlocks.push(`//     - ${td}`),
-      );
-    }
-    if (strat.match_signals?.length > 0) {
-      extractedBlocks.push(`//   Match Signals:`);
-      strat.match_signals.forEach((ms: string) =>
-        extractedBlocks.push(`//     - ${ms}`),
-      );
-    }
-  }
-
-  // =========================================================================
-  // SECTION 3: File & Function Selection Rules
-  // =========================================================================
-  if (pathBJson.file_selection_rules?.length > 0) {
-    extractedBlocks.push(`//`);
-    extractedBlocks.push(`// FILE SELECTION RULES APPLIED:`);
-    pathBJson.file_selection_rules.forEach((rule: string) =>
-      extractedBlocks.push(`//   - ${rule}`),
-    );
-  }
-
-  if (pathBJson.function_extraction_rules?.length > 0) {
-    extractedBlocks.push(`//`);
-    extractedBlocks.push(`// FUNCTION EXTRACTION RULES APPLIED:`);
-    pathBJson.function_extraction_rules.forEach((rule: string) =>
-      extractedBlocks.push(`//   - ${rule}`),
-    );
-  }
-
-  // =========================================================================
-  // SECTION 4: Failure Focus
-  // =========================================================================
-  if (pathBJson.failure_focus?.length > 0) {
-    extractedBlocks.push(`//`);
-    extractedBlocks.push(`// FAILURE FOCUS — CRITICAL PATHS TO INSPECT:`);
-    pathBJson.failure_focus.forEach((focus: string) =>
-      extractedBlocks.push(`//   [!] ${focus}`),
-    );
-  }
-
-  // =========================================================================
-  // SECTION 5: DeepSeek Input Contract
-  // =========================================================================
-  if (pathBJson.deepseek_input_contract) {
-    const contract = pathBJson.deepseek_input_contract;
-    extractedBlocks.push(`//`);
-    extractedBlocks.push(`// DEEPSEEK INPUT CONTRACT:`);
-
-    if (contract.will_receive?.length > 0) {
-      extractedBlocks.push(`//   Will Receive:`);
-      contract.will_receive.forEach((item: string) =>
-        extractedBlocks.push(`//     - ${item}`),
-      );
-    }
-    if (contract.must_not_do?.length > 0) {
-      extractedBlocks.push(`//   Must NOT Do:`);
-      contract.must_not_do.forEach((item: string) =>
-        extractedBlocks.push(`//     [FORBIDDEN] ${item}`),
-      );
-    }
-  }
 
   extractedBlocks.push(
     `// =============================================================================\n`,
@@ -397,28 +310,57 @@ export function buildDeepseekContext(
     extractedBlocks.push(`// --- Source: ${relPath} ---`);
 
     if (blocks.length === 0) {
+      // If this file was already staged via source_mirror/ (Section 6a), don't duplicate it
+      const rawKey = `${fullPath}|__raw__`;
+      if (processedPairs.has(rawKey)) {
+        extractedBlocks.push(
+          `// (${hint} not isolated — full source already staged above as source_mirror file)`,
+        );
+        console.warn(
+          `[buildDeepseekContext] Could not isolate "${hint}" in ${relPath} but file already staged — skipping duplicate.`,
+        );
+        continue;
+      }
+
+      // Extract a windowed fallback (±150 lines around the hint) rather than the full file
+      const lines = code.split("\n");
+      const lowerHint = hint.toLowerCase();
+      const hitLines = lines
+        .map((l, i) => (l.toLowerCase().includes(lowerHint) ? i : -1))
+        .filter((i) => i !== -1);
+
       console.warn(
-        `[buildDeepseekContext] No functions matched "${hint}" in ${relPath} — emitting whole file as fallback.`,
+        `[buildDeepseekContext] No functions matched "${hint}" in ${relPath}${hitLines.length > 0 ? ` — using windowed fallback around line ${hitLines[0]}` : " — emitting capped head"}.`,
+      );
+
+      let snippet: string;
+      if (hitLines.length > 0) {
+        const centre = hitLines[0];
+        const from = Math.max(0, centre - 150);
+        const to = Math.min(lines.length - 1, centre + 150);
+        snippet =
+          (from > 0 ? `// [truncated ${from} lines before...]\n` : "") +
+          lines.slice(from, to + 1).join("\n") +
+          (to < lines.length - 1 ? `\n// [...truncated ${lines.length - to - 1} lines after]` : "");
+      } else {
+        // No hit at all — emit only the first 200 lines as a head
+        const CAP = 200;
+        snippet =
+          lines.slice(0, CAP).join("\n") +
+          (lines.length > CAP ? `\n// [...file truncated at ${CAP} lines — "${hint}" not found]` : "");
+      }
+
+      const safeName = hint.replace(/[^a-zA-Z0-9_-]/g, "_");
+      const splitFileName = `${safeName}.js`;
+      const splitFilePath = path.join(contextDir, splitFileName);
+      fs.writeFileSync(
+        splitFilePath,
+        `// Source: ${relPath}\n// Symbol: ${hint} (windowed fallback)\n\n${snippet}`,
+        "utf-8",
       );
       extractedBlocks.push(
-        `// [WHOLE-FILE FALLBACK] No function named "${hint}" found — emitting full source.`,
+        `// --- See: ${splitFileName} (windowed context around "${hint}") ---`,
       );
-      const lineCount = code.split("\n").length;
-      if (lineCount > SPLIT_LINE_THRESHOLD) {
-        const safeName = hint.replace(/[^a-zA-Z0-9_-]/g, "_");
-        const splitFileName = `${safeName}.js`;
-        const splitFilePath = path.join(contextDir, splitFileName);
-        fs.writeFileSync(
-          splitFilePath,
-          `// Source: ${relPath}\n// Symbol: ${hint} (whole-file fallback)\n\n${code}`,
-          "utf-8",
-        );
-        extractedBlocks.push(
-          `// --- See: ${splitFileName} (${lineCount} lines, split to keep context readable) ---`,
-        );
-      } else {
-        extractedBlocks.push(code);
-      }
       continue;
     }
 
@@ -441,6 +383,7 @@ export function buildDeepseekContext(
         extractedBlocks.push(block);
       }
     }
+
   }
 
   // =========================================================================
@@ -709,6 +652,81 @@ function extractFunctionsFromCode(code: string, hint: string): string[] {
     if (substringBlocks.length > 0) return substringBlocks;
     return [];
   } catch (err) {
-    return [code];
+    // If Babel fails, we are likely in a non-JS file (e.g. C/C++/Go)
+    // Use an aggressive regex-based extraction to find function bodies
+    const lines = code.split("\n");
+    const found: string[] = [];
+    const lowerHint = hint.toLowerCase();
+
+    // 1. Precise match (likely for C functions/macros/structs)
+    // Matches: int some_function(args) { ... }
+    //          extern void* some_func(void) {
+    //          #define hint ...
+    //          struct hint { ... }
+    const cDefPatterns = [
+      new RegExp(`^[^\\/*\\n]*\\b${hint}\\b\\s*\\([^;]*$`, "m"), // Function definition start
+      new RegExp(`^#\\s*define\\s+${hint}\\b`, "m"),              // Macro
+      new RegExp(`^(struct|union|enum)\\s+${hint}\\b`, "m"),     // Type definition
+      new RegExp(`^typedef\\s+.*\\b${hint}\\s*;`, "m"),           // Typedef
+    ];
+
+    let match: RegExpExecArray | null = null;
+    for (const pattern of cDefPatterns) {
+      match = pattern.exec(code);
+      if (match) break;
+    }
+
+    if (match) {
+      const idx = match.index;
+      // Find where the block ends via brace matching
+      let braceSearchIdx = idx;
+      while (
+        braceSearchIdx < code.length &&
+        code[braceSearchIdx] !== "{" &&
+        code[braceSearchIdx] !== ";" &&
+        code[braceSearchIdx] !== "\n" // for simple macros
+      ) {
+        braceSearchIdx++;
+      }
+
+      if (code[braceSearchIdx] === "{") {
+        let depth = 0;
+        let finalIdx = -1;
+        for (let k = braceSearchIdx; k < code.length; k++) {
+          if (code[k] === "{") depth++;
+          else if (code[k] === "}") {
+            depth--;
+            if (depth === 0) {
+              finalIdx = k;
+              break;
+            }
+          }
+        }
+        if (finalIdx !== -1) {
+          found.push(code.slice(idx, finalIdx + 1));
+        }
+      } else {
+        // Just the line (e.g. macro or typedef)
+        const endOfLine = code.indexOf("\n", idx);
+        found.push(code.slice(idx, endOfLine !== -1 ? endOfLine : code.length));
+      }
+    }
+
+    if (found.length > 0) return found;
+
+    // 2. Loose fallback (substring grep with context)
+    // If we can't find a clean block, we'll try to find the lines containing the hint
+    // and grab some context around it
+    const mathcingLines = lines
+      .map((l, idx) => (l.toLowerCase().includes(lowerHint) ? idx : -1))
+      .filter((i) => i !== -1);
+
+    if (mathcingLines.length > 0) {
+      const firstLine = Math.max(0, mathcingLines[0] - 10);
+      const lastLine = Math.min(lines.length - 1, mathcingLines[mathcingLines.length - 1] + 50);
+      return [`// [FALLBACK] Substring match for "${hint}"\n` + lines.slice(firstLine, lastLine + 1).join("\n")];
+    }
+
+    return [];
   }
 }

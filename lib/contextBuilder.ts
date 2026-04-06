@@ -2945,9 +2945,29 @@ export async function buildMasterContext(
     if (!file.path || file.type === "folder" || file.type === "tree") continue;
     const rawPath = join(mirrorDir, file.path);
     if (fs.existsSync(rawPath) && fs.statSync(rawPath).isDirectory()) continue;
+
     const rawDir = join(rawPath, "..");
-    if (!fs.existsSync(rawDir)) mkdirSync(rawDir, { recursive: true });
-    await writeFile(rawPath, safeContent(file), "utf-8");
+
+    // Robust directory creation: Verify that no parent component is a file
+    try {
+      if (!fs.existsSync(rawDir)) {
+        mkdirSync(rawDir, { recursive: true });
+      } else if (!fs.statSync(rawDir).isDirectory()) {
+        console.warn(
+          `[Mirror] Skipping ${file.path}: Parent ${rawDir} is a file, not a directory.`,
+        );
+        continue;
+      }
+      await writeFile(rawPath, safeContent(file), "utf-8");
+    } catch (e: any) {
+      if (e.code === "ENOTDIR") {
+        console.warn(
+          `[Mirror] ENOTDIR collision for ${file.path}. A path component is a file. Skipping.`,
+        );
+        continue;
+      }
+      throw e;
+    }
   }
 
   const batches = splitSourceBlocksIntoBatches(sourceBlocks, 48);

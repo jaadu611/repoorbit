@@ -63,10 +63,7 @@ function contentMentionsSymbol(content: string, symbol: string): boolean {
  * Exact match first, substring fallback, whole-file last resort.
  */
 function extractTargetFunction(code: string, hint: string): string {
-  const exactBlocks: string[] = [];
-  const substringBlocks: string[] = [];
   const lowerHint = hint.toLowerCase();
-
   const isExact = (name: string) => name.toLowerCase() === lowerHint;
   const isSubstring = (name: string) => {
     const n = name.toLowerCase();
@@ -83,6 +80,9 @@ function extractTargetFunction(code: string, hint: string): string {
       ],
     });
 
+    const exactBlocks: string[] = [];
+    const substringBlocks: string[] = [];
+
     traverse(ast, {
       FunctionDeclaration(p: any) {
         const name = p.node.id?.name;
@@ -92,12 +92,7 @@ function extractTargetFunction(code: string, hint: string): string {
         else if (isSubstring(name)) substringBlocks.push(block);
       },
       VariableDeclarator(p: any) {
-        if (
-          !p.node.init ||
-          (p.node.init.type !== "FunctionExpression" &&
-            p.node.init.type !== "ArrowFunctionExpression")
-        )
-          return;
+        if (!p.node.init || (p.node.init.type !== "FunctionExpression" && p.node.init.type !== "ArrowFunctionExpression")) return;
         const id = p.node.id;
         if (id.type !== "Identifier") return;
         const name = id.name;
@@ -108,21 +103,11 @@ function extractTargetFunction(code: string, hint: string): string {
         else if (isSubstring(name)) substringBlocks.push(block);
       },
       AssignmentExpression(p: any) {
-        if (
-          p.node.right.type !== "FunctionExpression" &&
-          p.node.right.type !== "ArrowFunctionExpression"
-        )
-          return;
+        if (p.node.right.type !== "FunctionExpression" && p.node.right.type !== "ArrowFunctionExpression") return;
         const left = p.node.left;
         let name = "";
-        if (
-          left.type === "MemberExpression" &&
-          left.property.type === "Identifier"
-        ) {
-          name = left.property.name;
-        } else if (left.type === "Identifier") {
-          name = left.name;
-        }
+        if (left.type === "MemberExpression" && left.property.type === "Identifier") name = left.property.name;
+        else if (left.type === "Identifier") name = left.name;
         if (!name) return;
         const block = code.slice(p.node.start!, p.node.end!);
         if (isExact(name)) exactBlocks.push(block);
@@ -141,12 +126,64 @@ function extractTargetFunction(code: string, hint: string): string {
     if (exactBlocks.length > 0) return exactBlocks.join("\n\n");
     if (substringBlocks.length > 0) return substringBlocks.join("\n\n");
   } catch {
-    // AST parse failed — fall through to whole-file
+    // AST failed — try regex fallback for Go/C/C++
+    const cDefPatterns = [
+      new RegExp(`^[^\\/*\\n]*\\b${hint}\\b\\s*\\([^;]*$`, "m"),
+      new RegExp(`^#\\s*define\\s+${hint}\\b`, "m"),
+      new RegExp(`^(struct|union|enum|type)\\s+${hint}\\b`, "m"), // Added 'type' for Go
+      new RegExp(`^typedef\\s+.*\\b${hint}\\s*;`, "m"),
+    ];
+
+    let match: RegExpExecArray | null = null;
+    for (const pattern of cDefPatterns) {
+      match = pattern.exec(code);
+      if (match) break;
+    }
+
+    if (match) {
+      const idx = match.index;
+      let braceSearchIdx = idx;
+      while (
+        braceSearchIdx < code.length &&
+        code[braceSearchIdx] !== "{" &&
+        code[braceSearchIdx] !== ";"
+      ) {
+        braceSearchIdx++;
+      }
+
+      if (code[braceSearchIdx] === "{") {
+        let depth = 0;
+        let finalIdx = -1;
+        for (let k = braceSearchIdx; k < code.length; k++) {
+          if (code[k] === "{") depth++;
+          else if (code[k] === "}") {
+            depth--;
+            if (depth === 0) {
+              finalIdx = k;
+              break;
+            }
+          }
+        }
+        if (finalIdx !== -1) return code.slice(idx, finalIdx + 1);
+      } else {
+        const endOfLine = code.indexOf("\n", idx);
+        return code.slice(idx, endOfLine !== -1 ? endOfLine : code.length);
+      }
+    }
+
+    // Snippet fallback (±30 lines) if logic can't be bounded
+    const lines = code.split("\n");
+    const hitIdx = lines.findIndex(l => l.toLowerCase().includes(lowerHint));
+    if (hitIdx !== -1) {
+      const start = Math.max(0, hitIdx - 30);
+      const end = Math.min(lines.length - 1, hitIdx + 30);
+      return `// [SNIPPET FALLBACK] "${hint}" found near line ${hitIdx + 1}\n` + lines.slice(start, end + 1).join("\n");
+    }
   }
 
-  // Whole-file fallback — still better than nothing
   return code;
 }
+
 
 // ─── Main export ──────────────────────────────────────────────────────────────
 

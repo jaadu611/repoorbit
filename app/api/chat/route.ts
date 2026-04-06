@@ -13,6 +13,7 @@ import {
   getArchitectPrompt,
   getStaffEngineerPrompt,
   getDeepseekCodingPrompt,
+  getTriagePrompt,
 } from "@/lib/prompts";
 import { NextResponse } from "next/server";
 import { BrowserContext } from "playwright";
@@ -258,12 +259,16 @@ function scoreNotebooksForQuery(
     let notebookScore = 0;
     const matchedFilesWithScore: { path: string; score: number }[] = [];
 
+    // Collect directories of directly-matched files for co-location bonus
+    const directMatchDirs = new Set<string>();
+
     for (const filePath of fileEntries) {
       if (isNeverRelevant(filePath)) continue;
 
       const filePathLower = filePath.toLowerCase();
       let fileScore = 0;
 
+      // Token match in file path
       if (tokens.size > 0) {
         for (const token of tokens) {
           if (filePathLower.includes(token)) {
@@ -290,16 +295,19 @@ function scoreNotebooksForQuery(
                 fileScore += Math.min(occurrences, 5) * 3;
               }
             } else {
-              // No tokens — give core source files a base score so they surface
               fileScore += 10;
             }
           }
         }
       }
 
-      if (CORE_SOURCE_BONUS_RE.test(filePath)) {
+      // C source path bonus — covers backend/ src/ include/ core/ etc.
+      if (/^src\/backend\/|^src\/include\/|^src\/common\/|^include\//.test(filePath)) {
+        fileScore = Math.round(fileScore * 1.5);
+      } else if (CORE_SOURCE_BONUS_RE.test(filePath)) {
         fileScore = Math.round(fileScore * 1.5);
       }
+
       if (TEST_FILE_PENALTY_RE.test(filePath) && fileScore > 0) {
         fileScore = Math.round(fileScore * 0.4);
       }
@@ -307,6 +315,23 @@ function scoreNotebooksForQuery(
       if (fileScore > 0) {
         notebookScore += fileScore;
         matchedFilesWithScore.push({ path: filePath, score: fileScore });
+        // Record the directory for co-location bonus
+        const dir = filePath.includes("/") ? filePath.split("/").slice(0, -1).join("/") : "";
+        if (dir) directMatchDirs.add(dir);
+      }
+    }
+
+    // Directory co-location bonus: if other files in this notebook share a directory
+    // with a matched file, they get a proximity bonus (catches arrayfuncs siblings like
+    // array_userfuncs.c, arraysubs.c even if they don't token-match directly)
+    if (directMatchDirs.size > 0) {
+      for (const filePath of fileEntries) {
+        if (matchedFilesWithScore.some((f) => f.path === filePath)) continue; // already scored
+        if (isNeverRelevant(filePath)) continue;
+        const dir = filePath.includes("/") ? filePath.split("/").slice(0, -1).join("/") : "";
+        if (dir && directMatchDirs.has(dir)) {
+          notebookScore += 15; // co-located sibling bonus
+        }
       }
     }
 
@@ -331,6 +356,7 @@ function scoreNotebooksForQuery(
 
   return scores.sort((a, b) => b.score - a.score);
 }
+
 
 function buildQueryRelevanceSection(
   scores: NotebookScore[],
@@ -391,16 +417,16 @@ function deriveNotebookPlan(
     selected = scores.filter((s) => s.tier === "MEDIUM").slice(0, 3);
   }
 
-  // 3. FALLBACK: If still empty or all are LOW, take the top 5 (increased from 2)
+  // 3. FALLBACK: If still empty or all are LOW, take the top 3 (increased from 2)
   if (selected.length === 0 && scores.length > 0) {
     console.warn(
-      "[PLANNER] All notebooks scored LOW — using top 5 by score as fallback",
+      "[PLANNER] All notebooks scored LOW — using top 3 by score as fallback",
     );
-    selected = scores.slice(0, 5);
+    selected = scores.slice(0, 3);
   }
 
-  // 4. Increase global limit to 5 notebooks total
-  selected = selected.slice(0, 5);
+  // 4. Increase global limit to 3 notebooks total
+  selected = selected.slice(0, 3);
 
   return {
     include_meta: false,
@@ -733,16 +759,97 @@ export async function POST(req: Request) {
           return;
         }
 
-        // ── Phase 2: query each selected notebook ─────────────────────────
-        setStatus("Consulting NotebookLM...");
-        const phase2Insights = await processNotebookPlan(
-          context,
-          notebookPlan,
-          outDir,
-          repo,
-          repoLang,
-          (msg, part, prog) => setStatus(msg, part, prog),
-        );
+        // ── TRIAGE STEP ───────────────────────────────────────────────────
+        setStatus("Running NotebookLM Triage...");
+
+        let triagePage = context
+          .pages()
+          .find((p: any) => p.url()?.includes("notebooklm.google.com"));
+        if (!triagePage) triagePage = await context.newPage();
+
+        const triagePromptCmd = getTriagePrompt(query);
+        const triagePromptPath = path.join(outDir, "TRIAGE_PROMPT.txt");
+        fs.writeFileSync(triagePromptPath, triagePromptCmd, "utf-8");
+
+        const topFilesPaths = notebookPlan.notebooks
+          .flatMap((nb: any) => nb.covers || [])
+          .map((f: string) => path.join(outDir, "source_mirror", f))
+          .filter((f: string) => fs.existsSync(f))
+          .slice(0, 10);
+
+        const triageFiles: string[] = [triagePromptPath, annotatedManifestPath];
+        const triageContentBlocks: string[] = [];
+
+        for (const mirrorPath of topFilesPaths) {
+          if (fs.statSync(mirrorPath).isDirectory()) continue;
+          const relPathStr = path.relative(
+            path.join(outDir, "source_mirror"),
+            mirrorPath,
+          );
+          const content = fs.readFileSync(mirrorPath, "utf-8");
+          triageContentBlocks.push(`// --- SOURCE FILE: ${relPathStr} ---\n${content}\n`);
+        }
+
+        if (triageContentBlocks.length > 0) {
+          const combinedTriagePath = path.join(outDir, "triage_source_context.txt");
+          fs.writeFileSync(combinedTriagePath, triageContentBlocks.join("\n\n"), "utf-8");
+          triageFiles.push(combinedTriagePath);
+          console.log(`[TRIAGE] Bundled ${triageContentBlocks.length} files into triage_source_context.txt`);
+        }
+
+        const triageTitle = `@${repo} - [Triage]`;
+        let triageJsonStr = "";
+        try {
+          triageJsonStr = await automateNotebookLM(
+            triagePage,
+            triageFiles,
+            "Execute the instructions in TRIAGE_PROMPT.txt. Output JSON only.",
+            triageTitle,
+            setStatus,
+            true,
+            [triagePromptPath],
+          );
+        } catch (err: any) {
+          console.warn("[TRIAGE] Failed:", err.message);
+        }
+
+        let parsedTriage: any = null;
+        if (triageJsonStr) {
+          try {
+            const cleanedJson = triageJsonStr
+              .replace(/```(?:json)?\s*/gi, "")
+              .replace(/```/g, "")
+              .trim();
+            const start = cleanedJson.indexOf("{");
+            const end = cleanedJson.lastIndexOf("}");
+            if (start !== -1 && end !== -1 && end > start) {
+              parsedTriage = JSON.parse(
+                cleanedJson.slice(start, end + 1).replace(/[\x00-\x1F]+/g, " "),
+              );
+            }
+          } catch (err) {
+            console.warn("[TRIAGE] Failed to parse JSON:", err);
+          }
+        }
+
+        let phase2Insights = "";
+
+        if (parsedTriage && parsedTriage.intent === "FIX") {
+          setStatus(
+            "Triage determined intent is FIX. Fast-tracking to DeepSeek...",
+          );
+        } else {
+          // ── Phase 2: query each selected notebook ─────────────────────────
+          setStatus("Consulting NotebookLM...");
+          phase2Insights = await processNotebookPlan(
+            context,
+            notebookPlan,
+            outDir,
+            repo,
+            repoLang,
+            (msg, part, prog) => setStatus(msg, part, prog),
+          );
+        }
 
         // ── Phase 3: final synthesis loop with gap fill ───────────────────
         setStatus("Running final phase 3 synthesis...");
@@ -822,40 +929,33 @@ export async function POST(req: Request) {
             }
           }
 
-          // [PINNING] Also include pinned source files from ALL notebooks in the plan,
-          // but ONLY for the final phase answer. Convert to .txt if unsupported.
+          // [PINNING] Combine pinned source files from ALL notebooks in the plan
+          // into batched text bundles to respect NotebookLM's 50-file limit.
           const sourceMirrorDir = path.join(outDir, "source_mirror");
           if (fs.existsSync(sourceMirrorDir)) {
-            const txtPinnedDir = path.join(outDir, "txt_pinned");
-            if (!fs.existsSync(txtPinnedDir)) {
-              fs.mkdirSync(txtPinnedDir, { recursive: true });
-            }
-
             const pinnedSet = new Set<string>();
+            const pinnedContentBlocks: string[] = [];
+
             for (const nb of notebookPlan.notebooks) {
               for (const coveredFile of nb.covers ?? []) {
                 const mirrorPath = path.join(sourceMirrorDir, coveredFile);
                 if (fs.existsSync(mirrorPath) && !pinnedSet.has(mirrorPath)) {
                   if (fs.statSync(mirrorPath).isDirectory()) continue;
-                  const ext = path.extname(coveredFile).toLowerCase();
-                  if (SUPPORTED_EXTENSIONS.has(ext)) {
-                    finalPhaseFiles.push(mirrorPath);
-                    console.log(
-                      `[NOTEBOOK-FINAL] Pinning source mirror file: ${coveredFile}`,
-                    );
-                  } else {
-                    const safeName = coveredFile.replace(/[\/\\]/g, "_");
-                    const txtPath = path.join(txtPinnedDir, `${safeName}.txt`);
-                    if (!fs.existsSync(txtPath)) {
-                      fs.copyFileSync(mirrorPath, txtPath);
-                    }
-                    finalPhaseFiles.push(txtPath);
-                    console.log(
-                      `[NOTEBOOK-FINAL] Pinning source mirror file (converted to .txt): ${coveredFile} -> ${path.basename(txtPath)}`,
-                    );
-                  }
                   pinnedSet.add(mirrorPath);
+                  const content = fs.readFileSync(mirrorPath, "utf-8");
+                  pinnedContentBlocks.push(`// --- INITIAL SOURCE FILE: ${coveredFile} ---\n${content}\n`);
                 }
+              }
+            }
+
+            const BUNDLE_MAX_FILES = 20;
+            if (pinnedContentBlocks.length > 0) {
+              for (let i = 0; i < pinnedContentBlocks.length; i += BUNDLE_MAX_FILES) {
+                const chunk = pinnedContentBlocks.slice(i, i + BUNDLE_MAX_FILES);
+                const chunkPath = path.join(outDir, `pinned_source_context_part_${Math.floor(i / BUNDLE_MAX_FILES) + 1}.txt`);
+                fs.writeFileSync(chunkPath, chunk.join("\n\n"), "utf-8");
+                finalPhaseFiles.push(chunkPath);
+                console.log(`[NOTEBOOK-FINAL] Bundled ${chunk.length} pinned files into ${path.basename(chunkPath)}`);
               }
             }
           }
@@ -877,22 +977,30 @@ export async function POST(req: Request) {
             .find((p: any) => p.url()?.includes("notebooklm.google.com"));
           if (!page) page = await context.newPage();
 
-          const structuralJsonResult = await automateNotebookLM(
-            page,
-            finalPhaseFiles,
-            chatTrigger,
-            finalNotebookTitle,
-            setStatus,
-            true,
-            [finalInsightsPath, gapNBPath, queryPromptPath],
-          );
+          let structuralJsonResult = "";
+          if (parsedTriage && parsedTriage.intent === "FIX" && attempts === 0) {
+            structuralJsonResult = JSON.stringify(parsedTriage);
+            setStatus(
+              "Bypassing NotebookLM Phase 3 — injecting Triage JSON for DeepSeek...",
+            );
+          } else {
+            structuralJsonResult = await automateNotebookLM(
+              page,
+              finalPhaseFiles,
+              chatTrigger,
+              finalNotebookTitle,
+              setStatus,
+              true,
+              [finalInsightsPath, gapNBPath, queryPromptPath],
+            );
+          }
 
           let parsedGap: MissingContextResult | null = null;
           let parsedPathA: FinalPhaseResult | null = null;
           try {
             let jsonString = structuralJsonResult
-              .replace(/```(?:json)?\s*/gi, "")
-              .replace(/```/g, "")
+              .replace(new RegExp("```(?:json)?\\s*", "gi"), "")
+              .replace(new RegExp("```", "g"), "")
               .trim();
             const start = jsonString.indexOf("{");
             const end = jsonString.lastIndexOf("}");
@@ -919,11 +1027,7 @@ export async function POST(req: Request) {
                     : "// [WARNING] Root manifest not found.";
 
                   const dsPromptString = getDeepseekCodingPrompt({
-                    task: resultJson.task || "",
-                    focusAreas: resultJson.target_areas || [],
                     userQuery: query,
-                    strategy: resultJson.extraction_strategy,
-                    failureFocus: resultJson.failure_focus || [],
                   });
 
                   let deepPage = context
@@ -935,32 +1039,57 @@ export async function POST(req: Request) {
                   const dsFilledSymbols = new Set<string>();
                   let currentPathBJson = resultJson;
 
+                  const dsBaseContextDir = path.join(outDir, "deepseek_context");
+                  if (fs.existsSync(dsBaseContextDir)) {
+                    fs.rmSync(dsBaseContextDir, { recursive: true, force: true });
+                  }
+                  fs.mkdirSync(dsBaseContextDir, { recursive: true });
+                  
+                  // Build base context ONCE
+                  buildDeepseekContext(currentPathBJson, outDir);
+
                   for (
                     let dsAttempt = 0;
                     dsAttempt <= MAX_DS_GAP_FILLS;
                     dsAttempt++
                   ) {
-                    const { contextDir: dsContextDir } = buildDeepseekContext(
-                      currentPathBJson,
-                      outDir,
-                    );
+                    const turnUploadDir = path.join(outDir, `ds_upload_${dsAttempt}`);
+                    if (!fs.existsSync(turnUploadDir)) {
+                      fs.mkdirSync(turnUploadDir, { recursive: true });
+                    }
+
+                    // Copy base context (context.js, symbols.txt, manifest.txt) to THIS turn's upload folder.
+                    // This ensures DeepSeek doesn't lose the user's query or the original source mirror on Turn 1+.
+                    if (fs.existsSync(dsBaseContextDir)) {
+                      for (const f of fs.readdirSync(dsBaseContextDir)) {
+                        fs.copyFileSync(
+                          path.join(dsBaseContextDir, f),
+                          path.join(turnUploadDir, f)
+                        );
+                      }
+                    }
 
                     setStatus(
                       dsAttempt === 0
                         ? "Routing Path B payload to Deepseek..."
-                        : `Deepseek gap fill attempt ${dsAttempt} — retrying with enriched context...`,
+                        : `Deepseek gap fill attempt ${dsAttempt} — retrying with newly extracted requested context...`,
                     );
+
+                    const turnPrompt = dsAttempt === 0
+                      ? dsPromptString
+                      : "Here is the requested missing context extracted from the codebase. Please re-evaluate the logic and output only the final JSON as before.";
 
                     let dsRaw = "";
                     try {
                       dsRaw = await askDeepseek(
                         deepPage,
-                        dsPromptString,
+                        turnPrompt,
                         rootManifestContent,
-                        dsContextDir,
+                        turnUploadDir,
                         (msg, partial, prog) =>
                           setStatus(`[Deepseek] ${msg}`, partial, prog),
                         outDir,
+                        dsAttempt === 0
                       );
                     } catch (dsErr: any) {
                       console.warn("[Deepseek] Failed:", dsErr.message);
@@ -975,8 +1104,8 @@ export async function POST(req: Request) {
                     let dsNeedsMore = false;
                     try {
                       const cleanedDs = dsRaw
-                        .replace(/```(?:json)?\s*/gi, "")
-                        .replace(/```/g, "")
+                        .replace(new RegExp("```(?:json)?\\s*", "gi"), "")
+                        .replace(new RegExp("```", "g"), "")
                         .trim();
                       const dsStart = cleanedDs.indexOf("{");
                       const dsEnd = cleanedDs.lastIndexOf("}");
@@ -1140,45 +1269,17 @@ export async function POST(req: Request) {
                             return;
                           }
 
-                          // ── Write gap_filler.txt into deepseek_context/ ───────────────────────
-                          const dsContextDir = path.join(
-                            outDir,
-                            "deepseek_context",
-                          );
-                          fs.mkdirSync(dsContextDir, { recursive: true });
+                          // ── Write gap_filler.txt directly to the NEXT turn's upload folder ──
+                          const nextTurnDir = path.join(outDir, `ds_upload_${dsAttempt + 1}`);
+                          fs.mkdirSync(nextTurnDir, { recursive: true });
 
-                          const gapFillerPath = path.join(
-                            dsContextDir,
-                            "gap_filler.txt",
-                          );
-                          const existingGapContent = fs.existsSync(
-                            gapFillerPath,
-                          )
-                            ? fs.readFileSync(gapFillerPath, "utf-8") + "\n\n"
-                            : "";
-
+                          const gapFillerPath = path.join(nextTurnDir, "gap_filler.txt");
                           fs.writeFileSync(
                             gapFillerPath,
-                            existingGapContent + gapBundles.join("\n\n---\n\n"),
+                            gapBundles.join("\n\n---\n\n"),
                             "utf-8",
                           );
-                          console.log(
-                            `[DS-GAP] Wrote gap_filler.txt to ${dsContextDir}`,
-                          );
-
-                          // ── Update context_files for next round ──────────────────────────────
-                          const newContextFiles = [
-                            ...new Set([
-                              ...(currentPathBJson.context_files || []),
-                              ...symbolsToFetch
-                                .map((s: any) => s.source_file)
-                                .filter(Boolean),
-                            ]),
-                          ];
-                          currentPathBJson = {
-                            ...currentPathBJson,
-                            context_files: newContextFiles,
-                          };
+                          console.log(`[DS-GAP] Wrote gap_filler.txt to ${nextTurnDir}`);
                         }
                       }
                     } catch {

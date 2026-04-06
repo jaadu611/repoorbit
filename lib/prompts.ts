@@ -255,67 +255,19 @@ If ANY answer is NO → regenerate output
 RETURN FINAL ANSWER ONLY`;
 }
 
-export function getDeepseekCodingPrompt(props: {
-  focusAreas: string[];
-  userQuery: string;
-  task: string;
-  strategy?: {
-    entry_points?: string[];
-    trace_directions?: string[];
-  };
-  failureFocus?: string[];
-  coverageGaps?: string[];
-}): string {
-  const areas = props.focusAreas.map((a) => `• ${a}`).join("\n");
-  const entryPoints =
-    props.strategy?.entry_points?.join(", ") || "Not explicitly defined";
+export function getDeepseekCodingPrompt(props: { userQuery: string }): string {
+  return `### ROLE: SYSTEMS ENGINEER
 
-  const failureFocus =
-    props.failureFocus && props.failureFocus.length
-      ? props.failureFocus.map((f) => `• ${f}`).join("\n")
-      : "• Paths where execution diverges from the intended state machine\n• Async boundaries where the continuation is never invoked\n• Resource acquisition without a guaranteed release path";
+You are fixing a production bug in a real codebase. You have been given the exact source code. Trust the code over the question — if they conflict, the code is ground truth.
 
-  const coverageGaps =
-    props.coverageGaps && props.coverageGaps.length
-      ? `\n### KNOWN GAPS\n${props.coverageGaps.map((g) => `• ${g}`).join("\n")}\n`
-      : "";
-
-  return `### ROLE: STAFF-LEVEL SYSTEMS ENGINEER
-
-You are fixing a production bug in a real codebase. Reason from the source code provided.
-Do not follow a prescribed solution. If the fix requires adding new logic, add it.
+Before attempting any fix:
+1. Locate the described bug in the provided code exactly as stated.
+2. Verify the described condition is actually reachable given the code's logic.
+3. Only proceed to a fix if both are confirmed.
 
 ---
 
-### THE BUG
-
-${props.task}
-
-USER QUERY: ${props.userQuery}
-
----
-
-### FOCUS AREAS
-
-${areas}
-
----
-
-### FAILURE PATTERNS TO LOOK FOR
-
-${failureFocus}
-
----
-${coverageGaps}
-### ENTRY POINTS
-
-${entryPoints}
-
----
-
-### SOURCE CODE
-
-<contents of source files>
+${props.userQuery}
 
 ---
 
@@ -333,6 +285,20 @@ If a function directly called in the provided code is entirely absent AND strict
     }
   ]
 }
+
+---
+
+### INVALID QUESTION PROTOCOL
+
+If after analyzing the provided code you determine that the described bug cannot exist as stated — because the code already prevents it, the described condition is unreachable, or the premise contradicts the actual implementation — respond ONLY with:
+
+{
+  "status": "INVALID_QUESTION",
+  "reason": "One precise sentence explaining why the bug cannot exist as described.",
+  "evidence": "The exact line(s) or condition in the provided code that disproves the premise."
+}
+
+Do NOT attempt a fix. Do NOT speculate about related bugs. Do NOT fabricate a plausible-sounding alternative.
 
 ---
 
@@ -394,25 +360,18 @@ BEFORE declaring PATH C for any local file:
 
 The query describes a bug or desired behavior. It does NOT describe the current code.
 
-1. target_symbols MUST only contain symbols that literally exist in the provided source files, source_mirror/ files, or gap_filler.txt. Do NOT add symbols derived from the query description.
-2. match_signals MUST only contain string tokens that literally appear in the provided source code or source_mirror/ files. Do NOT derive match_signals from the query text.
-3. context_files MUST only list files that were actually provided, observed in phase2_insights.txt, or confirmed to exist in source_mirror/. Do NOT invent file paths.
-4. If the query describes a bug involving a system (e.g. "local cache", "TTL", "revocation") but that system is ABSENT from all provided source AND absent from source_mirror/ → do NOT construct PATH B around it. Instead:
-   - Add a coverage_gaps entry: "Query describes [X] but no implementation of [X] found in provided source or source_mirror/. Scoping fix to what is present."
-   - Scope PATH B only to the code that IS present and IS relevant.
-5. failure_focus entries MUST be grounded in observed code behavior from source files or source_mirror/. Not copied from the query description.
+1. context_files MUST only list files that were actually provided, observed in phase2_insights.txt, or confirmed to exist in source_mirror/. Do NOT invent file paths.
+2. If the query describes a bug involving a system (e.g. "local cache", "TTL", "revocation") but that system is ABSENT from all provided source AND absent from source_mirror/ → add a coverage_gaps entry: "Query describes [X] but no implementation of [X] found in provided source or source_mirror/. Scoping analysis to what is present."
 
-VIOLATION = INVALID OUTPUT. DeepSeek will loop indefinitely chasing symbols that do not exist.
+VIOLATION = INVALID OUTPUT. Analysis will be grounded in code.
 
 ---
 
 ### EXTERNAL DEPENDENCY RULE (CHECK BEFORE PATH C)
 
-If a symbol comes from an external npm package (bare require/import, no './' or '../'):
 - Do NOT declare PATH C. The file was never in this repo.
 - Answer from the call site — where it's required, how it's used, what's passed to it.
 - In PATH A: set role to "external_dependency", note package name and version.
-- In PATH B: scope fix to call site only.
 
 Examples:
   require('router')        → external, never PATH C
@@ -438,25 +397,9 @@ ${gap}
 
 ### PATH DECISION
 
-PATH B — if query asks for code modification AND entry point is known AND at least one path is traceable. PREFER this for fix-type queries. Do NOT block on missing non-critical details.
-
-PATH A — if query asks for understanding/analysis AND pre-check fully passes.
+PATH A — provide a comprehensive synthesis and analysis of the repository context grounded in the provided files.
 
 PATH C — ONLY if a LOCAL symbol (relative import) is missing AND breaks execution continuity AND is not covered by gap-filler AND is NOT present in source_mirror/. External packages NEVER trigger PATH C.
-
-ANTI-PARTIAL-FIX RULE: For hang/stall problems, you MUST have visibility into BOTH the hook runner continuation AND the thenable/promise wrapper — both are hang vectors. If only the entry point is available and the dispatcher is a local module not in context → check source_mirror/ first before PATH C.
-
----
-
-### PATH B SYMBOL CONSTRAINTS (MANDATORY)
-
-When constructing PATH B output:
-
-- target_symbols: list ONLY symbols that exist in provided source, source_mirror/ files, or gap_filler.txt. If a symbol from the query (e.g. "cache", "TTL") has no corresponding code anywhere → omit it and note in coverage_gaps.
-- match_signals: list ONLY string tokens that literally appear in the source files or source_mirror/ files (e.g. function names, variable names, import strings). NEVER copy words from the query description.
-- failure_focus: describe failure patterns you can directly observe in the code or source_mirror/ files. If you cannot point to a specific file and function where the failure occurs → do not include it.
-- context_files: include source_mirror/ paths for any raw files you read (e.g. "source_mirror/src/bearer.js"). DeepSeek can read these directly.
-- If the entire bug described in the query has no corresponding code in the provided source or source_mirror/ → produce PATH B scoped to the closest related code that IS present, with coverage_gaps explaining the mismatch. Do NOT produce PATH C just because the bug's system is missing — that would cause an infinite gap fill loop.
 
 ---
 
@@ -475,102 +418,10 @@ When constructing PATH B output:
   "coverage_gaps": []
 }
 
----
-
-#### PATH B (JSON ONLY):
-{
-  "intent": "FIX",
-  "task": "Ensure the request lifecycle reaches a terminal state when handlerTimeout is configured.",
-  "problem": "Requests hang indefinitely under load when asynchronous hooks or thenables fail to settle.",
-  "target_areas": [
-    "lib/route.js",
-    "lib/hooks.js",
-    "lib/handle-request.js",
-    "lib/wrap-thenable.js",
-    "lib/reply.js"
-  ],
-  "context_files": [
-    "lib/route.js",
-    "lib/hooks.js",
-    "lib/handle-request.js",
-    "lib/wrap-thenable.js",
-    "lib/reply.js",
-    "lib/symbols.js",
-    "source_mirror/lib/route.js",
-    "source_mirror/lib/hooks.js"
-  ],
-  "target_symbols": [
-    {
-      "name": "routeHandler",
-      "source_file": "lib/route.js",
-      "type": "function",
-      "role": "Entry point for request matching and timer initialization."
-    },
-    {
-      "name": "hookRunnerIterator",
-      "source_file": "lib/hooks.js",
-      "type": "function",
-      "role": "Recursive iterator for executing asynchronous middleware hooks."
-    },
-    {
-      "name": "wrapThenable",
-      "source_file": "lib/wrap-thenable.js",
-      "type": "function",
-      "role": "Logic for resolving/rejecting asynchronous or Promise-based handlers."
-    },
-    {
-      "name": "handler",
-      "source_file": "lib/handle-request.js",
-      "type": "function",
-      "role": "The primary execution block for the route's business logic."
-    },
-    {
-      "name": "Reply.prototype.send",
-      "source_file": "lib/reply.js",
-      "type": "method",
-      "role": "Terminal lifecycle function responsible for finalizing the response and clearing timers."
-    }
-  ],
-  "extraction_strategy": {
-    "entry_points": [
-      "lib/route.js:routeHandler"
-    ],
-    "trace_directions": [
-      "downstream through lib/hooks.js",
-      "downstream through lib/wrap-thenable.js",
-      "terminal at lib/reply.js"
-    ],
-    "match_signals": [
-      "handlerTimeout",
-      "kReplySent",
-      "kRequestSignal",
-      "kTimeoutTimer"
-    ]
-  },
-  "file_selection_rules": [
-    "select files implementing the core lifecycle or processing pipeline",
-    "include async wrappers and thenable handlers",
-    "include internal symbol definitions for state tracking",
-    "include source_mirror/ paths for any file where the notebook chunk was truncated or incomplete"
-  ],
-  "function_extraction_rules": [
-    "extract FULL dispatcher including internal loop or recursion",
-    "extract FULL async wrapper including both resolve and reject paths",
-    "extract termination conditions and closure-captured state",
-    "if a function is truncated in the notebook chunk, extract from source_mirror/<path> instead"
-  ],
-  "failure_focus": [
-    "unsettled hooks",
-    "stalled promise resolutions",
-    "missing timer cleanup on successful completion"
-  ],
-  "coverage_gaps": []
-}
-
-NOTE: The above PATH B is an EXAMPLE showing correct structure and grounding.
+NOTE: The above PATH A is an EXAMPLE showing correct structure and grounding.
 Your output must reflect the ACTUAL query and ACTUAL source files provided.
-match_signals, target_symbols, and failure_focus must come from observed code — not from this example and not from the query text.
-context_files should include source_mirror/ paths for any raw files that were read or are needed by DeepSeek.
+target_symbols must come from observed code — not from this example and not from the query text.
+context_files should include source_mirror/ paths for any raw files that were read.
 
 ---
 
@@ -595,7 +446,6 @@ context_files should include source_mirror/ paths for any raw files that were re
 - DO NOT compress chains or infer hidden nodes
 - DO NOT assume missing logic
 - DO NOT copy match_signals or target_symbols from the query text
-- DO NOT construct PATH B around systems that do not exist in the provided source or source_mirror/
 - ALWAYS check source_mirror/ before declaring any gap`;
 }
 
@@ -688,4 +538,55 @@ HARD CONSTRAINTS
 
 **Input Data:**
 ${jsonData}`;
+}
+
+export function getTriagePrompt(query: string): string {
+  return `You are a Lead Systems Architect and Triage Specialist.
+
+Your job is to analyze the user's query and the provided repository context (including the root manifest and top relevant source files) to determine if this is a coding task (requiring code modification) or a reasoning/understanding task (requiring explanation).
+
+### QUERY
+${query}
+
+---
+
+### DECISION CRITERIA
+- If the query asks to fix a bug, implement a feature, change behavior, or write code -> intent is "FIX".
+- If the query asks to explain how something works, document architecture, or trace a flow without changing it -> intent is "UNDERSTAND".
+
+---
+
+### PATH DECISION OUTPUT (STRICT — JSON ONLY)
+
+If intent is "UNDERSTAND":
+{
+  "intent": "UNDERSTAND",
+  "reason": "Brief explanation of why this is a reasoning task."
+}
+
+If intent is "FIX", produce a precise execution strategy for a downstream AI agent (DeepSeek) using this exact PATH B output format:
+{
+  "intent": "FIX",
+  "task": "A concise, actionable rephrasing of the bug or feature request.",
+  "problem": "The technical problem that needs to be solved.",
+  "expected_behavior": "What the system should do after the fix.",
+  "context_files": [
+    "List of required file paths. Include 'source_mirror/<path>' if passing a raw file to DeepSeek."
+  ],
+  "target_symbols": [
+    {
+      "name": "exactSymbolName",
+      "source_file": "lib/example.js",
+      "type": "function|class|method",
+      "role": "Why this needs to be modified."
+    }
+  ]
+}
+
+### RULES
+- Output MUST be valid JSON only. Start with { and end with }. No markdown fences \`\`\`.
+- Keep explanations in json fields extremely technical and concise.
+- Use paths exactly as they appear in the provided context files.
+- DO NOT invent systems or files that do not exist in the provided context.
+`;
 }
