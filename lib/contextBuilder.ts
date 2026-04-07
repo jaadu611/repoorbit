@@ -53,6 +53,7 @@ function detectRepoLanguage(filesMetadata: any[]): RepoLanguage {
     assembly: ["s", "asm"],
     lua: ["lua"],
     groovy: ["groovy"],
+    coffee: ["coffee"],
   };
 
   // 2. Count extensions, ignoring common noise (node_modules, .git, etc)
@@ -130,6 +131,7 @@ const TIER2_SYSTEMS = new Set([
   "sql",
   "S",
   "ld",
+  "coffee",
 ]);
 const KERNEL_CONFIG_EXTENSIONS = new Set(["Kconfig", "Makefile", "makefile"]);
 

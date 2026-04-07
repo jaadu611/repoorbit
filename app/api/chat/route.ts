@@ -7,6 +7,8 @@ import { automateChatGPT } from "@/lib/chatgptAutomator";
 import { getOrCreateContext } from "@/lib/browser";
 import { generateGapFillerNotebook } from "@/lib/gapScout";
 import { askDeepseek } from "@/lib/deepseekAutomator";
+import { askQwen } from "@/lib/qwenAutomator";
+import { askGemini } from "@/lib/geminiAutomator";
 import { buildDeepseekContext } from "@/lib/deepseekContextBuilder";
 import {
   getFinalPhasePrompt,
@@ -14,6 +16,7 @@ import {
   getStaffEngineerPrompt,
   getDeepseekCodingPrompt,
   getTriagePrompt,
+  getGeminiSynthesisPrompt,
 } from "@/lib/prompts";
 import { NextResponse } from "next/server";
 import { BrowserContext } from "playwright";
@@ -302,7 +305,11 @@ function scoreNotebooksForQuery(
       }
 
       // C source path bonus — covers backend/ src/ include/ core/ etc.
-      if (/^src\/backend\/|^src\/include\/|^src\/common\/|^include\//.test(filePath)) {
+      if (
+        /^src\/backend\/|^src\/include\/|^src\/common\/|^include\//.test(
+          filePath,
+        )
+      ) {
         fileScore = Math.round(fileScore * 1.5);
       } else if (CORE_SOURCE_BONUS_RE.test(filePath)) {
         fileScore = Math.round(fileScore * 1.5);
@@ -316,7 +323,9 @@ function scoreNotebooksForQuery(
         notebookScore += fileScore;
         matchedFilesWithScore.push({ path: filePath, score: fileScore });
         // Record the directory for co-location bonus
-        const dir = filePath.includes("/") ? filePath.split("/").slice(0, -1).join("/") : "";
+        const dir = filePath.includes("/")
+          ? filePath.split("/").slice(0, -1).join("/")
+          : "";
         if (dir) directMatchDirs.add(dir);
       }
     }
@@ -328,7 +337,9 @@ function scoreNotebooksForQuery(
       for (const filePath of fileEntries) {
         if (matchedFilesWithScore.some((f) => f.path === filePath)) continue; // already scored
         if (isNeverRelevant(filePath)) continue;
-        const dir = filePath.includes("/") ? filePath.split("/").slice(0, -1).join("/") : "";
+        const dir = filePath.includes("/")
+          ? filePath.split("/").slice(0, -1).join("/")
+          : "";
         if (dir && directMatchDirs.has(dir)) {
           notebookScore += 15; // co-located sibling bonus
         }
@@ -356,7 +367,6 @@ function scoreNotebooksForQuery(
 
   return scores.sort((a, b) => b.score - a.score);
 }
-
 
 function buildQueryRelevanceSection(
   scores: NotebookScore[],
@@ -787,14 +797,25 @@ export async function POST(req: Request) {
             mirrorPath,
           );
           const content = fs.readFileSync(mirrorPath, "utf-8");
-          triageContentBlocks.push(`// --- SOURCE FILE: ${relPathStr} ---\n${content}\n`);
+          triageContentBlocks.push(
+            `// --- SOURCE FILE: ${relPathStr} ---\n${content}\n`,
+          );
         }
 
         if (triageContentBlocks.length > 0) {
-          const combinedTriagePath = path.join(outDir, "triage_source_context.txt");
-          fs.writeFileSync(combinedTriagePath, triageContentBlocks.join("\n\n"), "utf-8");
+          const combinedTriagePath = path.join(
+            outDir,
+            "triage_source_context.txt",
+          );
+          fs.writeFileSync(
+            combinedTriagePath,
+            triageContentBlocks.join("\n\n"),
+            "utf-8",
+          );
           triageFiles.push(combinedTriagePath);
-          console.log(`[TRIAGE] Bundled ${triageContentBlocks.length} files into triage_source_context.txt`);
+          console.log(
+            `[TRIAGE] Bundled ${triageContentBlocks.length} files into triage_source_context.txt`,
+          );
         }
 
         const triageTitle = `@${repo} - [Triage]`;
@@ -943,19 +964,33 @@ export async function POST(req: Request) {
                   if (fs.statSync(mirrorPath).isDirectory()) continue;
                   pinnedSet.add(mirrorPath);
                   const content = fs.readFileSync(mirrorPath, "utf-8");
-                  pinnedContentBlocks.push(`// --- INITIAL SOURCE FILE: ${coveredFile} ---\n${content}\n`);
+                  pinnedContentBlocks.push(
+                    `// --- INITIAL SOURCE FILE: ${coveredFile} ---\n${content}\n`,
+                  );
                 }
               }
             }
 
             const BUNDLE_MAX_FILES = 20;
             if (pinnedContentBlocks.length > 0) {
-              for (let i = 0; i < pinnedContentBlocks.length; i += BUNDLE_MAX_FILES) {
-                const chunk = pinnedContentBlocks.slice(i, i + BUNDLE_MAX_FILES);
-                const chunkPath = path.join(outDir, `pinned_source_context_part_${Math.floor(i / BUNDLE_MAX_FILES) + 1}.txt`);
+              for (
+                let i = 0;
+                i < pinnedContentBlocks.length;
+                i += BUNDLE_MAX_FILES
+              ) {
+                const chunk = pinnedContentBlocks.slice(
+                  i,
+                  i + BUNDLE_MAX_FILES,
+                );
+                const chunkPath = path.join(
+                  outDir,
+                  `pinned_source_context_part_${Math.floor(i / BUNDLE_MAX_FILES) + 1}.txt`,
+                );
                 fs.writeFileSync(chunkPath, chunk.join("\n\n"), "utf-8");
                 finalPhaseFiles.push(chunkPath);
-                console.log(`[NOTEBOOK-FINAL] Bundled ${chunk.length} pinned files into ${path.basename(chunkPath)}`);
+                console.log(
+                  `[NOTEBOOK-FINAL] Bundled ${chunk.length} pinned files into ${path.basename(chunkPath)}`,
+                );
               }
             }
           }
@@ -1035,16 +1070,27 @@ export async function POST(req: Request) {
                     .find((p: any) => p.url()?.includes("chat.deepseek.com"));
                   if (!deepPage) deepPage = await context.newPage();
 
+                  let qwenPage = context
+                    .pages()
+                    .find((p: any) => p.url()?.includes("chat.qwen.ai"));
+                  if (!qwenPage) qwenPage = await context.newPage();
+
                   const MAX_DS_GAP_FILLS = 2;
                   const dsFilledSymbols = new Set<string>();
                   let currentPathBJson = resultJson;
 
-                  const dsBaseContextDir = path.join(outDir, "deepseek_context");
+                  const dsBaseContextDir = path.join(
+                    outDir,
+                    "deepseek_context",
+                  );
                   if (fs.existsSync(dsBaseContextDir)) {
-                    fs.rmSync(dsBaseContextDir, { recursive: true, force: true });
+                    fs.rmSync(dsBaseContextDir, {
+                      recursive: true,
+                      force: true,
+                    });
                   }
                   fs.mkdirSync(dsBaseContextDir, { recursive: true });
-                  
+
                   // Build base context ONCE
                   buildDeepseekContext(currentPathBJson, outDir);
 
@@ -1053,7 +1099,10 @@ export async function POST(req: Request) {
                     dsAttempt <= MAX_DS_GAP_FILLS;
                     dsAttempt++
                   ) {
-                    const turnUploadDir = path.join(outDir, `ds_upload_${dsAttempt}`);
+                    const turnUploadDir = path.join(
+                      outDir,
+                      `ds_upload_${dsAttempt}`,
+                    );
                     if (!fs.existsSync(turnUploadDir)) {
                       fs.mkdirSync(turnUploadDir, { recursive: true });
                     }
@@ -1064,7 +1113,7 @@ export async function POST(req: Request) {
                       for (const f of fs.readdirSync(dsBaseContextDir)) {
                         fs.copyFileSync(
                           path.join(dsBaseContextDir, f),
-                          path.join(turnUploadDir, f)
+                          path.join(turnUploadDir, f),
                         );
                       }
                     }
@@ -1075,12 +1124,16 @@ export async function POST(req: Request) {
                         : `Deepseek gap fill attempt ${dsAttempt} — retrying with newly extracted requested context...`,
                     );
 
-                    const turnPrompt = dsAttempt === 0
-                      ? dsPromptString
-                      : "Here is the requested missing context extracted from the codebase. Please re-evaluate the logic and output only the final JSON as before.";
+                    const turnPrompt =
+                      dsAttempt === 0
+                        ? dsPromptString
+                        : "Here is the requested missing context extracted from the codebase. Please re-evaluate the logic and output only the final JSON as before.";
 
                     let dsRaw = "";
+                    let qwenRaw = "";
                     try {
+                      // Execute DeepSeek first
+                      console.log("[ORCHESTRATOR] Starting DeepSeek...");
                       dsRaw = await askDeepseek(
                         deepPage,
                         turnPrompt,
@@ -1089,15 +1142,34 @@ export async function POST(req: Request) {
                         (msg, partial, prog) =>
                           setStatus(`[Deepseek] ${msg}`, partial, prog),
                         outDir,
-                        dsAttempt === 0
+                        dsAttempt === 0,
                       );
-                    } catch (dsErr: any) {
-                      console.warn("[Deepseek] Failed:", dsErr.message);
-                      activeJobs.set(taskId, {
-                        status: "error",
-                        error: dsErr.message,
-                      });
-                      return;
+
+                      // Then execute Qwen
+                      console.log("[ORCHESTRATOR] Starting Qwen...");
+                      qwenRaw = await askQwen(
+                        qwenPage,
+                        turnPrompt,
+                        rootManifestContent,
+                        turnUploadDir,
+                        (msg, partial, prog) =>
+                          setStatus(`[Qwen] ${msg}`, partial, prog),
+                        outDir,
+                        dsAttempt === 0,
+                      );
+                    } catch (err: any) {
+                      console.warn(
+                        "[Automator] Error during sequential execution:",
+                        err.message,
+                      );
+                      // Try to recover if at least one succeeded
+                      if (!dsRaw && !qwenRaw) {
+                        activeJobs.set(taskId, {
+                          status: "error",
+                          error: err.message,
+                        });
+                        return;
+                      }
                     }
 
                     // ── Check if DeepSeek needs more context ───────────────
@@ -1270,16 +1342,24 @@ export async function POST(req: Request) {
                           }
 
                           // ── Write gap_filler.txt directly to the NEXT turn's upload folder ──
-                          const nextTurnDir = path.join(outDir, `ds_upload_${dsAttempt + 1}`);
+                          const nextTurnDir = path.join(
+                            outDir,
+                            `ds_upload_${dsAttempt + 1}`,
+                          );
                           fs.mkdirSync(nextTurnDir, { recursive: true });
 
-                          const gapFillerPath = path.join(nextTurnDir, "gap_filler.txt");
+                          const gapFillerPath = path.join(
+                            nextTurnDir,
+                            "gap_filler.txt",
+                          );
                           fs.writeFileSync(
                             gapFillerPath,
                             gapBundles.join("\n\n---\n\n"),
                             "utf-8",
                           );
-                          console.log(`[DS-GAP] Wrote gap_filler.txt to ${nextTurnDir}`);
+                          console.log(
+                            `[DS-GAP] Wrote gap_filler.txt to ${nextTurnDir}`,
+                          );
                         }
                       }
                     } catch {
@@ -1287,12 +1367,73 @@ export async function POST(req: Request) {
                     }
 
                     if (!dsNeedsMore) {
+                      const combinedResult = [
+                        `// =============================================================================`,
+                        `// DEEPSEEK RESPONSE`,
+                        `// =============================================================================`,
+                        dsRaw,
+                        ``,
+                        `// =============================================================================`,
+                        `// QWEN RESPONSE`,
+                        `// =============================================================================`,
+                        qwenRaw,
+                      ].join("\n");
+
+                      const combinedPath = path.join(
+                        outDir,
+                        "combined_responses.txt",
+                      );
+                      fs.writeFileSync(combinedPath, combinedResult, "utf-8");
+                      console.log(
+                        `[ORCHESTRATOR] Saved combined responses to ${combinedPath}`,
+                      );
+
+                      let finalResult = combinedResult;
+                      try {
+                        const geminiPage =
+                          context
+                            .pages()
+                            .find((p) =>
+                              p.url().includes("gemini.google.com"),
+                            ) || (await context.newPage());
+                        const synthesisPrompt = getGeminiSynthesisPrompt();
+
+                        setStatus(
+                          "Uploading combined proposals to Gemini for final synthesis...",
+                        );
+                        const synthesisRaw = await askGemini(
+                          geminiPage,
+                          synthesisPrompt,
+                          [combinedPath],
+                          (msg) => setStatus(`[Gemini] ${msg}`),
+                        );
+
+                        // Save the synthesized result for debugging and final output
+                        const finalSynthesisPath = path.join(
+                          outDir,
+                          "final_synthesis.txt",
+                        );
+                        fs.writeFileSync(
+                          finalSynthesisPath,
+                          synthesisRaw,
+                          "utf-8",
+                        );
+                        console.log(
+                          `[ORCHESTRATOR] Saved final synthesis to ${finalSynthesisPath}`,
+                        );
+
+                        // Use only the synthesized code for the final result
+                        finalResult = synthesisRaw;
+                      } catch (geminiErr: any) {
+                        console.warn(
+                          "[Gemini] Synthesis failed, falling back to combined responses:",
+                          geminiErr.message,
+                        );
+                      }
+
                       activeJobs.set(taskId, {
                         status: "done",
-                        result:
-                          typeof dsRaw === "string"
-                            ? dsRaw
-                            : JSON.stringify(dsRaw, null, 2),
+                        result: finalResult,
                         answerSource: "final",
                       });
                       return;

@@ -54,14 +54,12 @@ export async function askDeepseek(
 
   // ── 2. Stage Structural Metadata ─────────────────────────────────────────
   if (isFirstTurn) {
-    const metadataBase = outDir && fs.existsSync(outDir) ? outDir : process.cwd();
+    const metadataBase =
+      outDir && fs.existsSync(outDir) ? outDir : process.cwd();
 
     // graph.json is excluded — 68k+ lines for Postgres, irrelevant for function-level fixes.
     // Dependency info is already embedded in context.js via // --- Source: ... --- headers.
-    const rootMetadata = [
-      "00_Root_Manifest_Annotated.txt",
-      "symbols.json",
-    ];
+    const rootMetadata = ["00_Root_Manifest_Annotated.txt", "symbols.json"];
 
     // ── Determine query-relevant symbols from the already-written context.js ─
     // This lets us filter symbols.json to only entries that are actually in scope.
@@ -75,8 +73,11 @@ export async function askDeepseek(
           if (m[1]) querySymbols.add(m[1].toLowerCase());
         }
         // Also extract source file names to pull their symbols
-        for (const m of ctxText.matchAll(/\/\/ --- (?:Raw )?Source: ([^\s]+) ---/g)) {
-          if (m[1]) querySymbols.add(m[1].toLowerCase().replace(/\.[^.]+$/, ""));
+        for (const m of ctxText.matchAll(
+          /\/\/ --- (?:Raw )?Source: ([^\s]+) ---/g,
+        )) {
+          if (m[1])
+            querySymbols.add(m[1].toLowerCase().replace(/\.[^.]+$/, ""));
         }
       } catch {}
     }
@@ -93,7 +94,10 @@ export async function askDeepseek(
             const filtered: string[] = [];
             const MAX_SYMBOLS = 500;
 
-            for (const [name, data] of Object.entries(syms) as [string, any][]) {
+            for (const [name, data] of Object.entries(syms) as [
+              string,
+              any,
+            ][]) {
               if (filtered.length >= MAX_SYMBOLS) break;
 
               const pathStr = (data.defined_in || "") as string;
@@ -107,7 +111,8 @@ export async function askDeepseek(
                 pathStr.endsWith(".out") ||
                 pathStr.endsWith(".sgml") ||
                 pathStr.endsWith(".txt")
-              ) continue;
+              )
+                continue;
 
               // Always skip numeric names
               if (/^\d+$/.test(name)) continue;
@@ -118,8 +123,8 @@ export async function askDeepseek(
                 const lowerPath = pathStr.toLowerCase().replace(/\.[^.]+$/, "");
                 const isRelevant =
                   querySymbols.has(lowerName) ||
-                  [...querySymbols].some(qs =>
-                    lowerPath.includes(qs) || lowerName.includes(qs)
+                  [...querySymbols].some(
+                    (qs) => lowerPath.includes(qs) || lowerName.includes(qs),
                   );
                 if (!isRelevant) continue;
               }
@@ -139,7 +144,8 @@ export async function askDeepseek(
           }
         }
 
-        const fileNameToUpload = fileName === "symbols.json" ? "symbols.txt" : fileName;
+        const fileNameToUpload =
+          fileName === "symbols.json" ? "symbols.txt" : fileName;
         const tmpPath = path.join(sessionDir, fileNameToUpload);
         fs.writeFileSync(tmpPath, content, "utf-8");
         allTmpPaths.push(tmpPath);
@@ -173,8 +179,6 @@ export async function askDeepseek(
         }
       }
     }
-
-
 
     // ── 4. Stage Session Manifest ────────────────────────────────────────────
     const manifestTmpPath = path.join(sessionDir, "manifest.txt");

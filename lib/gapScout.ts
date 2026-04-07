@@ -42,6 +42,20 @@ function resolveFilePath(outDir: string, loosePath: string): string | null {
     path.join(outDir, loosePath),
     loosePath,
   ];
+
+  // Fuzzy mapping for common build patterns (e.g. lib/foo.js -> _src/lib/foo.coffee)
+  const base = loosePath.replace(/\.[a-z0-9]+$/, "");
+  const extensions = [".ts", ".js", ".coffee", ".py", ".go", ".rs"];
+  const prefixes = ["", "src/", "_src/", "lib/"];
+  
+  for (const p of prefixes) {
+    for (const ext of extensions) {
+      const cleanBase = base.replace(/^(src|lib|_src)\//, "");
+      candidates.push(path.join(outDir, "source_mirror", p, base + ext));
+      candidates.push(path.join(outDir, "source_mirror", p, cleanBase + ext));
+    }
+  }
+
   for (const c of candidates) {
     if (fs.existsSync(c)) return c;
   }
@@ -128,8 +142,9 @@ function extractTargetFunction(code: string, hint: string): string {
   } catch {
     // AST failed — try regex fallback for Go/C/C++
     const cDefPatterns = [
-      new RegExp(`^[^\\/*\\n]*\\b${hint}\\b\\s*\\([^;]*$`, "m"),
-      new RegExp(`^#\\s*define\\s+${hint}\\b`, "m"),
+      new RegExp(`^[^\\/*\\n]*\\b${hint}\\b\\s*\\([^;]*$`, "m"), // Function definition start
+      new RegExp(`^\\s*\\b${hint}\\b\\s*[:=].*->`, "m"),        // CoffeeScript
+      new RegExp(`^#\\s*define\\s+${hint}\\b`, "m"),              // Macro
       new RegExp(`^(struct|union|enum|type)\\s+${hint}\\b`, "m"), // Added 'type' for Go
       new RegExp(`^typedef\\s+.*\\b${hint}\\s*;`, "m"),
     ];
@@ -259,7 +274,7 @@ export function generateGapFillerNotebook(
       const mirrorDir = path.join(outDir, "source_mirror");
       const searchDir = fs.existsSync(mirrorDir) ? "source_mirror" : ".";
       const matches = execSync(
-        `rg -l "${pattern}" ${searchDir} -g "*.{js,ts,jsx,tsx,rs,py,go,c,cpp,h,hpp,java,php}"`,
+        `rg -l "${pattern}" ${searchDir} -g "*.{js,ts,jsx,tsx,rs,py,go,c,cpp,h,hpp,java,php,coffee}"`,
         { cwd: outDir, encoding: "utf8", stdio: ["pipe", "pipe", "ignore"] },
       )
         .split("\n")

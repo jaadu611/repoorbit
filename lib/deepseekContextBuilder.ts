@@ -19,6 +19,7 @@ const CODE_EXTENSIONS = new Set([
   ".hpp",
   ".java",
   ".php",
+  ".coffee",
 ]);
 
 const SPLIT_LINE_THRESHOLD = 80;
@@ -273,6 +274,7 @@ export function buildDeepseekContext(
           symbolIndex,
           contextFiles.filter((f) => !f.startsWith("source_mirror/")),
           mirrorDir,
+          explicitSourceFile, // Pass explicit file to handle mappings
         );
       }
     } else {
@@ -505,19 +507,41 @@ function resolveCandidateFiles(
   symbolIndex: Record<string, { defined_in: string; used_by_files: string }>,
   contextFiles: string[],
   mirrorDir: string,
+  explicitFileHint?: string,
 ): CandidateFile[] {
   const candidates: CandidateFile[] = [];
   const seen = new Set<string>();
 
   const addCandidate = (relPath: string) => {
+    if (!relPath) return;
     const ext = path.extname(relPath).toLowerCase();
-    if (!CODE_EXTENSIONS.has(ext)) return;
+    // Allow .coffee etc
+    if (!CODE_EXTENSIONS.has(ext) && ext !== ".coffee") return;
     const fullPath = path.join(mirrorDir, relPath);
     if (!fs.existsSync(fullPath)) return;
     if (seen.has(fullPath)) return;
     seen.add(fullPath);
     candidates.push({ fullPath, relPath });
   };
+
+  // Try to resolve explicit hint with fuzzy mapping (e.g. lib/foo.js -> _src/lib/foo.coffee)
+  if (explicitFileHint) {
+    addCandidate(explicitFileHint);
+    if (candidates.length === 0) {
+      const base = explicitFileHint.replace(/\.[a-z0-9]+$/, "");
+      const extensions = [".ts", ".js", ".coffee", ".py", ".go", ".rs"];
+      const prefixes = ["", "src/", "_src/", "lib/"];
+      
+      for (const p of prefixes) {
+        for (const ext of extensions) {
+          // try removing common prefixes from base too
+          const cleanBase = base.replace(/^(src|lib|_src)\//, "");
+          addCandidate(path.join(p, base + ext));
+          addCandidate(path.join(p, cleanBase + ext));
+        }
+      }
+    }
+  }
 
   if (Object.prototype.hasOwnProperty.call(symbolIndex, hint)) {
     addCandidate(symbolIndex[hint].defined_in);
@@ -665,6 +689,7 @@ function extractFunctionsFromCode(code: string, hint: string): string[] {
     //          struct hint { ... }
     const cDefPatterns = [
       new RegExp(`^[^\\/*\\n]*\\b${hint}\\b\\s*\\([^;]*$`, "m"), // Function definition start
+      new RegExp(`^\\s*\\b${hint}\\b\\s*[:=].*->`, "m"),        // CoffeeScript
       new RegExp(`^#\\s*define\\s+${hint}\\b`, "m"),              // Macro
       new RegExp(`^(struct|union|enum)\\s+${hint}\\b`, "m"),     // Type definition
       new RegExp(`^typedef\\s+.*\\b${hint}\\s*;`, "m"),           // Typedef

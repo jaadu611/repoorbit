@@ -243,7 +243,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
               setProgress(null);
             }
           }
-        }, 1000);
+        }, 3000);
       } catch (err: any) {
         if (err?.name !== "AbortError") {
           abortControllerRef.current = null;
