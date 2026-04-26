@@ -585,7 +585,9 @@ export interface MissingContextResult {
 }
 
 export interface JobStatus {
-  status: "pending" | "done" | "error";
+  status: "pending" | "running" | "completed" | "done" | "error";
+  turn?: number;
+  step?: string;
   result?: string;
   partialResult?: string;
   error?: string;

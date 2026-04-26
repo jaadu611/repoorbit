@@ -24,54 +24,65 @@ const CODE_EXTENSIONS = new Set([
 // ─── Upload ───────────────────────────────────────────────────────────────────
 
 async function uploadFiles(page: Page, filePaths: string[]): Promise<void> {
-  const plusBtnSelector =
-    '.message-input-container [class*="attach"], button[aria-label*="Attach" i], .mode-select, button:has(span[class*="plus"])';
-  const plusBtn = await page.waitForSelector(plusBtnSelector, {
-    timeout: 10_000,
-  });
+  const attemptUpload = async () => {
+    const plusBtnSelector =
+      '.message-input-container [class*="attach"], button[aria-label*="Attach" i], .mode-select, button:has(span[class*="plus"])';
+    const plusBtn = await page.waitForSelector(plusBtnSelector, {
+      timeout: 10_000,
+    });
 
-  await page.click("textarea.message-input-textarea").catch(() => {});
-  await plusBtn.click({ force: true });
-  await page.waitForTimeout(1000);
+    await page.click("textarea.message-input-textarea").catch(() => {});
+    await plusBtn.click({ force: true });
+    await page.waitForTimeout(1000);
 
-  const ITEM_SELS = [
-    'li:has-text("Upload")',
-    '.ant-dropdown-menu-item:has-text("Upload")',
-    "text=/Upload/i",
-  ];
-  let uploadItem: any = null;
-  for (const sel of ITEM_SELS) {
-    uploadItem = await page
-      .waitForSelector(sel, { timeout: 3000 })
-      .catch(() => null);
-    if (uploadItem) break;
+    const ITEM_SELS = [
+      'li:has-text("Upload")',
+      '.ant-dropdown-menu-item:has-text("Upload")',
+      "text=/Upload/i",
+    ];
+    let uploadItem: any = null;
+    for (const sel of ITEM_SELS) {
+      uploadItem = await page
+        .waitForSelector(sel, { timeout: 3000 })
+        .catch(() => null);
+      if (uploadItem) break;
+    }
+    if (!uploadItem) throw new Error("Upload menu item not visible");
+
+    const [fileChooser] = await Promise.all([
+      page.waitForEvent("filechooser", { timeout: 15_000 }),
+      uploadItem.click({ force: true }),
+    ]);
+    await fileChooser.setFiles(filePaths);
+
+    await page.waitForFunction(
+      (count) => {
+        const container =
+          document.querySelector(
+            '.message-input-container, .qwen-chat-input-container, [class*="input-container"]',
+          ) || document;
+        const chips = container.querySelectorAll(
+          '.anticon.fileitem-icon, .message-input-file-item, .ant-upload-list-item, [class*="file-item"]',
+        );
+        const isBusy = !!document.querySelector(
+          '.ant-progress-bg, .ant-upload-list-item-uploading, [class*="uploading"], .ant-btn-loading',
+        );
+        return chips.length >= count && !isBusy;
+      },
+      filePaths.length,
+      { timeout: 45_000 },
+    );
+  };
+
+  try {
+    await attemptUpload();
+  } catch (err: any) {
+    if (err.message.includes("Timeout")) {
+      console.warn(`[Qwen] Warning: Timeout waiting for upload chips. Assuming uploaded and continuing.`);
+    } else {
+      throw err;
+    }
   }
-  if (!uploadItem) throw new Error("Upload menu item not visible");
-
-  const [fileChooser] = await Promise.all([
-    page.waitForEvent("filechooser", { timeout: 15_000 }),
-    uploadItem.click({ force: true }),
-  ]);
-  await fileChooser.setFiles(filePaths);
-
-  // Wait until all file chips appear and none are still uploading
-  await page.waitForFunction(
-    (count) => {
-      const container =
-        document.querySelector(
-          '.message-input-container, .qwen-chat-input-container, [class*="input-container"]',
-        ) || document;
-      const chips = container.querySelectorAll(
-        '.anticon.fileitem-icon, .message-input-file-item, .ant-upload-list-item, [class*="file-item"]',
-      );
-      const isBusy = !!document.querySelector(
-        '.ant-progress-bg, .ant-upload-list-item-uploading, [class*="uploading"], .ant-btn-loading',
-      );
-      return chips.length >= count && !isBusy;
-    },
-    filePaths.length,
-    { timeout: 40_000 },
-  );
 
   console.log(`[Qwen] ${filePaths.length} file(s) confirmed loaded.`);
 }
@@ -96,9 +107,8 @@ async function typeAndSend(page: Page, message: string): Promise<void> {
   console.log("[Qwen] Message sent.");
 }
 
-// ─── Reply detection — counts only Qwen answer bubbles ───────────────────────
+// ─── Reply detection ──────────────────────────────────────────────────────────
 
-// Matches the exact classes Qwen puts on its answer elements
 const REPLY_SEL = ".response-message-content.phase-answer";
 
 async function getReplyCount(page: Page): Promise<number> {
@@ -111,7 +121,7 @@ async function getReplyCount(page: Page): Promise<number> {
 async function waitForReply(
   page: Page,
   countBefore: number,
-  timeoutMs = 120_000,
+  timeoutMs = 1_800_000,
 ): Promise<void> {
   console.log(
     `[Qwen] Waiting for reply (Qwen answers so far: ${countBefore})...`,
@@ -128,12 +138,30 @@ async function waitForReply(
   throw new Error("[Qwen] Timed out waiting for reply");
 }
 
-// ─── Extract final response via clipboard ─────────────────────────────────────
+// ─── Extract response at a specific index ────────────────────────────────────
+// FIX: previously extractResponse always grabbed the LAST bubble on the page,
+// which could be a "Ready" from an intermediate batch.
+// Now we snapshot the reply count BEFORE sending the final message and extract
+// specifically the bubble at that index — guaranteed to be the final answer.
 
-const SENTINEL = "__QWEN_WAITING__";
+async function extractResponseAtIndex(
+  page: Page,
+  targetIndex: number,
+): Promise<string> {
+  // Step 1: Wait for stop button to appear (generation started)
+  await page
+    .waitForFunction(
+      () =>
+        !!document.querySelector(
+          '.qwen-chat-package-comp-new-action-control-container-stop, [class*="stop-generating"]',
+        ),
+      { timeout: 30_000 },
+    )
+    .catch(() => {
+      // Fast responses may not show stop button — continue
+    });
 
-async function extractResponse(page: Page): Promise<string> {
-  // Wait until generation stops (stop button gone)
+  // Step 2: Wait until generation is fully done
   await page.waitForFunction(
     () =>
       !document.querySelector(
@@ -142,51 +170,54 @@ async function extractResponse(page: Page): Promise<string> {
     { timeout: 300_000 },
   );
 
-  // Stability: 2 consecutive seconds with no char-count change in the last reply
-  let last = -1,
-    stable = 0;
-  while (stable < 2) {
-    const count = await page.evaluate((sel) => {
-      const els = document.querySelectorAll(sel);
-      return (
-        (els[els.length - 1] as HTMLElement | undefined)?.innerText?.length ?? 0
-      );
-    }, REPLY_SEL);
-    if (count === last) stable++;
-    else {
+  // Step 3: Stability — 5 consecutive 1.5s polls with no char-count change on the target bubble
+  let last = -1;
+  let stable = 0;
+  const STABLE_NEEDED = 5;
+
+  while (stable < STABLE_NEEDED) {
+    const count = await page.evaluate(
+      ({ sel, idx }: { sel: string; idx: number }) => {
+        const els = document.querySelectorAll(sel);
+        const el = els[idx] as HTMLElement | undefined;
+        return el?.innerText?.length ?? 0;
+      },
+      { sel: REPLY_SEL, idx: targetIndex },
+    );
+
+    if (count === last && count > 0) {
+      stable++;
+    } else {
       stable = 0;
       last = count;
     }
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(1500);
   }
 
-  // Extract final text via robust DOM selection
-  return page.evaluate(() => {
-    const selectors = [
-      '[data-message-author-role="assistant"]',
-      '.markdown-body:not([class*="user"])',
-      '.response-message-content',
-      '[class*="message-content"]:not([class*="user"])',
-      '[class*="assistant"]'
-    ];
+  // Step 4: Final settle pause
+  await page.waitForTimeout(2000);
 
-    let lastBubble: HTMLElement | null = null;
-    for (const sel of selectors) {
-      const nodes = Array.from(document.querySelectorAll<HTMLElement>(sel));
-      if (nodes.length > 0) {
-        lastBubble = nodes[nodes.length - 1];
-        break;
-      }
-    }
+  // Step 5: Extract text from the specific bubble at targetIndex
+  const text = await page.evaluate(
+    ({ sel, idx }: { sel: string; idx: number }) => {
+      const els = document.querySelectorAll(sel);
+      const bubble = els[idx] as HTMLElement | undefined;
+      if (!bubble) return "";
 
-    if (!lastBubble) return "";
+      const clone = bubble.cloneNode(true) as HTMLElement;
+      const ignoreEls = clone.querySelectorAll(
+        ".qwen-chat-package-comp-new-action-control-container-copy .qwen-chat-package-comp-new-action-control-container",
+      );
+      ignoreEls.forEach((el) => el.remove());
+      return clone.innerText?.trim() ?? "";
+    },
+    { sel: REPLY_SEL, idx: targetIndex },
+  );
 
-    const clone = lastBubble.cloneNode(true) as HTMLElement;
-    const ignoreEls = clone.querySelectorAll('button, [role="button"], [class*="copy"], [class*="download"], header, .md-code-block-header');
-    ignoreEls.forEach(el => el.remove());
-
-    return clone.innerText?.trim() ?? "";
-  });
+  console.log(
+    `[Qwen] Extracted response at index ${targetIndex} (${text.length} chars)`,
+  );
+  return text;
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -255,19 +286,12 @@ export async function askQwen(
     const metadataBase =
       outDir && fs.existsSync(outDir) ? outDir : process.cwd();
 
-    const rootManifest = path.join(
-      metadataBase,
-      "00_Root_Manifest_Annotated.txt",
-    );
+    const rootManifest = path.join(metadataBase, "00_Root_Manifest.txt");
     if (fs.existsSync(rootManifest)) {
-      const dst = path.join(sessionDir, "00_Root_Manifest_Annotated.txt");
+      const dst = path.join(sessionDir, "00_Root_Manifest.txt");
       fs.writeFileSync(dst, fs.readFileSync(rootManifest, "utf-8"), "utf-8");
       addFile(dst);
     }
-
-    const turnManifest = path.join(sessionDir, "manifest.txt");
-    fs.writeFileSync(turnManifest, manifestContent, "utf-8");
-    addFile(turnManifest);
 
     const symbolsPath = path.join(metadataBase, "symbols.json");
     if (fs.existsSync(symbolsPath)) {
@@ -299,7 +323,7 @@ export async function askQwen(
     const countBefore = await getReplyCount(qPage);
     await typeAndSend(qPage, query);
     await waitForReply(qPage, countBefore);
-    return extractResponse(qPage);
+    return extractResponseAtIndex(qPage, countBefore); // countBefore = index of the new reply
   }
 
   onStatus?.(
@@ -321,19 +345,22 @@ export async function askQwen(
         batches.length > 1
           ? `[FINAL PART ${i + 1}/${batches.length}] All context uploaded. Analyze and solve: ${query}`
           : query;
-      const countBefore = await getReplyCount(qPage);
+
+      // Snapshot BEFORE sending — this index is exactly where the final answer will land
+      const finalReplyIndex = await getReplyCount(qPage);
       onStatus?.("Sending final query…");
       await typeAndSend(qPage, msg);
-      await waitForReply(qPage, countBefore);
-      return extractResponse(qPage);
+      await waitForReply(qPage, finalReplyIndex);
+      return extractResponseAtIndex(qPage, finalReplyIndex);
     } else {
-      // Snapshot reply count BEFORE sending — .phase-answer only matches Qwen's bubbles, not ours
       const replyCountBefore = await getReplyCount(qPage);
       await typeAndSend(
         qPage,
         `Context Part ${i + 1}/${batches.length} attached. Wait for the next part. Reply only "Ready".`,
       );
       await waitForReply(qPage, replyCountBefore);
+      console.log(`[Qwen] Batch ${i + 1} acknowledged. Settling...`);
+      await qPage.waitForTimeout(5000);
     }
   }
 

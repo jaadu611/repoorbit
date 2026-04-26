@@ -24,6 +24,155 @@ const CODE_EXTENSIONS = new Set([
 
 const SPLIT_LINE_THRESHOLD = 80;
 
+// ---------------------------------------------------------------------------
+// SURROUNDING CONTEXT WINDOW
+// ---------------------------------------------------------------------------
+// When we extract a specific symbol (e.g. parseExtendedQueryString), we only
+// get the function body. The coding models therefore never see the require()
+// or import statements at the top of the file — the lines that tell them
+// which external modules are in scope and in what version.
+//
+// Without this, a model fixing parseExtendedQueryString cannot know that `qs`
+// is even a variable in scope, let alone what major version it is. This causes
+// models to guess option values (false, -1) instead of the correct documented
+// value (Infinity). This happened on the express arrayLimit bug.
+//
+// Fix: after extracting a symbol block, we capture the N lines immediately
+// before it in the source file (to get require/import and module-level config)
+// and N lines after it (to get module.exports and sibling wiring). These are
+// emitted as labelled sections so the model sees the full calling context.
+const SURROUNDING_LINES_BEFORE = 40; // enough to capture require() at top of file
+const SURROUNDING_LINES_AFTER = 20; // enough to capture module.exports below fn
+
+// ---------------------------------------------------------------------------
+// DEPENDENCY MANIFEST CO-EXTRACTION
+// ---------------------------------------------------------------------------
+// package.json (and equivalents) have zero entries in graph.json — they are
+// pure metadata and the dependency graph builder never links them to source
+// files. The context extractor therefore never pulls them in automatically,
+// even when the target function's correctness depends entirely on knowing
+// which version of a third-party library is installed.
+//
+// Real example: parseExtendedQueryString calls qs.parse(). The correct value
+// for the arrayLimit option depends on which major version of `qs` is used.
+// Without package.json, both DeepSeek and Qwen guessed (false and -1) instead
+// of the correct documented value (Infinity). The fix is to always co-extract
+// the nearest dependency manifest before emitting any symbol blocks.
+const DEPENDENCY_MANIFEST_NAMES = [
+  "package.json",
+  "Cargo.toml",
+  "go.mod",
+  "requirements.txt",
+  "pyproject.toml",
+  "Gemfile",
+  "composer.json",
+  "build.gradle",
+  "pom.xml",
+];
+
+/**
+ * Walks up from `startDir` toward `repoRoot` root looking for a dependency
+ * manifest. Returns the first one found (relative path + content), or null.
+ * maxDepth prevents walking above the repo root.
+ */
+function findDependencyManifest(
+  startDir: string,
+  repoRoot: string,
+  maxDepth = 4,
+): { relPath: string; content: string } | null {
+  let dir = startDir;
+  const root = path.resolve(repoRoot);
+
+  for (let depth = 0; depth < maxDepth; depth++) {
+    for (const name of DEPENDENCY_MANIFEST_NAMES) {
+      const candidate = path.join(dir, name);
+      if (fs.existsSync(candidate)) {
+        const relPath = path.relative(root, candidate);
+        const content = fs.readFileSync(candidate, "utf-8");
+        return { relPath, content };
+      }
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break; // filesystem root
+    if (!path.resolve(dir).startsWith(root)) break; // above root
+    dir = parent;
+  }
+  return null;
+}
+
+/**
+ * Given the full source text and the character offsets of an extracted symbol
+ * block, returns the SURROUNDING_LINES_BEFORE lines before and
+ * SURROUNDING_LINES_AFTER lines after the block as separate strings.
+ *
+ * We return prefix and suffix separately so the caller can label each section
+ * distinctly ("module context before" vs "module context after"), preserving
+ * the model's ability to distinguish require/imports from exports/wiring.
+ */
+function extractSurroundingContext(
+  fullCode: string,
+  blockStart: number,
+  blockEnd: number,
+): { prefix: string; suffix: string } {
+  const lines = fullCode.split("\n");
+
+  // Build line index: map each line to its starting character offset so we
+  // can convert Babel AST node.start/node.end offsets to line numbers.
+  let charCount = 0;
+  const lineStartOffsets: number[] = [];
+  for (const line of lines) {
+    lineStartOffsets.push(charCount);
+    charCount += line.length + 1; // +1 for \n
+  }
+
+  // Find start line index
+  let startLine = 0;
+  for (let i = 0; i < lineStartOffsets.length; i++) {
+    if (
+      lineStartOffsets[i] <= blockStart &&
+      (i === lineStartOffsets.length - 1 ||
+        lineStartOffsets[i + 1] > blockStart)
+    ) {
+      startLine = i;
+      break;
+    }
+  }
+
+  // Find end line index
+  let endLine = startLine;
+  for (let i = startLine; i < lineStartOffsets.length; i++) {
+    if (
+      lineStartOffsets[i] <= blockEnd &&
+      (i === lineStartOffsets.length - 1 || lineStartOffsets[i + 1] > blockEnd)
+    ) {
+      endLine = i;
+      break;
+    }
+  }
+
+  const prefixStart = Math.max(0, startLine - SURROUNDING_LINES_BEFORE);
+  const suffixEnd = Math.min(
+    lines.length - 1,
+    endLine + SURROUNDING_LINES_AFTER,
+  );
+
+  const prefixLines = lines.slice(prefixStart, startLine);
+  const suffixLines = lines.slice(endLine + 1, suffixEnd + 1);
+
+  // Omission notes tell the model there is more code outside this window
+  const prefixNote =
+    prefixStart > 0 ? `// [... ${prefixStart} lines before omitted ...]\n` : "";
+  const suffixNote =
+    suffixEnd < lines.length - 1
+      ? `\n// [... ${lines.length - 1 - suffixEnd} lines after omitted ...]`
+      : "";
+
+  return {
+    prefix: prefixNote + prefixLines.join("\n"),
+    suffix: suffixLines.join("\n") + suffixNote,
+  };
+}
+
 const SOURCE_PRIORITY: RegExp[] = [
   /^lib\//,
   /^src\//,
@@ -87,12 +236,6 @@ export function buildDeepseekContext(
     `// =============================================================================\n`,
   );
 
-
-  // =========================================================================
-  // SECTION 2: Logic Extraction (Removed - DeepSeek handles natively)
-  // =========================================================================
-
-
   extractedBlocks.push(
     `// =============================================================================\n`,
   );
@@ -101,46 +244,82 @@ export function buildDeepseekContext(
   // SECTION 6: Symbol & File Resolution
   // =========================================================================
   const symbolsPath = path.join(outDir, "symbols.json");
-  const mirrorDir = path.join(outDir, "source_mirror");
+  // The notebook files stored in outDir are the repository source ground truth
+  const notebooksMetaPath = path.join(outDir, "notebooks.json");
+  const notebooksDir = outDir; // notebook_01, notebook_02, ... live here
 
   // ------------------------------------------------------------------
-  // Mirror missing — fall back to reading context_files from repo root
+  // SECTION 4: Process context_files (from notebooks or direct read)
   // ------------------------------------------------------------------
-  if (!fs.existsSync(mirrorDir)) {
-    console.warn(
-      `[ContentBuilder] Mirror directory not found at ${mirrorDir}. ` +
-        `Falling back to reading context_files directly from repo root: ${repoRoot}`,
-    );
-    extractedBlocks.push(
-      `// [WARNING] Source mirror missing — reading context_files directly from repo root.\n`,
+  const cFiles: string[] = Array.isArray(pathBJson.context_files)
+    ? pathBJson.context_files
+    : [];
+
+  if (cFiles.length > 0) {
+    console.log(
+      `[ContentBuilder] Reading ${cFiles.length} context_files from repository sources`,
     );
 
-    const contextFiles: string[] = Array.isArray(pathBJson.context_files)
-      ? pathBJson.context_files
-      : [];
-
-    for (const relPath of contextFiles) {
-      const fullPath = path.join(repoRoot, relPath);
-      const ext = path.extname(relPath).toLowerCase();
-      if (!CODE_EXTENSIONS.has(ext)) continue;
-      if (!fs.existsSync(fullPath)) {
-        extractedBlocks.push(
-          `// [MISSING] ${relPath} not found at ${fullPath}`,
+    let notebooksLookup: Array<{
+      name: string;
+      files: string[];
+      localFiles: string[];
+    }> = [];
+    try {
+      if (fs.existsSync(notebooksMetaPath)) {
+        notebooksLookup = JSON.parse(
+          fs.readFileSync(notebooksMetaPath, "utf-8"),
         );
-        continue;
       }
-      const pairKey = `${fullPath}|__file__`;
-      if (processedPairs.has(pairKey)) continue;
-      processedPairs.add(pairKey);
-      const code = fs.readFileSync(fullPath, "utf-8");
-      extractedBlocks.push(`// --- Source: ${relPath} (direct read) ---`);
-      extractedBlocks.push(code);
-    }
+    } catch {}
 
-    const contextText = extractedBlocks.join("\n\n");
-    const mainFile = path.join(contextDir, "context.js");
-    fs.writeFileSync(mainFile, contextText, "utf-8");
-    return { contextDir, contextText };
+    for (const relPath of cFiles) {
+      if (!relPath) continue;
+
+      // 1. Try local notebook files first
+      let found = false;
+      for (const nb of notebooksLookup) {
+        const idx = nb.files.indexOf(relPath);
+        if (idx !== -1) {
+          const localPath = nb.localFiles[idx];
+          if (fs.existsSync(localPath)) {
+            const pairKey = `${localPath}|__file__`;
+            if (processedPairs.has(pairKey)) {
+              found = true;
+              break;
+            }
+            processedPairs.add(pairKey);
+            const raw = fs.readFileSync(localPath, "utf-8");
+            const code = raw.includes("\n\n")
+              ? raw.split("\n\n").slice(1).join("\n\n")
+              : raw;
+            extractedBlocks.push(`// --- Source: ${relPath} (notebook) ---`);
+            extractedBlocks.push(code);
+            found = true;
+            break;
+          }
+        }
+      }
+
+      // 2. Fall back to repoRoot direct read
+      if (!found) {
+        const fullPath = path.join(repoRoot, relPath);
+        const ext = path.extname(relPath).toLowerCase();
+        if (!CODE_EXTENSIONS.has(ext)) continue;
+        if (!fs.existsSync(fullPath)) {
+          extractedBlocks.push(
+            `// [MISSING] ${relPath} not found at ${fullPath}`,
+          );
+          continue;
+        }
+        const pairKey = `${fullPath}|__file__`;
+        if (processedPairs.has(pairKey)) continue;
+        processedPairs.add(pairKey);
+        const code = fs.readFileSync(fullPath, "utf-8");
+        extractedBlocks.push(`// --- Source: ${relPath} (direct read) ---`);
+        extractedBlocks.push(code);
+      }
+    }
   }
 
   // ------------------------------------------------------------------
@@ -159,71 +338,116 @@ export function buildDeepseekContext(
     console.warn("Could not load symbols index:", err);
   }
 
+  // =========================================================================
+  // SECTION 5 (NEW): Dependency Manifest Co-Extraction
+  // =========================================================================
+  // Emitted ONCE before any symbols so every model reading this context file
+  // sees the dependency versions first, before any function body it will fix.
+  const manifestCoExtract = findDependencyManifest(repoRoot, repoRoot, 2);
+  if (manifestCoExtract !== null) {
+    const rel: string = manifestCoExtract.relPath as string;
+    const content: string = manifestCoExtract.content as string;
+    extractedBlocks.push(
+      `\n// =============================================================================`,
+    );
+    extractedBlocks.push(`// DEPENDENCY MANIFEST: ${rel}`);
+    extractedBlocks.push(
+      `// Co-extracted automatically alongside the target symbols.`,
+      `// IMPORTANT FOR CODING MODELS:`,
+      `// Before choosing any option value for a third-party library call`,
+      `// look up the installed version in this manifest first.`,
+    );
+    extractedBlocks.push(
+      `// =============================================================================`,
+    );
+    extractedBlocks.push(content);
+
+    const mfn: string = rel.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const manifestFileName = `dep_manifest_${mfn}.txt`;
+    const manifestFilePath = path.join(contextDir, manifestFileName);
+    fs.writeFileSync(
+      manifestFilePath,
+      `// Dependency Manifest: ${rel}\n\n${content}`,
+      "utf-8",
+    );
+  } else {
+    console.warn(
+      `[buildDeepseekContext] No dependency manifest found in mirror. Models will not have version info.`,
+    );
+    extractedBlocks.push(
+      `// [WARNING] No dependency manifest (package.json / Cargo.toml / go.mod etc.) found.`,
+      `// Models MUST NOT guess option values for third-party libraries without version info.`,
+      `// Use the NEED_MORE_CONTEXT protocol if you require dependency version information.`,
+    );
+  }
+
   // ------------------------------------------------------------------
-  // SECTION 6a: Process context_files that are source_mirror/ paths
-  // These are raw files listed explicitly by NotebookLM in PATH B JSON.
-  // They bypass the symbol extraction path and are included directly.
+  // SECTION 6a: Process context_files (prefer notebook local files, fallback to GitHub/direct)
   // ------------------------------------------------------------------
   const contextFiles: string[] = Array.isArray(pathBJson.context_files)
     ? pathBJson.context_files
     : [];
 
-  const mirrorPrefixedFiles = contextFiles.filter((f) =>
-    f.startsWith("source_mirror/"),
-  );
+  let notebooksLookup2: Array<{ name: string; files: string[]; localFiles: string[] }> = [];
+  try {
+    if (fs.existsSync(notebooksMetaPath)) {
+      notebooksLookup2 = JSON.parse(fs.readFileSync(notebooksMetaPath, "utf-8"));
+    }
+  } catch {}
 
-  if (mirrorPrefixedFiles.length > 0) {
-    extractedBlocks.push(
-      `\n// =============================================================================`,
-    );
-    extractedBlocks.push(`// RAW SOURCE MIRROR FILES (ground truth)`);
-    extractedBlocks.push(
-      `// =============================================================================`,
-    );
+  if (contextFiles.length > 0) {
+    extractedBlocks.push(`\n// =============================================================================`);
+    extractedBlocks.push(`// REPOSITORY SOURCE FILES`);
+    extractedBlocks.push(`// =============================================================================`);
 
-    for (const mirrorRelPath of mirrorPrefixedFiles) {
-      // e.g. "source_mirror/src/bearer.js" → absolute path
-      const fullPath = path.join(outDir, mirrorRelPath);
-      const ext = path.extname(mirrorRelPath).toLowerCase();
-
+    for (const relPath of contextFiles) {
+      const ext = path.extname(relPath).toLowerCase();
       if (!CODE_EXTENSIONS.has(ext)) continue;
 
-      if (!fs.existsSync(fullPath)) {
-        extractedBlocks.push(
-          `// [MISSING] ${mirrorRelPath} not found at ${fullPath}`,
-        );
-        console.warn(`[buildDeepseekContext] Mirror file not found: ${fullPath}`);
-        continue;
+      // Try notebook local files first
+      let found = false;
+      for (const nb of notebooksLookup2) {
+        const idx = nb.files.indexOf(relPath);
+        if (idx !== -1 && fs.existsSync(nb.localFiles[idx])) {
+          const localPath = nb.localFiles[idx];
+          const pairKey = `${localPath}|__raw__`;
+          if (processedPairs.has(pairKey)) continue;
+          processedPairs.add(pairKey);
+
+          const raw = fs.readFileSync(localPath, "utf-8");
+          const code = raw.includes("\n\n") ? raw.split("\n\n").slice(1).join("\n\n") : raw;
+          const lineCount = code.split("\n").length;
+
+          extractedBlocks.push(`// --- Source: ${relPath} ---`);
+          console.log(`[buildDeepseekContext] Staged notebook file: ${relPath} (${lineCount} lines)`);
+
+          if (lineCount > SPLIT_LINE_THRESHOLD) {
+            const safeName = relPath.replace(/[^a-zA-Z0-9_-]/g, "_").replace(/_+/g, "_");
+            const splitFileName = `raw_${safeName}.js`;
+            const splitFilePath = path.join(contextDir, splitFileName);
+            fs.writeFileSync(splitFilePath, `// Raw source: ${relPath}\n\n${code}`, "utf-8");
+            extractedBlocks.push(`// --- See: ${splitFileName} (${lineCount} lines) ---`);
+          } else {
+            extractedBlocks.push(code);
+          }
+          found = true;
+          break;
+        }
       }
 
-      const pairKey = `${fullPath}|__raw__`;
-      if (processedPairs.has(pairKey)) continue;
-      processedPairs.add(pairKey);
-
-      const code = fs.readFileSync(fullPath, "utf-8");
-      const lineCount = code.split("\n").length;
-      const originalPath = mirrorRelPath.replace(/^source_mirror\//, "");
-
-      extractedBlocks.push(`// --- Raw Source: ${originalPath} ---`);
-      console.log(
-        `[buildDeepseekContext] Staged raw mirror file: ${mirrorRelPath} (${lineCount} lines)`,
-      );
-
-      if (lineCount > SPLIT_LINE_THRESHOLD) {
-        const safeName = originalPath
-          .replace(/[^a-zA-Z0-9_-]/g, "_")
-          .replace(/_+/g, "_");
-        const splitFileName = `raw_${safeName}.js`;
-        const splitFilePath = path.join(contextDir, splitFileName);
-        fs.writeFileSync(
-          splitFilePath,
-          `// Raw source: ${originalPath}\n\n${code}`,
-          "utf-8",
-        );
-        extractedBlocks.push(
-          `// --- See: ${splitFileName} (${lineCount} lines) ---`,
-        );
-      } else {
+      // Fallback to direct repo read
+      if (!found) {
+        const fullPath = path.join(repoRoot, relPath);
+        if (!fs.existsSync(fullPath)) {
+          extractedBlocks.push(`// [MISSING] ${relPath} not found`);
+          console.warn(`[buildDeepseekContext] File not found: ${fullPath}`);
+          continue;
+        }
+        const pairKey = `${fullPath}|__raw__`;
+        if (processedPairs.has(pairKey)) continue;
+        processedPairs.add(pairKey);
+        const code = fs.readFileSync(fullPath, "utf-8");
+        extractedBlocks.push(`// --- Source: ${relPath} (direct) ---`);
         extractedBlocks.push(code);
       }
     }
@@ -244,45 +468,54 @@ export function buildDeepseekContext(
       `// --- Symbol: "${hint}" | Role: ${symRequest.role || "unspecified"} | Type: ${symRequest.type || "unknown"} ---`,
     );
 
-    // ------------------------------------------------------------------
-    // Resolve source file — explicit source_file wins, heuristic fallback.
-    // Also handle source_mirror/ prefixed source_file paths from PATH B JSON.
-    // ------------------------------------------------------------------
     const rawSourceFile: string | undefined =
       typeof symRequest.source_file === "string" &&
       symRequest.source_file.trim()
         ? symRequest.source_file.trim()
         : undefined;
 
-    // Strip source_mirror/ prefix if present — we resolve via mirrorDir
-    const explicitSourceFile = rawSourceFile?.startsWith("source_mirror/")
-      ? rawSourceFile.replace(/^source_mirror\//, "")
-      : rawSourceFile;
+    const explicitSourceFile = rawSourceFile ?? undefined;
 
-    let candidateFiles: CandidateFile[];
+    let candidateFiles: CandidateFile[] = [];
 
     if (explicitSourceFile) {
-      const fullPath = path.join(mirrorDir, explicitSourceFile);
-      if (fs.existsSync(fullPath)) {
-        candidateFiles = [{ fullPath, relPath: explicitSourceFile }];
-      } else {
-        extractedBlocks.push(
-          `// [WARN] source_file "${explicitSourceFile}" not found in mirror — falling back to heuristic search`,
-        );
-        candidateFiles = resolveCandidateFiles(
-          hint,
-          symbolIndex,
-          contextFiles.filter((f) => !f.startsWith("source_mirror/")),
-          mirrorDir,
-          explicitSourceFile, // Pass explicit file to handle mappings
-        );
+      const explicit: string = explicitSourceFile;
+      // Check notebook local files first
+      let resolvedFromNotebook = false;
+      for (const nb of notebooksLookup2) {
+        const idx = nb.files.indexOf(explicit);
+        if (idx !== -1 && fs.existsSync(nb.localFiles[idx])) {
+          candidateFiles = [{ fullPath: nb.localFiles[idx], relPath: explicit }];
+          resolvedFromNotebook = true;
+          break;
+        }
+      }
+
+      if (!resolvedFromNotebook) {
+        const fullPath = path.join(repoRoot, explicit);
+        if (fs.existsSync(fullPath)) {
+          candidateFiles = [{ fullPath, relPath: explicit }];
+        } else {
+          extractedBlocks.push(
+            `// [WARN] source_file "${explicit}" not found — falling back to heuristic search`,
+          );
+          candidateFiles = resolveCandidateFiles(
+            hint,
+            symbolIndex,
+            contextFiles,
+            notebooksLookup2,
+            repoRoot,
+            explicit,
+          );
+        }
       }
     } else {
       candidateFiles = resolveCandidateFiles(
         hint,
         symbolIndex,
-        contextFiles.filter((f) => !f.startsWith("source_mirror/")),
-        mirrorDir,
+        contextFiles,
+        notebooksLookup2,
+        repoRoot,
       );
     }
 
@@ -312,11 +545,10 @@ export function buildDeepseekContext(
     extractedBlocks.push(`// --- Source: ${relPath} ---`);
 
     if (blocks.length === 0) {
-      // If this file was already staged via source_mirror/ (Section 6a), don't duplicate it
       const rawKey = `${fullPath}|__raw__`;
       if (processedPairs.has(rawKey)) {
         extractedBlocks.push(
-          `// (${hint} not isolated — full source already staged above as source_mirror file)`,
+          `// (${hint} not isolated — full source already staged above)`,
         );
         console.warn(
           `[buildDeepseekContext] Could not isolate "${hint}" in ${relPath} but file already staged — skipping duplicate.`,
@@ -324,7 +556,6 @@ export function buildDeepseekContext(
         continue;
       }
 
-      // Extract a windowed fallback (±150 lines around the hint) rather than the full file
       const lines = code.split("\n");
       const lowerHint = hint.toLowerCase();
       const hitLines = lines
@@ -338,18 +569,26 @@ export function buildDeepseekContext(
       let snippet: string;
       if (hitLines.length > 0) {
         const centre = hitLines[0];
-        const from = Math.max(0, centre - 150);
+        // Use the larger of 150 or SURROUNDING_LINES_BEFORE so require()
+        // statements at the top of the file are always captured.
+        const from = Math.max(
+          0,
+          centre - Math.max(150, SURROUNDING_LINES_BEFORE),
+        );
         const to = Math.min(lines.length - 1, centre + 150);
         snippet =
           (from > 0 ? `// [truncated ${from} lines before...]\n` : "") +
           lines.slice(from, to + 1).join("\n") +
-          (to < lines.length - 1 ? `\n// [...truncated ${lines.length - to - 1} lines after]` : "");
+          (to < lines.length - 1
+            ? `\n// [...truncated ${lines.length - to - 1} lines after]`
+            : "");
       } else {
-        // No hit at all — emit only the first 200 lines as a head
         const CAP = 200;
         snippet =
           lines.slice(0, CAP).join("\n") +
-          (lines.length > CAP ? `\n// [...file truncated at ${CAP} lines — "${hint}" not found]` : "");
+          (lines.length > CAP
+            ? `\n// [...file truncated at ${CAP} lines — "${hint}" not found]`
+            : "");
       }
 
       const safeName = hint.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -366,26 +605,85 @@ export function buildDeepseekContext(
       continue;
     }
 
+    // ---------------------------------------------------------------
+    // SURROUNDING CONTEXT WINDOW — emitted for every extracted block
+    // ---------------------------------------------------------------
+    // We find the character offset of the extracted block in the full
+    // source, then use extractSurroundingContext to get the lines
+    // immediately before (require/imports) and after (module.exports).
+    //
+    // For small blocks we emit inline with labelled headers.
+    // For large blocks we write to the split file with the prefix and
+    // suffix included so the split file is self-contained.
+    // ---------------------------------------------------------------
     for (const block of blocks) {
       const lineCount = block.split("\n").length;
+
+      // Locate the block in the original source by exact string match.
+      // This works because extractFunctionsFromCode uses code.slice() on
+      // AST node offsets, so the block is a verbatim substring of code.
+      const blockCharStart = code.indexOf(block);
+      const blockCharEnd =
+        blockCharStart >= 0 ? blockCharStart + block.length : -1;
+
+      let prefixText = "";
+      let suffixText = "";
+
+      if (blockCharStart >= 0) {
+        const surrounding = extractSurroundingContext(
+          code,
+          blockCharStart,
+          blockCharEnd,
+        );
+        prefixText = surrounding.prefix.trim();
+        suffixText = surrounding.suffix.trim();
+      }
 
       if (lineCount > SPLIT_LINE_THRESHOLD) {
         const safeName = hint.replace(/[^a-zA-Z0-9_-]/g, "_");
         const splitFileName = `${safeName}.js`;
         const splitFilePath = path.join(contextDir, splitFileName);
-        fs.writeFileSync(
-          splitFilePath,
-          `// Source: ${relPath}\n// Symbol: ${hint}\n\n${block}`,
-          "utf-8",
-        );
+
+        // Write prefix + body + suffix into the split file so it is
+        // fully self-contained: the model sees require() stmts, the
+        // function, and the module.exports line all in one file.
+        const fullContent = [
+          `// Source: ${relPath}`,
+          `// Symbol: ${hint}`,
+          ``,
+          prefixText
+            ? `// --- Module context before ${hint} (require/imports/module-level config) ---\n${prefixText}\n`
+            : "",
+          `// --- Symbol body ---`,
+          block,
+          suffixText
+            ? `\n// --- Module context after ${hint} (exports/wiring) ---\n${suffixText}`
+            : "",
+        ]
+          .filter((s) => s !== "")
+          .join("\n");
+
+        fs.writeFileSync(splitFilePath, fullContent, "utf-8");
         extractedBlocks.push(
           `// --- See: ${splitFileName} (${lineCount} lines, split to keep context readable) ---`,
         );
       } else {
+        // Inline: emit prefix → body → suffix with clear section labels
+        if (prefixText) {
+          extractedBlocks.push(
+            `// --- Module context before ${hint} (require/imports/module-level config) ---`,
+          );
+          extractedBlocks.push(prefixText);
+        }
         extractedBlocks.push(block);
+        if (suffixText) {
+          extractedBlocks.push(
+            `// --- Module context after ${hint} (exports/wiring) ---`,
+          );
+          extractedBlocks.push(suffixText);
+        }
       }
     }
-
   }
 
   // =========================================================================
@@ -393,7 +691,9 @@ export function buildDeepseekContext(
   // =========================================================================
   const gapFiles = fs
     .readdirSync(contextDir)
-    .filter((f) => f.startsWith("gap_") && (f.endsWith(".js") || f.endsWith(".txt")))
+    .filter(
+      (f) => f.startsWith("gap_") && (f.endsWith(".js") || f.endsWith(".txt")),
+    )
     .sort();
 
   if (gapFiles.length > 0) {
@@ -422,11 +722,9 @@ export function buildDeepseekContext(
 
       let extracted = false;
       if (gapSourceFile) {
-        const sourceBlockMatch = gapContent.match(
-          /```typescript\n([\s\S]*?)```/,
-        );
-        if (sourceBlockMatch) {
-          const sourceCode = sourceBlockMatch[1];
+        const match = gapContent.match(/```typescript\n([\s\S]*?)```/);
+        if (match !== null && match[1]) {
+          const sourceCode: string = match[1];
           const blocks = extractFunctionsFromCode(sourceCode, gapSymbol);
           if (blocks.length > 0) {
             extractedBlocks.push(`// Source: ${gapSourceFile} (gap-filled)`);
@@ -439,9 +737,7 @@ export function buildDeepseekContext(
                   `// Gap-filled: ${gapSymbol} from ${gapSourceFile}\n\n${block}`,
                   "utf-8",
                 );
-                extractedBlocks.push(
-                  `// --- See: ${gapFile} (${lineCount} lines) ---`,
-                );
+                extractedBlocks.push(`// --- See: ${gapFile} (${lineCount} lines) ---`);
               } else {
                 extractedBlocks.push(block);
               }
@@ -456,28 +752,9 @@ export function buildDeepseekContext(
         if (lineCount <= SPLIT_LINE_THRESHOLD * 2) {
           extractedBlocks.push(gapContent);
         } else {
-          console.warn(
-            `[buildDeepseekContext] Could not extract "${gapSymbol}" from gap file — ` +
-              `file is ${lineCount} lines. DeepSeek will receive it as a separate upload ` +
-              `but it may contain noise. Consider fixing name_hint in PATH B JSON.`,
-          );
           extractedBlocks.push(
-            `// [GAP FILE TOO LARGE — ${lineCount} lines] Could not extract "${gapSymbol}". ` +
-              `Check that name_hint in PATH B JSON is an exact function name not a filename.`,
+            `// [GAP FILE TOO LARGE — ${lineCount} lines] Could not isolate "${gapSymbol}". Check the full context upload for this symbol.`,
           );
-          const sourceBlockMatch = gapContent.match(
-            /```typescript\n([\s\S]*?)```/,
-          );
-          if (sourceBlockMatch) {
-            fs.writeFileSync(
-              gapFilePath,
-              `// Gap-filled: ${gapSymbol} from ${gapSourceFile ?? "unknown"}\n\n${sourceBlockMatch[1]}`,
-              "utf-8",
-            );
-            extractedBlocks.push(
-              `// Trimmed to direct source block — see ${gapFile}`,
-            );
-          }
         }
       }
     }
@@ -506,7 +783,8 @@ function resolveCandidateFiles(
   hint: string,
   symbolIndex: Record<string, { defined_in: string; used_by_files: string }>,
   contextFiles: string[],
-  mirrorDir: string,
+  notebooksLookup: Array<{ name: string; files: string[]; localFiles: string[] }>,
+  repoRoot: string,
   explicitFileHint?: string,
 ): CandidateFile[] {
   const candidates: CandidateFile[] = [];
@@ -515,26 +793,37 @@ function resolveCandidateFiles(
   const addCandidate = (relPath: string) => {
     if (!relPath) return;
     const ext = path.extname(relPath).toLowerCase();
-    // Allow .coffee etc
     if (!CODE_EXTENSIONS.has(ext) && ext !== ".coffee") return;
-    const fullPath = path.join(mirrorDir, relPath);
-    if (!fs.existsSync(fullPath)) return;
-    if (seen.has(fullPath)) return;
-    seen.add(fullPath);
-    candidates.push({ fullPath, relPath });
+
+    // 1. Try notebooks first
+    for (const nb of notebooksLookup) {
+      const idx = nb.files.indexOf(relPath);
+      if (idx !== -1 && fs.existsSync(nb.localFiles[idx])) {
+        const fullPath = nb.localFiles[idx];
+        if (seen.has(fullPath)) return;
+        seen.add(fullPath);
+        candidates.push({ fullPath, relPath });
+        return;
+      }
+    }
+
+    // 2. Fallback to direct repo read
+    const repoPath = path.join(repoRoot, relPath);
+    if (fs.existsSync(repoPath)) {
+      if (seen.has(repoPath)) return;
+      seen.add(repoPath);
+      candidates.push({ fullPath: repoPath, relPath });
+    }
   };
 
-  // Try to resolve explicit hint with fuzzy mapping (e.g. lib/foo.js -> _src/lib/foo.coffee)
   if (explicitFileHint) {
     addCandidate(explicitFileHint);
     if (candidates.length === 0) {
       const base = explicitFileHint.replace(/\.[a-z0-9]+$/, "");
       const extensions = [".ts", ".js", ".coffee", ".py", ".go", ".rs"];
       const prefixes = ["", "src/", "_src/", "lib/"];
-      
       for (const p of prefixes) {
         for (const ext of extensions) {
-          // try removing common prefixes from base too
           const cleanBase = base.replace(/^(src|lib|_src)\//, "");
           addCandidate(path.join(p, base + ext));
           addCandidate(path.join(p, cleanBase + ext));
@@ -566,10 +855,11 @@ function resolveCandidateFiles(
     substringMatches.forEach(addCandidate);
   }
 
-  if (fs.existsSync(mirrorDir) && !hint.includes(" ")) {
+  if (fs.existsSync(repoRoot) && !hint.includes(" ")) {
     try {
+      // If repoRoot still contains files (e.g. was direct read), search it
       const rgMatches = execSync(`rg -l "\\b${hint}\\b" .`, {
-        cwd: mirrorDir,
+        cwd: repoRoot,
         encoding: "utf-8",
         stdio: ["pipe", "pipe", "ignore"],
       })
@@ -609,8 +899,6 @@ function extractFunctionsFromCode(code: string, hint: string): string[] {
     });
 
     traverse(ast, {
-      // FIX: ClassDeclaration was missing — ES6 classes like Bearer, Basic,
-      // Permit were not being extracted, causing whole-file fallback every time.
       ClassDeclaration(p: any) {
         const name = p.node.id?.name;
         if (!name) return;
@@ -676,23 +964,16 @@ function extractFunctionsFromCode(code: string, hint: string): string[] {
     if (substringBlocks.length > 0) return substringBlocks;
     return [];
   } catch (err) {
-    // If Babel fails, we are likely in a non-JS file (e.g. C/C++/Go)
-    // Use an aggressive regex-based extraction to find function bodies
     const lines = code.split("\n");
     const found: string[] = [];
     const lowerHint = hint.toLowerCase();
 
-    // 1. Precise match (likely for C functions/macros/structs)
-    // Matches: int some_function(args) { ... }
-    //          extern void* some_func(void) {
-    //          #define hint ...
-    //          struct hint { ... }
     const cDefPatterns = [
-      new RegExp(`^[^\\/*\\n]*\\b${hint}\\b\\s*\\([^;]*$`, "m"), // Function definition start
-      new RegExp(`^\\s*\\b${hint}\\b\\s*[:=].*->`, "m"),        // CoffeeScript
-      new RegExp(`^#\\s*define\\s+${hint}\\b`, "m"),              // Macro
-      new RegExp(`^(struct|union|enum)\\s+${hint}\\b`, "m"),     // Type definition
-      new RegExp(`^typedef\\s+.*\\b${hint}\\s*;`, "m"),           // Typedef
+      new RegExp(`^[^\\/*\\n]*\\b${hint}\\b\\s*\\([^;]*$`, "m"),
+      new RegExp(`^\\s*\\b${hint}\\b\\s*[:=].*->`, "m"),
+      new RegExp(`^#\\s*define\\s+${hint}\\b`, "m"),
+      new RegExp(`^(struct|union|enum)\\s+${hint}\\b`, "m"),
+      new RegExp(`^typedef\\s+.*\\b${hint}\\s*;`, "m"),
     ];
 
     let match: RegExpExecArray | null = null;
@@ -703,13 +984,12 @@ function extractFunctionsFromCode(code: string, hint: string): string[] {
 
     if (match) {
       const idx = match.index;
-      // Find where the block ends via brace matching
       let braceSearchIdx = idx;
       while (
         braceSearchIdx < code.length &&
         code[braceSearchIdx] !== "{" &&
         code[braceSearchIdx] !== ";" &&
-        code[braceSearchIdx] !== "\n" // for simple macros
+        code[braceSearchIdx] !== "\n"
       ) {
         braceSearchIdx++;
       }
@@ -731,7 +1011,6 @@ function extractFunctionsFromCode(code: string, hint: string): string[] {
           found.push(code.slice(idx, finalIdx + 1));
         }
       } else {
-        // Just the line (e.g. macro or typedef)
         const endOfLine = code.indexOf("\n", idx);
         found.push(code.slice(idx, endOfLine !== -1 ? endOfLine : code.length));
       }
@@ -739,17 +1018,20 @@ function extractFunctionsFromCode(code: string, hint: string): string[] {
 
     if (found.length > 0) return found;
 
-    // 2. Loose fallback (substring grep with context)
-    // If we can't find a clean block, we'll try to find the lines containing the hint
-    // and grab some context around it
-    const mathcingLines = lines
+    const matchingLines = lines
       .map((l, idx) => (l.toLowerCase().includes(lowerHint) ? idx : -1))
       .filter((i) => i !== -1);
 
-    if (mathcingLines.length > 0) {
-      const firstLine = Math.max(0, mathcingLines[0] - 10);
-      const lastLine = Math.min(lines.length - 1, mathcingLines[mathcingLines.length - 1] + 50);
-      return [`// [FALLBACK] Substring match for "${hint}"\n` + lines.slice(firstLine, lastLine + 1).join("\n")];
+    if (matchingLines.length > 0) {
+      const firstLine = Math.max(0, matchingLines[0] - 10);
+      const lastLine = Math.min(
+        lines.length - 1,
+        matchingLines[matchingLines.length - 1] + 50,
+      );
+      return [
+        `// [FALLBACK] Substring match for "${hint}"\n` +
+          lines.slice(firstLine, lastLine + 1).join("\n"),
+      ];
     }
 
     return [];

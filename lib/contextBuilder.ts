@@ -7,6 +7,8 @@ const SPLIT_THRESHOLD_CHARS = 3_000;
 const MIN_RELEVANCE_SCORE_GENERIC = 3;
 const MIN_RELEVANCE_SCORE_TARGETED = 15;
 
+import { getNotebookSystemInstruction } from "@/lib/prompts";
+
 import {
   RepoLanguage,
   ImportRole,
@@ -24,7 +26,6 @@ function detectRepoLanguage(filesMetadata: any[]): RepoLanguage {
 
   const extCounts: Record<string, number> = {};
 
-  // 1. Map extensions to language groups
   const languageGroups: Record<string, string[]> = {
     cpp: ["cpp", "cc", "cxx", "hpp", "h++"],
     c: ["c", "h"],
@@ -56,28 +57,23 @@ function detectRepoLanguage(filesMetadata: any[]): RepoLanguage {
     coffee: ["coffee"],
   };
 
-  // 2. Count extensions, ignoring common noise (node_modules, .git, etc)
   let validFileCount = 0;
   for (const f of filesMetadata) {
-    const path = (f.path as string).toLowerCase();
-
-    // Skip dependencies and hidden files to find "real" source code
+    const p = (f.path as string).toLowerCase();
     if (
-      path.includes("node_modules/") ||
-      path.includes("vendor/") ||
-      path.startsWith(".")
+      p.includes("node_modules/") ||
+      p.includes("vendor/") ||
+      p.startsWith(".")
     ) {
       continue;
     }
-
-    const ext = path.split(".").pop() ?? "";
+    const ext = p.split(".").pop() ?? "";
     extCounts[ext] = (extCounts[ext] ?? 0) + 1;
     validFileCount++;
   }
 
   if (validFileCount === 0) return "mixed";
 
-  // 3. Calculate the total weight for each group
   let topLanguage: RepoLanguage = "mixed";
   let maxPercentage = 0;
 
@@ -87,15 +83,12 @@ function detectRepoLanguage(filesMetadata: any[]): RepoLanguage {
       0,
     );
     const percentage = (groupCount / validFileCount) * 100;
-
-    // 4. Update the "Winner" if this group is more significant
     if (percentage > maxPercentage) {
       maxPercentage = percentage;
       topLanguage = langName as RepoLanguage;
     }
   }
 
-  // 5. Threshold check: if the top language is less than 10% of the repo, call it "mixed"
   return maxPercentage > 10 ? topLanguage : "mixed";
 }
 
@@ -134,7 +127,6 @@ const TIER2_SYSTEMS = new Set([
   "coffee",
 ]);
 const KERNEL_CONFIG_EXTENSIONS = new Set(["Kconfig", "Makefile", "makefile"]);
-
 const TIER4_EXTENSIONS = new Set(["css", "scss", "sass", "less"]);
 
 const ROOT_CONFIG_NAMES = new Set([
@@ -421,10 +413,8 @@ function extractQueryTokens(query: string): string[] {
 
   for (const q of query.match(/['"`]([a-zA-Z_$][a-zA-Z0-9_$]{2,})['"`]/g) ?? [])
     tokens.add(q.replace(/['"`]/g, ""));
-
   for (const p of query.match(/\b[\w-]+\/[\w-]+(\.[a-z]{1,5})?\b/g) ?? [])
     tokens.add(p);
-
   for (const chain of query.match(/\b[a-zA-Z_$][a-zA-Z0-9_$.]{3,}\b/g) ?? []) {
     if (chain.includes(".")) {
       tokens.add(chain);
@@ -432,12 +422,10 @@ function extractQueryTokens(query: string): string[] {
         if (part.length > 2) tokens.add(part);
     }
   }
-
   for (const c of query.match(/\b[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*\b/g) ?? [])
     tokens.add(c);
   for (const s of query.match(/\b[a-z][a-z0-9]*(_[a-z0-9]+){1,}\b/g) ?? [])
     tokens.add(s);
-
   for (const w of query
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, " ")
@@ -446,8 +434,6 @@ function extractQueryTokens(query: string): string[] {
 
   return [...tokens];
 }
-
-// ─── Symbol Extraction (BIG UPGRADE) ──────────────────────────────────────────
 
 function extractSymbols(content: string): SymbolExtraction {
   const defined = new Set<string>();
@@ -462,7 +448,6 @@ function extractSymbols(content: string): SymbolExtraction {
   while ((match = classRegex.exec(content))) defined.add(match[1]);
   while ((match = exportRegex.exec(content))) defined.add(match[1]);
 
-  // naive usage detection — improved slightly to avoid keywords
   const words = content.match(/\b[A-Za-z_][A-Za-z0-9_]*\b/g) || [];
   const JS_KEYWORDS = new Set([
     "if",
@@ -521,15 +506,10 @@ function extractSymbols(content: string): SymbolExtraction {
   ]);
 
   for (const w of words) {
-    if (!JS_KEYWORDS.has(w)) {
-      used.add(w);
-    }
+    if (!JS_KEYWORDS.has(w)) used.add(w);
   }
 
-  return {
-    defined: Array.from(defined),
-    used: Array.from(used),
-  };
+  return { defined: Array.from(defined), used: Array.from(used) };
 }
 
 function extractCSymbols(content: string): string[] {
@@ -543,26 +523,19 @@ function extractCSymbols(content: string): string[] {
       name &&
       name.length > 2 &&
       !["if", "for", "while", "switch", "return", "sizeof"].includes(name)
-    ) {
+    )
       syms.add(name);
-    }
   }
-
   for (const m of content.matchAll(
     /\b(struct|union|enum|typedef)\s+([a-zA-Z_]\w*)\b/g,
-  )) {
+  ))
     if (m[2]) syms.add(m[2]);
-  }
-
-  for (const m of content.matchAll(/^#\s*define\s+([a-zA-Z_]\w*)/gm)) {
+  for (const m of content.matchAll(/^#\s*define\s+([a-zA-Z_]\w*)/gm))
     if (m[1]) syms.add(m[1]);
-  }
-
   for (const m of content.matchAll(
     /EXPORT_SYMBOL(?:_GPL)?\s*\(\s*([a-zA-Z_]\w*)\s*\)/g,
-  )) {
+  ))
     if (m[1]) syms.add(m[1]);
-  }
 
   return [...syms];
 }
@@ -575,8 +548,6 @@ let _repoorbit_symbol_index: Record<
 function clearSymbolIndex(): void {
   _repoorbit_symbol_index = Object.create(null);
 }
-
-// ─── Import Resolution ────────────────────────────────────────────────────────
 
 const STDLIB_MODULES = new Set([
   "fs",
@@ -615,8 +586,6 @@ const STDLIB_MODULES = new Set([
   "timers",
   "trace_events",
   "wasi",
-  "os",
-  "sys",
   "io",
   "re",
   "json",
@@ -672,7 +641,6 @@ const STDLIB_MODULES = new Set([
   "decimal",
   "numbers",
   "operator",
-  "functools",
   "fmt",
   "errors",
   "strings",
@@ -681,7 +649,6 @@ const STDLIB_MODULES = new Set([
   "sync",
   "atomic",
   "bytes",
-  "io",
   "bufio",
   "log",
   "flag",
@@ -691,10 +658,7 @@ const STDLIB_MODULES = new Set([
   "context",
   "unicode",
   "regexp",
-  "math",
   "rand",
-  "time",
-  "filepath",
   "filepath",
   "exec",
   "signal",
@@ -702,9 +666,6 @@ const STDLIB_MODULES = new Set([
   "std",
   "core",
   "alloc",
-  "collections",
-  "fmt",
-  "io",
 ]);
 
 const ALIAS_PATTERNS: Array<{ pattern: RegExp; prefix: string }> = [
@@ -745,9 +706,8 @@ function resolveAlias(
   aliases: Record<string, string>,
 ): string {
   for (const [alias, target] of Object.entries(aliases)) {
-    if (importPath.startsWith(alias + "/")) {
+    if (importPath.startsWith(alias + "/"))
       return target + importPath.slice(alias.length);
-    }
     if (importPath === alias) return target;
   }
   for (const { pattern, prefix } of ALIAS_PATTERNS) {
@@ -810,38 +770,26 @@ function tryResolveExtension(
       ...GO_EXTENSIONS,
       ...JAVA_EXTENSIONS,
       ...RUST_EXTENSIONS,
-    ]) {
+    ])
       candidates.push(`${basePath}.${ext}`);
-    }
   }
-  for (const c of candidates) {
-    if (repoFileSet.has(c)) return c;
-  }
+  for (const c of candidates) if (repoFileSet.has(c)) return c;
   return null;
 }
 
-function resolveImportPath(
-  importPath: string,
-  fromFile: string,
-  repoFileSet: Set<string>,
-  lang: RepoLanguage,
-  aliases: Record<string, string> = {},
-): string | null {
-  if (!importPath || !fromFile) return null;
-  if (isExternalImport(importPath)) return null;
-  let resolved = importPath;
-  resolved = resolveAlias(resolved, aliases);
-  if (resolved.startsWith(".")) {
-    resolved = resolveRelativePath(fromFile, resolved);
-  }
-  resolved = resolved.replace(/^\/+/, "");
-  return tryResolveExtension(resolved, repoFileSet, lang);
+function extractGoModuleName(filesMetadata: any[]): string | null {
+  const goMod = filesMetadata.find((f) => f.path === "go.mod");
+  if (!goMod) return null;
+  const content = safeContent(goMod);
+  const m = content.match(/^module\s+(\S+)/m);
+  return m ? m[1] : null;
 }
 
 function parseRawImports(
   content: string,
   filePath: string,
   lang: RepoLanguage,
+  goModulePrefix?: string | null,
 ): string[] {
   const raw: string[] = [];
   const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
@@ -868,16 +816,24 @@ function parseRawImports(
       }
     }
   } else if (ext === "go") {
-    for (const m of content.matchAll(/["']([^"']+)["']/g))
-      if (m[1]) raw.push(m[1]);
+    const importBlockRe = /import\s*\(([\s\S]*?)\)/g;
+    const singleImportRe = /^import\s+(?:[\w]+\s+)?["']([^"']+)["']/gm;
+
+    for (const m of content.matchAll(importBlockRe)) {
+      const block = m[1];
+      for (const lineMatch of block.matchAll(/["']([^"']+)["']/g)) {
+        raw.push(lineMatch[1]);
+      }
+    }
+    for (const m of content.matchAll(singleImportRe)) {
+      raw.push(m[1]);
+    }
   } else if (ext === "rs") {
-    for (const m of content.matchAll(/^(?:use|mod)\s+([\w:]+)/gm)) {
+    for (const m of content.matchAll(/^(?:use|mod)\s+([\w:]+)/gm))
       if (m[1]) raw.push(m[1].replace(/::/g, "/"));
-    }
   } else if (["java", "kt"].includes(ext)) {
-    for (const m of content.matchAll(/^import\s+([\w.]+)/gm)) {
+    for (const m of content.matchAll(/^import\s+([\w.]+)/gm))
       if (m[1]) raw.push(m[1].replace(/\./g, "/"));
-    }
   } else if (["c", "h", "cpp", "cc", "cxx", "hpp"].includes(ext)) {
     for (const m of content.matchAll(/^#\s*include\s+"([^"]+)"/gm))
       if (m[1]) raw.push(m[1]);
@@ -886,7 +842,77 @@ function parseRawImports(
   return raw;
 }
 
-// ─── Bidirectional Graph Construction ────────────────────────────────────────
+function resolveGoImportPath(
+  importPath: string,
+  modulePrefix: string,
+  fileSet: Set<string>,
+): string | null {
+  if (!importPath.startsWith(modulePrefix + "/")) return null;
+
+  const pkgPath = importPath.slice(modulePrefix.length + 1);
+
+  const lastSegment = pkgPath.split("/").pop()!;
+  const namedCandidate = `${pkgPath}/${lastSegment}.go`;
+  if (fileSet.has(namedCandidate)) return namedCandidate;
+
+  const commonNames = [
+    "service.go",
+    "config.go",
+    "main.go",
+    "handler.go",
+    "agent.go",
+    "proxy.go",
+    "mock.go",
+    "replay.go",
+    "hooks.go",
+    "router.go",
+    "server.go",
+    "client.go",
+    "app.go",
+  ];
+  for (const name of commonNames) {
+    const candidate = `${pkgPath}/${name}`;
+    if (fileSet.has(candidate)) return candidate;
+  }
+
+  for (const f of fileSet) {
+    if (
+      f.startsWith(pkgPath + "/") &&
+      f.endsWith(".go") &&
+      !f.endsWith("_test.go") &&
+      !f.includes("/testdata/")
+    ) {
+      return f;
+    }
+  }
+
+  return null;
+}
+
+function resolveImportPath(
+  importPath: string,
+  fromFile: string,
+  repoFileSet: Set<string>,
+  lang: RepoLanguage,
+  aliases: Record<string, string> = {},
+  goModulePrefix?: string | null,
+): string | null {
+  if (!importPath || !fromFile) return null;
+
+  const ext = fromFile.split(".").pop()?.toLowerCase() ?? "";
+
+  if (ext === "go" && goModulePrefix) {
+    return resolveGoImportPath(importPath, goModulePrefix, repoFileSet);
+  }
+
+  if (isExternalImport(importPath)) return null;
+  let resolved = importPath;
+  resolved = resolveAlias(resolved, aliases);
+  if (resolved.startsWith("."))
+    resolved = resolveRelativePath(fromFile, resolved);
+  resolved = resolved.replace(/^\/+/, "");
+  return tryResolveExtension(resolved, repoFileSet, lang);
+}
 
 function buildBidirectionalGraph(
   filesMetadata: any[],
@@ -904,35 +930,24 @@ function buildBidirectionalGraph(
     const filePath = file.path as string;
     if (!graph.imports[filePath]) graph.imports[filePath] = [];
     if (!graph.imported_by[filePath]) graph.imported_by[filePath] = [];
-
     if (isDocFile(filePath)) continue;
-
     const content = safeContent(file);
     const { defined, used } = extractSymbols(content);
-
-    // Build symbol index
     for (const sym of defined) {
       _repoorbit_symbol_index[sym] = {
         defined_in: filePath,
         used_by_files: "",
       };
     }
-
-    // Capture usages for index building (we'll link them in a second pass or check as we go)
-    // Actually, following the user's logic:
     (file as any).symbolsUsed = used;
   }
 
-  // Second pass: link usages to defined symbols
   for (const file of filesMetadata) {
     const filePath = file.path as string;
     const used = (file as any).symbolsUsed || [];
     for (const sym of used) {
       const entry = _repoorbit_symbol_index[sym];
       if (entry && entry.defined_in !== filePath) {
-        if (!entry.used_by_files) {
-          entry.used_by_files = "";
-        }
         const currentUsages = entry.used_by_files
           .split(",")
           .map((s) => s.trim())
@@ -945,23 +960,29 @@ function buildBidirectionalGraph(
     }
   }
 
+  const goModulePrefix = extractGoModuleName(filesMetadata);
+  if (goModulePrefix) {
+    console.log(`[GRAPH] Go module detected: ${goModulePrefix}`);
+  }
+
   const importCache = new Map<string, string[]>();
 
   for (const file of filesMetadata) {
     const filePath = file.path as string;
     if (importCache.has(filePath)) continue;
-
     const metadataImports = (file as any).imports as string[] | undefined;
     const resolvedImports: string[] = [];
 
     if (metadataImports && metadataImports.length > 0) {
-      // Use pre-parsed and pre-resolved imports from metadata
       resolvedImports.push(...metadataImports);
     } else {
-      // Fallback to internal parsing
       const content = safeContent(file);
-      const rawImports = parseRawImports(content, filePath, lang);
-
+      const rawImports = parseRawImports(
+        content,
+        filePath,
+        lang,
+        goModulePrefix,
+      );
       for (const raw of rawImports) {
         const resolved = resolveImportPath(
           raw,
@@ -969,31 +990,34 @@ function buildBidirectionalGraph(
           repoFileSet,
           lang,
           aliases,
+          goModulePrefix,
         );
-        if (resolved && resolved !== filePath) {
-          resolvedImports.push(resolved);
-        }
+        if (resolved && resolved !== filePath) resolvedImports.push(resolved);
       }
     }
 
     const deduped = [...new Set(resolvedImports)];
     importCache.set(filePath, deduped);
-
     if (!graph.imports[filePath]) graph.imports[filePath] = [];
     graph.imports[filePath].push(...deduped);
 
     for (const dep of deduped) {
       if (!graph.imported_by[dep]) graph.imported_by[dep] = [];
-      if (!graph.imported_by[dep].includes(filePath)) {
+      if (!graph.imported_by[dep].includes(filePath))
         graph.imported_by[dep].push(filePath);
-      }
     }
   }
 
+  const edgeCount = Object.values(graph.imports).reduce(
+    (s, v) => s + v.length,
+    0,
+  );
+  console.log(
+    `[GRAPH] Built import graph: ${Object.keys(graph.imports).length} nodes, ${edgeCount} edges`,
+  );
+
   return graph;
 }
-
-// ─── K-Hop Dependency Expansion ──────────────────────────────────────────────
 
 const kHopExpansionCache = new Map<string, Set<string>>();
 
@@ -1003,18 +1027,12 @@ function expandDependencies(
   depth: number = 2,
 ): Set<string> {
   const visited = new Set<string>();
-
   function dfs(file: string, currentDepth: number) {
     if (visited.has(file) || currentDepth > depth) return;
-
     visited.add(file);
-
     const deps = graph.imports[file] || [];
-    for (const dep of deps) {
-      dfs(dep, currentDepth + 1);
-    }
+    for (const dep of deps) dfs(dep, currentDepth + 1);
   }
-
   dfs(start, 0);
   return visited;
 }
@@ -1026,9 +1044,7 @@ function expandDependenciesMulti(
 ): Set<string> {
   const result = new Set<string>();
   for (const fp of filePaths) {
-    for (const dep of expandDependencies(fp, graph, depth)) {
-      result.add(dep);
-    }
+    for (const dep of expandDependencies(fp, graph, depth)) result.add(dep);
     result.add(fp);
   }
   return result;
@@ -1038,15 +1054,12 @@ function clearKHopCache(): void {
   kHopExpansionCache.clear();
 }
 
-// ─── C call-graph extraction ──────────────────────────────────────────────────
-
 function buildCIncludeGraph(filesMetadata: any[]): Record<string, string[]> {
   const pathIndex = new Map<string, string>();
   for (const f of filesMetadata) {
     const base = (f.path as string).split("/").pop() ?? "";
     pathIndex.set(base, f.path);
   }
-
   const graph: Record<string, string[]> = {};
   for (const f of filesMetadata) {
     const content = safeContent(f);
@@ -1062,8 +1075,6 @@ function buildCIncludeGraph(filesMetadata: any[]): Record<string, string[]> {
   return graph;
 }
 
-// ─── Merge flat import graph with bidirectional graph ─────────────────────────
-
 function mergeImportGraphs(
   flatGraph: Record<string, string[]>,
   biGraph: BidirectionalGraph,
@@ -1072,7 +1083,6 @@ function mergeImportGraphs(
     imports: { ...biGraph.imports },
     imported_by: { ...biGraph.imported_by },
   };
-
   for (const [from, deps] of Object.entries(flatGraph)) {
     if (!result.imports[from]) result.imports[from] = [];
     for (const dep of deps) {
@@ -1082,11 +1092,8 @@ function mergeImportGraphs(
         result.imported_by[dep].push(from);
     }
   }
-
   return result;
 }
-
-// ─── Scoring ──────────────────────────────────────────────────────────────────
 
 function scoreFile(
   file: any,
@@ -1129,12 +1136,9 @@ function scoreFile(
 
     if (pathBase === t) score += 30;
     else if (filePath.includes(t)) score += 5;
-
     if (exports.some((e) => e.toLowerCase() === t)) score += 20;
     else if (exports.some((e) => e.toLowerCase().includes(t))) score += 8;
-
     if (imports.some((i) => i.toLowerCase().includes(t))) score += 3;
-
     if (cSymbols.includes(t)) score += 20;
     else if (cSymbols.some((s) => s.includes(t))) score += 8;
 
@@ -1142,7 +1146,6 @@ function scoreFile(
       fullContent.match(new RegExp(`\\b${escapeRegex(t)}\\b`, "g")) ?? []
     ).length;
     score += Math.min(occurrences * 2, 30);
-
     if (token.includes("/") && filePath.includes(t)) score += 50;
   }
 
@@ -1151,7 +1154,6 @@ function scoreFile(
       deps.some((d) => d.includes(file.path) || file.path.includes(d)),
     ).length;
     score += jsImporterCount * 4;
-
     const cIncluderCount = Object.values(cIncludeGraph).filter((deps) =>
       deps.includes(file.path),
     ).length;
@@ -1171,8 +1173,6 @@ function scoreFile(
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
-
-// ─── File selection ───────────────────────────────────────────────────────────
 
 function selectFilesForQuery(
   sourceFiles: any[],
@@ -1198,7 +1198,6 @@ function selectFilesForQuery(
       query,
     );
   const isTestQuery = intents.includes("test");
-
   const threshold =
     focus === "targeted"
       ? MIN_RELEVANCE_SCORE_TARGETED
@@ -1245,12 +1244,10 @@ function selectFilesForQuery(
   if (targetSymbols.size > 0) {
     for (const candidate of scored) {
       if (candidate.score >= MIN_RELEVANCE_SCORE_TARGETED) continue;
-
       const content = safeContent(candidate.file);
       const foundSymbols = [...targetSymbols].filter((sym) =>
         new RegExp(`\\b${escapeRegex(sym)}\\b`).test(content),
       );
-
       if (foundSymbols.length > 0) {
         const isStatefulCall = statefulPatterns.some((pattern) =>
           pattern.test(content),
@@ -1271,7 +1268,6 @@ function selectFilesForQuery(
         (d: string) => d.includes(targetPath) || targetPath.includes(d),
       );
     });
-
     for (const consumer of consumers) {
       if (consumer.score >= threshold) continue;
       const content = safeContent(consumer.file);
@@ -1289,8 +1285,6 @@ function selectFilesForQuery(
 
   const relevantCore = scored.filter((s) => s.score >= threshold);
   const coreFilePaths = relevantCore.map((s) => s.file.path as string);
-
-  // K-Hop expansion: expand each core file's dependencies up to kHopDepth
   const expandedPaths = expandDependenciesMulti(
     coreFilePaths,
     biGraph,
@@ -1300,7 +1294,6 @@ function selectFilesForQuery(
   const filePathToFile = new Map<string, any>();
   for (const { file } of scored) filePathToFile.set(file.path as string, file);
 
-  // Build final selected set: core files + all k-hop expanded dependencies
   const selectedPaths = new Set<string>(coreFilePaths);
   for (const p of expandedPaths) {
     if (filePathToFile.has(p)) selectedPaths.add(p);
@@ -1309,7 +1302,6 @@ function selectFilesForQuery(
   const selected = [...selectedPaths]
     .map((p) => filePathToFile.get(p))
     .filter(Boolean);
-
   const selectedSet = new Set(selected);
   const omitted = scored
     .filter((s) => !selectedSet.has(s.file))
@@ -1322,8 +1314,6 @@ function selectFilesForQuery(
   };
 }
 
-// ─── Import depth resolution ──────────────────────────────────────────────────
-
 function resolveImportDepths(
   seedPaths: string[],
   importGraph: Record<string, string[]>,
@@ -1331,7 +1321,6 @@ function resolveImportDepths(
   const depths = new Map<string, number>();
   for (const seed of seedPaths) depths.set(seed, 0);
   let frontier = [...seedPaths];
-
   let depth = 1;
   while (frontier.length > 0) {
     const next: string[] = [];
@@ -1355,8 +1344,6 @@ function importRoleLabel(depth: number | undefined): ImportRole {
   return `Depth ${depth}`;
 }
 
-// ─── File tier ────────────────────────────────────────────────────────────────
-
 function fileTier(filePath: string, lang: RepoLanguage = "typescript"): number {
   if (EXCLUDE_PATTERNS.some((re) => re.test(filePath))) return 0;
 
@@ -1372,7 +1359,6 @@ function fileTier(filePath: string, lang: RepoLanguage = "typescript"): number {
     KERNEL_CONFIG_EXTENSIONS.has(fileName)
   )
     return 1;
-
   if (extLower === "ld" || extLower === "lds") return 2;
   if (ext === "S") return 2;
 
@@ -1392,14 +1378,9 @@ function fileTier(filePath: string, lang: RepoLanguage = "typescript"): number {
     return 2;
 
   if (
-    extLower === "md" ||
-    extLower === "mdx" ||
-    extLower === "rst" ||
-    extLower === "html" ||
-    extLower === "yaml" ||
-    extLower === "yml" ||
-    extLower === "toml" ||
-    extLower === "json"
+    ["md", "mdx", "rst", "html", "yaml", "yml", "toml", "json"].includes(
+      extLower,
+    )
   )
     return 3;
 
@@ -1414,8 +1395,6 @@ function shouldInclude(
 ): boolean {
   return fileTier(filePath, lang) > 0;
 }
-
-// ─── Budget-aware file selection ──────────────────────────────────────────────
 
 function selectFilesByBudget(
   candidates: any[],
@@ -1448,8 +1427,6 @@ function selectFilesByBudget(
   return { files: selected, droppedTiers };
 }
 
-// ─── Doc detection ────────────────────────────────────────────────────────────
-
 function isDocFile(filePath: string): boolean {
   const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
   if (ext !== "md" && ext !== "mdx" && ext !== "rst") return false;
@@ -1458,8 +1435,6 @@ function isDocFile(filePath: string): boolean {
   );
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
 function safeFileExt(file: any): string {
   const raw: unknown = file.ext;
   if (typeof raw !== "string" || raw.includes("."))
@@ -1467,14 +1442,20 @@ function safeFileExt(file: any): string {
   return raw.toLowerCase();
 }
 
+// FIX: Improved safeContent that also checks file.rawContent and file.source
+// to handle different file object shapes from various callers.
 function safeContent(file: any): string {
   if (!file) return "";
-  const c = file.content || file.analysis?.fullContent;
+  const c =
+    file.content ??
+    file.rawContent ??
+    file.source ??
+    file.analysis?.fullContent ??
+    file.text ??
+    null;
   if (!c) return "";
   return String(c);
 }
-
-// ─── Directory structure ──────────────────────────────────────────────────────
 
 function getDirectoryStructure(
   filesMetadata: any[],
@@ -1542,8 +1523,6 @@ function getDirectoryStructure(
   return lines.join("\n");
 }
 
-// ─── Repo metadata sections ───────────────────────────────────────────────────
-
 function docSortKey(filePath: string): string {
   const lower = filePath.toLowerCase();
   if (lower === "readme.md" || lower === "readme.mdx" || lower === "readme.rst")
@@ -1561,7 +1540,6 @@ function getReadme(docFiles: any[], maxFiles = 5): string {
   );
   const limited = sorted.slice(0, maxFiles);
   const omitted = sorted.length - limited.length;
-
   const parts: string[] = [
     `## Project Documentation\n\nIncluding ${limited.length} documentation file${limited.length !== 1 ? "s" : ""}.${omitted > 0 ? ` Omitted ${omitted} secondary doc files.` : ""}`,
   ];
@@ -1709,8 +1687,6 @@ function getPulls(repoContext: any): string {
   return lines.join("\n");
 }
 
-// ─── C include graph summary ──────────────────────────────────────────────────
-
 function getCIncludeGraphSummary(
   cIncludeGraph: Record<string, string[]>,
   selectedFilePaths: Set<string>,
@@ -1727,7 +1703,6 @@ function getCIncludeGraphSummary(
         : null;
     })
     .filter(Boolean);
-
   if (!entries.length) return "";
   return `## C Include Graph (selected files)\n\nLocal #include relationships among included files:\n\n${entries.join("\n")}`;
 }
@@ -1736,13 +1711,10 @@ function parseFunctionBlocks(content: string): FunctionBlock[] {
   const lines = content.split("\n");
   const blocks: FunctionBlock[] = [];
 
-  // ES6 patterns (existing)
   const es6StartRe =
     /^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s*\*?\s*(\w+)|class\s+(\w+)|const\s+(\w+)\s*=|let\s+(\w+)\s*=|var\s+(\w+)\s*=)/;
-
   const commonjsStartRe =
     /^(?:[\w$]+(?:\.(?:prototype|exports))?\.\w+|[\w$]+\[[\w'"]+\]|module\.exports)\s*=\s*(?:async\s+)?function/;
-
   const decoratorRe = /^@\w+/;
 
   const isBlockStart = (line: string) => {
@@ -1752,38 +1724,28 @@ function parseFunctionBlocks(content: string): FunctionBlock[] {
 
   const extractName = (line: string): string => {
     const trimmed = line.trim();
-
-    // CommonJS: proto.handle = function handle / proto.handle = function(
     const cjsNamed = trimmed.match(
       /^([\w$]+(?:\.(?:prototype|exports))?\.\w+|[\w$]+\[[\w'"]+\]|module\.exports)\s*=\s*(?:async\s+)?function\s*(\w+)?/,
     );
     if (cjsNamed) {
-      // Prefer the explicit function name (m[2]), fall back to the LHS property name
       if (cjsNamed[2]) return cjsNamed[2];
       const lhs = cjsNamed[1];
-      // e.g. "proto.handle" -> "handle", "Router.prototype.process_params" -> "process_params"
       return lhs.split(".").pop() ?? lhs;
     }
-
-    // ES6 patterns
     const es6 = es6StartRe.exec(trimmed);
     if (es6)
       return es6[1] ?? es6[2] ?? es6[3] ?? es6[4] ?? es6[5] ?? "anonymous";
-
     return "anonymous";
   };
 
   let i = 0;
   while (i < lines.length) {
-    // Skip decorators
     let decoratorStart: number | null = null;
     while (i < lines.length && decoratorRe.test(lines[i].trim())) {
       if (decoratorStart === null) decoratorStart = i;
       i++;
     }
-
     if (i >= lines.length) break;
-
     if (!isBlockStart(lines[i])) {
       i++;
       continue;
@@ -1876,8 +1838,6 @@ function parseFunctionBlocks(content: string): FunctionBlock[] {
   return blocks;
 }
 
-// ─── C function block parsing ─────────────────────────────────────────────────
-
 function parseCFunctionBlocks(content: string): FunctionBlock[] {
   const lines = content.split("\n");
   const blocks: FunctionBlock[] = [];
@@ -1886,7 +1846,6 @@ function parseCFunctionBlocks(content: string): FunctionBlock[] {
   let i = 0;
   while (i < lines.length) {
     const line = lines[i].trim();
-
     if (
       !line ||
       line.startsWith("#") ||
@@ -1897,13 +1856,11 @@ function parseCFunctionBlocks(content: string): FunctionBlock[] {
       i++;
       continue;
     }
-
     const m = defRe.exec(lines[i]);
     if (!m || lines[i].startsWith(" ") || lines[i].startsWith("\t")) {
       i++;
       continue;
     }
-
     const name = m[1];
     if (
       !name ||
@@ -1945,22 +1902,17 @@ function parseCFunctionBlocks(content: string): FunctionBlock[] {
     if (found && j > i) {
       const text = lines.slice(i, j + 1).join("\n");
       const lineCount = j - i + 1;
-      if (lineCount >= 3 && lineCount <= 500) {
+      if (lineCount >= 3 && lineCount <= 500)
         blocks.push({ name, startLine: i, endLine: j, text });
-      }
     }
-
     i = found ? j + 1 : i + 1;
   }
   return blocks;
 }
 
-// ─── Universal Bracket Parser ───────────────────────────────────────────────────
-
 function parseUniversalBlocks(content: string, ext: string): FunctionBlock[] {
   const lines = content.split("\n");
   const blocks: FunctionBlock[] = [];
-
   const isPython = ext === "py" || ext === "yml" || ext === "yaml";
   let inBlock = false;
   let blockStart = -1;
@@ -1993,9 +1945,7 @@ function parseUniversalBlocks(content: string, ext: string): FunctionBlock[] {
             continue;
           }
           const l2Indent = l2.match(/^[ \t]*/)?.[0].length ?? 0;
-          if (l2Indent <= indent && !l2.trim().startsWith("#")) {
-            break;
-          }
+          if (l2Indent <= indent && !l2.trim().startsWith("#")) break;
           j++;
         }
         blocks.push({
@@ -2012,7 +1962,6 @@ function parseUniversalBlocks(content: string, ext: string): FunctionBlock[] {
         if (ch === "{") braceDepth++;
         else if (ch === "}") braceDepth--;
       }
-
       if (!inBlock && braceDepth > 0) {
         inBlock = true;
         blockStart = i;
@@ -2067,9 +2016,7 @@ function prioritizeBlocks(
 
     if (snapSymbols.length > 0) {
       for (const sym of snapSymbols) {
-        if (new RegExp(`\\b${escapeRegex(sym)}\\b`).test(b.text)) {
-          score += 50;
-        }
+        if (new RegExp(`\\b${escapeRegex(sym)}\\b`).test(b.text)) score += 50;
       }
     }
 
@@ -2083,25 +2030,20 @@ function prioritizeBlocks(
       (hasControlFlowIterator ||
         hasPythonComprehension ||
         hasFunctionalIterator)
-    ) {
+    )
       score += 40;
-    }
 
     const hasCPointerAccumulator =
       /\*\w+\+\+\s*=/.test(b.text) || /\w+\[\w+\]\s*=/.test(b.text);
     const hasScriptAccumulator =
       /\+=/.test(b.text) ||
       /\.(push|append|add|insert|extend|update)\(/.test(b.text);
-
-    if (hasCPointerAccumulator || hasScriptAccumulator) {
-      score += 25;
-    }
+    if (hasCPointerAccumulator || hasScriptAccumulator) score += 25;
 
     const hasIdCheck =
       /\.id\s*==/.test(b.text) || /\b(PK|UUID|guid)\b/i.test(b.text);
-    if (hasIdCheck && (hasScriptAccumulator || hasFunctionalIterator)) {
+    if (hasIdCheck && (hasScriptAccumulator || hasFunctionalIterator))
       score += 15;
-    }
 
     return score;
   };
@@ -2111,7 +2053,6 @@ function prioritizeBlocks(
     score: scoreBlock(b),
     idx,
   }));
-
   const oneThird = Math.floor(scored.length / 3);
   const firstThird = scored
     .slice(0, oneThird)
@@ -2126,13 +2067,10 @@ function prioritizeBlocks(
     .sort((a, b) => b.score - a.score)
     .slice(0, 3);
 
-  const selected = [...firstThird, ...middleThird, ...lastThird]
+  return [...firstThird, ...middleThird, ...lastThird]
     .sort((a, b) => a.idx - b.idx)
     .map((s) => s.block);
-  return selected;
 }
-
-// ─── File context generation ──────────────────────────────────────────────────
 
 function getFileContext(
   file: any,
@@ -2152,7 +2090,6 @@ function getFileContext(
   const lineCount = file.metrics?.lineCount ?? "?";
   const codeLines = file.metrics?.codeLines ?? "?";
   const logicType = file.analysis?.logicType ?? "unknown";
-
   const consumers = graph?.[file.path]?.imported_by ?? [];
 
   const flags = [
@@ -2209,12 +2146,10 @@ function getFileContext(
     ? topImports.join(", ") +
       (imports.length > 12 ? ` and ${imports.length - 12} more` : "")
     : "(none)";
-
   const consumersInfoStr = consumers.length
     ? consumers.slice(0, 10).join(", ") +
       (consumers.length > 10 ? ` and ${consumers.length - 10} more` : "")
     : "(none detected)";
-
   const todosStr = todos.length ? ` TODOs: ${todos.join(" | ")}.` : "";
   const flagsStr = flags ? ` (${flags})` : "";
 
@@ -2224,6 +2159,13 @@ function getFileContext(
     `${exportsStr}${importsStr ? " " + importsStr : ""}${todosStr}`;
 
   let content = safeContent(file);
+
+  // FIX: If content is empty, produce a clear placeholder rather than a blank file.
+  // This prevents empty notebook files and makes missing content visible.
+  if (!content.trim()) {
+    content = `[NO SOURCE CONTENT AVAILABLE — the file object for "${file.path}" did not carry a content field.\nCheck that filesMetadata items include a "content", "rawContent", "source", or "text" property.]`;
+  }
+
   const isNonCodeFile = [
     "css",
     "scss",
@@ -2238,13 +2180,10 @@ function getFileContext(
     "rst",
     "xml",
   ].includes(ext);
-
   const heading = `### ${file.path} (${role})`;
-
   const manifestSummaryLine = notebookName
     ? `> This file is part of **${notebookName}**. The local manifest (\`00_manifest.txt\`) lists all files in this notebook.`
     : "";
-
   const crossDepsInfoStr =
     crossDeps.length > 0 ? crossDeps.join("; ") : "(none in this file)";
 
@@ -2277,15 +2216,12 @@ function getFileContext(
   let blocks = isCFile
     ? parseCFunctionBlocks(content)
     : parseFunctionBlocks(content);
-
-  if (blocks.length === 0 && !isNonCodeFile) {
+  if (blocks.length === 0 && !isNonCodeFile)
     blocks = parseUniversalBlocks(content, ext);
-  }
 
   const snapSymbols: string[] = file.snapSymbols ?? [];
-  if (snapSymbols.length > 0) {
+  if (snapSymbols.length > 0)
     blocks = prioritizeBlocks(blocks, lang, snapSymbols);
-  }
 
   const originalFirstBlockLine = blocks.length > 0 ? blocks[0].startLine : 0;
 
@@ -2303,9 +2239,8 @@ function getFileContext(
     }
   }
 
-  if (!blocks.length) {
+  if (!blocks.length)
     return [...headerParts, "", `\`\`\`${ext}`, content, "```"].join("\n");
-  }
 
   const fileLines = content.split("\n");
   const headerText = fileLines
@@ -2341,13 +2276,9 @@ function getFileContext(
   return parts.join("\n");
 }
 
-// ─── Word counting ────────────────────────────────────────────────────────────
-
 function countWords(text: string): number {
   return text.split(/\s+/).filter(Boolean).length;
 }
-
-// ─── Split source blocks into batches of up to maxFilesPerBatch ──────────────
 
 function splitSourceBlocksIntoBatches(
   sourceBlocks: Block[],
@@ -2362,13 +2293,20 @@ function splitSourceBlocksIntoBatches(
     }
     currentBatch.push(block);
   }
-  if (currentBatch.length > 0) {
-    batches.push(currentBatch);
-  }
+  if (currentBatch.length > 0) batches.push(currentBatch);
   return batches;
 }
 
-// ─── Write a single notebook folder ──────────────────────────────────────────
+// FIX: ensureDir — create the directory (and all parents) if it doesn't exist.
+// This must be called for outputDir BEFORE any notebook subfolder creation,
+// because mkdirSync with recursive:true on a child path DOES work but is fragile
+// when the parent path itself doesn't yet exist on some OSes / Node versions.
+function ensureDir(dirPath: string): void {
+  if (!fs.existsSync(dirPath)) {
+    mkdirSync(dirPath, { recursive: true });
+  }
+}
+
 async function writeNotebookFolder(
   batch: Block[],
   folderIndex: number,
@@ -2378,33 +2316,55 @@ async function writeNotebookFolder(
   fileCount: number;
   groups: string[];
   filePaths: string[];
+  localFilePaths: string[];
   localManifestPath: string;
 }> {
   const folderName = `notebook_${String(folderIndex + 1).padStart(2, "0")}`;
   const folderPath = join(outputDir, folderName);
-  mkdirSync(folderPath, { recursive: true });
+
+  // FIX: ensure parent outputDir exists first, then the subfolder
+  ensureDir(outputDir);
+  ensureDir(folderPath);
 
   const groupsSet = new Set<string>();
   const originalFilePaths: string[] = [];
+  const localFilePaths: string[] = [];
+
+  // Add system instruction file (prompt file)
+  const instrFileName = "notebook_instructions.txt";
+  const instrPath = join(folderPath, instrFileName);
+  await writeFile(instrPath, getNotebookSystemInstruction(), "utf-8");
+  originalFilePaths.push(instrFileName);
+  localFilePaths.push(instrPath);
 
   for (let i = 0; i < batch.length; i++) {
     const block = batch[i];
     groupsSet.add(block.group);
-    let filePath = block.filePath;
+
+    // FIX: filePath resolution — use block.filePath directly; fall back to
+    // parsing the "### path (role)" header line; final fallback is a synthetic name.
+    let filePath = block.filePath ?? "";
     if (!filePath) {
       const firstLine = block.text.split("\n")[0];
-      const match = firstLine.match(/^### (.+?) \(/);
-      filePath = match ? match[1] : `file_${i + 1}_NB${folderIndex + 1}`;
+      const match = firstLine.match(/^###\s+(.+?)\s+\(/);
+      filePath = match ? match[1].trim() : `file_${i + 1}_NB${folderIndex + 1}`;
     }
     originalFilePaths.push(filePath);
 
     const fileName = `file_${String(i + 1).padStart(3, "0")}_NB${folderIndex + 1}.txt`;
-    const fileFullPath = join(folderPath, fileName);
-    await writeFile(fileFullPath, block.text, "utf-8");
+    const destPath = join(folderPath, fileName);
+
+    // FIX: guard against empty block text — should not happen after the
+    // getFileContext fix above, but belt-and-suspenders here too.
+    const textToWrite = block.text.trim()
+      ? block.text
+      : `[EMPTY BLOCK — source file: ${filePath}]`;
+
+    await writeFile(destPath, textToWrite, "utf-8");
+    localFilePaths.push(destPath);
   }
 
   const sortedGroups = Array.from(groupsSet).sort();
-
   const manifestLines = [
     `# Manifest for ${folderName}`,
     `Generated: ${new Date().toISOString()}`,
@@ -2437,6 +2397,7 @@ async function writeNotebookFolder(
     fileCount: batch.length,
     groups: sortedGroups,
     filePaths: originalFilePaths,
+    localFilePaths,
     localManifestPath: manifestPath,
   };
 }
@@ -2444,7 +2405,6 @@ async function writeNotebookFolder(
 function getSymbolIndexSummary(): string {
   const symbols = Object.keys(_repoorbit_symbol_index).sort();
   if (symbols.length === 0) return "";
-
   const lines = [
     "## Global Symbol Authority (High-Precision Index)",
     "This index is the project-wide source of truth for symbol locations and consumer chains.",
@@ -2461,7 +2421,6 @@ function getSymbolIndexSummary(): string {
   return lines.join("\n");
 }
 
-// ─── Write root manifest and meta file ───────────────────────────────────────
 async function writeRootManifest(
   metaTexts: string[],
   folderInfos: Array<{
@@ -2478,6 +2437,9 @@ async function writeRootManifest(
   allCandidatesCount: number,
   globalDeps: Map<number, Set<number>>,
 ): Promise<{ rootManifestPath: string; metaFilePath: string }> {
+  // FIX: guarantee outputDir exists before writing root-level files
+  ensureDir(outputDir);
+
   const metaFilePath = join(outputDir, "01_Meta.txt");
   const logicalCouplesText =
     "## Functional Relationships (Logical Couples)\n" +
@@ -2487,7 +2449,6 @@ async function writeRootManifest(
     "should also check its corresponding Aggregator in the manifest to understand the full stateful flow.";
 
   const symbolIndexText = getSymbolIndexSummary();
-
   await writeFile(
     metaFilePath,
     [...metaTexts, logicalCouplesText, symbolIndexText]
@@ -2516,7 +2477,6 @@ async function writeRootManifest(
       const targetNames = targets
         .map((t) => `notebook_${String(t + 1).padStart(2, "0")}`)
         .join(", ");
-
       const relationalNote = targets.some((t) => t < srcIdx)
         ? " (Contains Callers/Aggregators)"
         : "";
@@ -2531,47 +2491,36 @@ async function writeRootManifest(
     lines.push(`- Contains ${info.fileCount} source files.`);
     lines.push(`- Groups: ${info.groups.join(", ")}`);
     lines.push(`- Files:`);
-    for (const fp of info.filePaths) {
-      lines.push(`  - ${fp}`);
-    }
+    for (const fp of info.filePaths) lines.push(`  - ${fp}`);
     lines.push("");
   }
-
-  lines.push("## Source Mirror");
-  lines.push("Raw source files are available in the source_mirror/ directory.");
-  lines.push("These are the original unprocessed files from the repository.");
-  lines.push(
-    "When a file is listed in a notebook above, its raw source is at:",
-  );
-  lines.push("  source_mirror/<original_path>");
-  lines.push("Example: src/permit.js → source_mirror/src/permit.js");
-  lines.push("");
 
   lines.push("END OF MANIFEST");
 
   const rootManifestPath = join(outputDir, "00_Root_Manifest.txt");
   await writeFile(rootManifestPath, lines.join("\n"), "utf-8");
-
   return { rootManifestPath, metaFilePath };
 }
 
 // ─── Main export ──────────────────────────────────────────────────────────────
 export async function buildMasterContext(
-  query: string,
+  outputDir: string,
   filesMetadata: any[],
   importGraph: Record<string, { imports: string[]; imported_by: string[] }>,
   repoContext: any,
+  query?: string,
   expertPlan?: ExpertPlan,
-  outputDir = "/tmp/notebooklm_sources",
   dumpAll = true,
   aliases: Record<string, string> = {},
   kHopDepth: number = 2,
 ): Promise<{ content: string; lang: RepoLanguage }> {
   clearKHopCache();
 
+  // FIX: create outputDir at the very top so all subsequent writes succeed
+  ensureDir(outputDir);
+
   const repoName = repoContext?.meta?.fullName?.split("/").pop() ?? "repo";
   const safeQuery = query ? String(query) : "";
-
   const lang = detectRepoLanguage(filesMetadata);
 
   const cIncludeGraph =
@@ -2579,14 +2528,11 @@ export async function buildMasterContext(
       ? buildCIncludeGraph(filesMetadata)
       : ({} as Record<string, string[]>);
 
-  // Build bidirectional graph with resolved import paths
   const biGraph = buildBidirectionalGraph(filesMetadata, lang, aliases);
 
-  // Merge legacy flat graph + C include graph into the bidirectional graph
   const flatIncoming = Object.fromEntries(
     Object.entries(importGraph).map(([path, data]) => [path, data.imports]),
   );
-
   const mergedBiGraph = mergeImportGraphs(
     { ...flatIncoming, ...cIncludeGraph },
     biGraph,
@@ -2600,7 +2546,6 @@ export async function buildMasterContext(
     ...Object.keys(mergedBiGraph.imports),
     ...Object.keys(mergedBiGraph.imported_by),
   ]);
-
   for (const node of allNodes) {
     finalGraph[node] = {
       imports: mergedBiGraph.imports[node] || [],
@@ -2608,7 +2553,6 @@ export async function buildMasterContext(
     };
   }
 
-  // Flat merged graph for backward-compatible downstream consumers
   const mergedImportGraph = mergedBiGraph.imports;
 
   const intents = dumpAll
@@ -2623,7 +2567,6 @@ export async function buildMasterContext(
         "tree",
       ] as QueryIntent[])
     : (expertPlan?.intents ?? detectIntent(safeQuery));
-
   const intentsArr = Array.isArray(intents) ? intents : [];
 
   const needsCode =
@@ -2644,14 +2587,13 @@ export async function buildMasterContext(
     .sort((a, b) => (a.path as string).localeCompare(b.path));
 
   const estimateWords = (f: any) =>
-    Math.ceil((f.metrics?.charCount ?? f.content?.length ?? 0) / 5);
+    Math.ceil((f.metrics?.charCount ?? safeContent(f).length ?? 0) / 5);
 
   const { files: allIncluded, droppedTiers } = selectFilesByBudget(
     allCandidates,
     estimateWords,
     lang,
   );
-
   const allIncludedSorted = [...allIncluded].sort((a, b) =>
     (a.path as string).localeCompare(b.path),
   );
@@ -2666,7 +2608,11 @@ export async function buildMasterContext(
     if (text.trim()) metaTexts.push(text);
   };
   const pushSource = (group: string, text: string, filePath: string) => {
-    if (text.trim()) sourceBlocks.push({ group, text, filePath });
+    // FIX: only skip if BOTH text and filePath are empty — previously a
+    // file with only header content (no code blocks) would pass text.trim()
+    // because the header prose itself is non-empty.  We still want those files
+    // in the notebook.  The guard here only prevents truly degenerate blocks.
+    if (text.trim() || filePath) sourceBlocks.push({ group, text, filePath });
   };
 
   const metaLines: string[] = [];
@@ -2677,9 +2623,8 @@ export async function buildMasterContext(
     `Generated: ${new Date().toISOString()}. Language profile: ${lang}. Mode: ${droppedTiers.length > 0 ? "budget-constrained" : "full"}.`,
   );
 
-  if (dumpAll || focus === "generic" || intentsArr.includes("repo_meta")) {
+  if (dumpAll || focus === "generic" || intentsArr.includes("repo_meta"))
     metaLines.push(getRepoMeta(repoContext, lang));
-  }
   if (dumpAll || intentsArr.includes("repo_meta") || focus === "generic") {
     const docsSection = getReadme(docFiles, dumpAll ? 5 : 3);
     if (docsSection) metaLines.push(docsSection);
@@ -2716,13 +2661,11 @@ export async function buildMasterContext(
       .slice(0, 10)
       .map(([ext, count]) => `.${ext}: ${count} files`)
       .join(", ");
-
     metaLines.push(
       `## Directory Structure\n\n${sourceFiles.length} source files${droppedTiers.length > 0 ? " (filtered by budget)" : ""}. Types: ${extSummary}.\n\n` +
         getDirectoryStructure(filesMetadata, lang, dumpAll ? 10000 : 200),
     );
 
-    // Structural Roadmap
     const entryPoints = Object.keys(finalGraph)
       .filter((p) => finalGraph[p].imported_by.length === 0)
       .slice(0, 15);
@@ -2732,7 +2675,6 @@ export async function buildMasterContext(
           finalGraph[b].imported_by.length - finalGraph[a].imported_by.length,
       )
       .slice(0, 15);
-
     metaLines.push(
       `## Global Dependency Roadmap\n\n` +
         `### Core Entry Points (not imported by others):\n` +
@@ -2788,7 +2730,7 @@ export async function buildMasterContext(
         omittedPaths,
       } = selectFilesForQuery(
         sourceFiles,
-        query,
+        safeQuery,
         focus,
         mergedImportGraph,
         cIncludeGraph,
@@ -2808,7 +2750,6 @@ export async function buildMasterContext(
           if (found && !expertFilePaths.has(found.path)) {
             selectedFiles.push(found);
             expertFilePaths.add(found.path);
-            // Also expand k-hop deps of expert-specified files
             const expertExpanded = expandDependencies(
               found.path,
               mergedBiGraph,
@@ -2832,7 +2773,6 @@ export async function buildMasterContext(
       sortedFiles = [...selectedFiles].sort((a, b) =>
         (a.path as string).localeCompare(b.path),
       );
-
       if (omittedCount > 0) {
         pushMeta(
           `## File Selection\n\n${sortedFiles.length} files included, ${omittedCount} files omitted as irrelevant.\nSample omitted: ${omittedPaths.join(", ")}`,
@@ -2841,9 +2781,8 @@ export async function buildMasterContext(
     }
 
     const globalFileIndexMap = new Map<string, number>();
-    for (let i = 0; i < sortedFiles.length; i++) {
+    for (let i = 0; i < sortedFiles.length; i++)
       globalFileIndexMap.set(sortedFiles[i].path, i);
-    }
 
     if (lang === "c" || lang === "mixed") {
       const selectedPaths = new Set(sortedFiles.map((f) => f.path));
@@ -2854,17 +2793,25 @@ export async function buildMasterContext(
       if (includeGraphSummary) pushMeta(includeGraphSummary);
     }
 
+    const allGraphPaths2 = new Set([
+      ...Object.keys(mergedImportGraph),
+      ...Object.values(mergedImportGraph).flat(),
+    ]);
+    const importedByOthers2 = new Set(Object.values(mergedImportGraph).flat());
+    const entryPoints2 = [...allGraphPaths2]
+      .filter((p) => !importedByOthers2.has(p))
+      .sort();
+
     const graphHeader =
       `## ${lang === "c" ? "Include" : "Import"} Graph and File Roles\n\n` +
       `- **Entry Point**: not ${lang === "c" ? "included by" : "imported by"} any other file.\n` +
       `- **Depth N**: N hops from an entry point.\n` +
       `- **Utility**: not in the ${lang === "c" ? "include" : "import"} graph.\n\n` +
-      `Entry points: ${entryPoints.slice(0, 20).join(", ") || "none detected"}.`;
+      `Entry points: ${entryPoints2.slice(0, 20).join(", ") || "none detected"}.`;
 
     if (sortedFiles.length > 0) pushMeta(graphHeader);
 
     const fileCrossDeps = new Map<number, string[]>();
-
     for (let i = 0; i < sortedFiles.length; i++) {
       const file = sortedFiles[i];
       const notebookIdx = Math.floor(i / 48);
@@ -2882,17 +2829,13 @@ export async function buildMasterContext(
             crossDeps.push(
               `${depNotebookName}: ${depLocalFileName} (${depPath})`,
             );
-
             if (!globalDeps.has(notebookIdx))
               globalDeps.set(notebookIdx, new Set());
             globalDeps.get(notebookIdx)!.add(depNotebookIdx);
           }
         }
       }
-
-      if (crossDeps.length > 0) {
-        fileCrossDeps.set(i, crossDeps);
-      }
+      if (crossDeps.length > 0) fileCrossDeps.set(i, crossDeps);
     }
 
     for (let i = 0; i < sortedFiles.length; i++) {
@@ -2903,22 +2846,24 @@ export async function buildMasterContext(
 
       let fileContext = getFileContext(
         file,
-        importRoleLabel(depthMap.get(file.path)),
+        importRoleLabel(undefined),
         repoName,
         lang,
         notebookName,
         crossDeps,
         finalGraph,
       );
-
-      if (crossDeps.length > 0) {
+      if (crossDeps.length > 0)
         fileContext += `\n\nCross‑notebook dependencies:\n- ${crossDeps.join("\n- ")}`;
-      }
 
       const group =
         lang === "c"
           ? subsystemKey(file.path)
           : file.path.split("/")[0] || "_root";
+
+      // FIX: always pass filePath to pushSource so writeNotebookFolder
+      // can write the correct path into the manifest even when the block
+      // text's header line is hard to parse.
       pushSource(group, fileContext, file.path);
     }
   }
@@ -2941,40 +2886,17 @@ export async function buildMasterContext(
     pushMeta(depLines.join("\n"));
   }
 
-  const mirrorDir = join(outputDir, "source_mirror");
-  if (!fs.existsSync(mirrorDir)) mkdirSync(mirrorDir, { recursive: true });
-  for (const file of filesMetadata) {
-    if (!file.path || file.type === "folder" || file.type === "tree") continue;
-    const rawPath = join(mirrorDir, file.path);
-    if (fs.existsSync(rawPath) && fs.statSync(rawPath).isDirectory()) continue;
+  // FIX: log sourceBlocks count before batching so we can diagnose empty-notebook issues
+  console.log(
+    `[BUILD] sourceBlocks to write: ${sourceBlocks.length} across ${Math.ceil(sourceBlocks.length / 48)} notebooks`,
+  );
 
-    const rawDir = join(rawPath, "..");
-
-    // Robust directory creation: Verify that no parent component is a file
-    try {
-      if (!fs.existsSync(rawDir)) {
-        mkdirSync(rawDir, { recursive: true });
-      } else if (!fs.statSync(rawDir).isDirectory()) {
-        console.warn(
-          `[Mirror] Skipping ${file.path}: Parent ${rawDir} is a file, not a directory.`,
-        );
-        continue;
-      }
-      await writeFile(rawPath, safeContent(file), "utf-8");
-    } catch (e: any) {
-      if (e.code === "ENOTDIR") {
-        console.warn(
-          `[Mirror] ENOTDIR collision for ${file.path}. A path component is a file. Skipping.`,
-        );
-        continue;
-      }
-      throw e;
-    }
-  }
-
-  const batches = splitSourceBlocksIntoBatches(sourceBlocks, 48);
+  const batches = splitSourceBlocksIntoBatches(sourceBlocks, 49);
   const folderInfos = [];
   for (let i = 0; i < batches.length; i++) {
+    console.log(
+      `[BUILD] Writing notebook_${String(i + 1).padStart(2, "0")} with ${batches[i].length} files`,
+    );
     const info = await writeNotebookFolder(batches[i], i, outputDir);
     folderInfos.push(info);
   }
@@ -3006,6 +2928,18 @@ export async function buildMasterContext(
 
   const graphPath = join(outputDir, "graph.json");
   await writeFile(graphPath, JSON.stringify(finalGraph, null, 2), "utf-8");
+
+  const notebooksJson = folderInfos.map((info) => ({
+    name: info.name,
+    title: `${repoContext?.meta?.fullName || "repo"} - ${info.name}`,
+    files: info.filePaths,
+    localFiles: info.localFilePaths,
+  }));
+  await writeFile(
+    join(outputDir, "notebooks.json"),
+    JSON.stringify(notebooksJson, null, 2),
+    "utf-8",
+  );
 
   const rootManifestContent = await readFile(rootManifestPath, "utf-8");
   return { content: rootManifestContent, lang };

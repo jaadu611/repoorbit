@@ -1,25 +1,27 @@
 import { buildMasterContext } from "@/lib/contextBuilder";
 import path from "path";
 import fs from "fs";
+import { execSync } from "child_process";
 import { analyzeFile, fetchFileContents } from "@/lib/github";
-import { automateNotebookLM } from "@/lib/notebooklmAutomator";
-import { automateChatGPT } from "@/lib/chatgptAutomator";
+import {
+  automateNotebookLM,
+  automateSubQuestion,
+} from "@/lib/notebooklmAutomator";
+import { automateChatGPT, askChatGPTCoder } from "@/lib/chatgptAutomator";
 import { getOrCreateContext } from "@/lib/browser";
-import { generateGapFillerNotebook } from "@/lib/gapScout";
 import { askDeepseek } from "@/lib/deepseekAutomator";
 import { askQwen } from "@/lib/qwenAutomator";
 import { askGemini } from "@/lib/geminiAutomator";
-import { buildDeepseekContext } from "@/lib/deepseekContextBuilder";
+
 import {
-  getFinalPhasePrompt,
-  getArchitectPrompt,
-  getStaffEngineerPrompt,
   getDeepseekCodingPrompt,
-  getTriagePrompt,
   getGeminiSynthesisPrompt,
+  getGeminiPlannerPrompt,
+  getNotebookSubQuestionPrompt,
+  getNotebookSystemInstruction,
 } from "@/lib/prompts";
 import { NextResponse } from "next/server";
-import { BrowserContext } from "playwright";
+import { Page, BrowserContext } from "playwright";
 import {
   JobStatus,
   NotebookPlan,
@@ -31,535 +33,482 @@ import {
 export const CONTEXT_DIR_PATH = "/tmp/notebooklm_sources";
 export const NOTEBOOKLM_URL = "https://notebooklm.google.com/";
 
-const SUPPORTED_EXTENSIONS = new Set([
-  ".pdf",
-  ".txt",
-  ".md",
-  ".docx",
-  ".csv",
-  ".pptx",
-  ".epub",
-  ".avif",
-  ".bmp",
-  ".gif",
-  ".ico",
-  ".jp2",
-  ".png",
-  ".webp",
-  ".tif",
-  ".tiff",
-  ".heic",
-  ".heif",
-  ".jpeg",
-  ".jpg",
-  ".jpe",
-  ".3g2",
-  ".3gp",
-  ".aac",
-  ".aif",
-  ".aifc",
-  ".aiff",
-  ".amr",
-  ".au",
-  ".avi",
-  ".cda",
-  ".m4a",
-  ".mid",
-  ".mp3",
-  ".mp4",
-  ".mpeg",
-  ".ogg",
-  ".opus",
-  ".ra",
-  ".ram",
-  ".snd",
-  ".wav",
-  ".wma",
-]);
-
 const GLOBAL_JOBS_KEY = Symbol.for("repoorbit.playwright.jobs");
 export const activeJobs: Map<string, JobStatus> =
   (global as any)[GLOBAL_JOBS_KEY] || new Map();
 (global as any)[GLOBAL_JOBS_KEY] = activeJobs;
 
-// ─── Notebook relevance scorer ────────────────────────────────────────────────
+// ─── Constants & Helpers ──────────────────────────────────────────────────
 
-const SCORER_STOP_WORDS = new Set([
-  "the",
-  "a",
-  "an",
-  "is",
-  "in",
-  "it",
-  "of",
-  "to",
-  "and",
-  "or",
-  "for",
-  "on",
-  "with",
-  "this",
-  "that",
-  "from",
-  "are",
-  "was",
-  "be",
-  "by",
-  "at",
-  "as",
-  "we",
-  "i",
-  "my",
-  "our",
-  "your",
-  "its",
-  "have",
-  "has",
-  "had",
-  "not",
-  "do",
-  "does",
-  "did",
-  "can",
-  "could",
-  "would",
-  "should",
-  "will",
-  "may",
-  "might",
-  "how",
-  "what",
-  "where",
-  "when",
-  "which",
-  "who",
-  "why",
-  "there",
-  "here",
-  "after",
-  "before",
-  "under",
-  "over",
-  "about",
-]);
+const MAX_LINES_PER_FILE = 500;
+const MAX_FILES_PER_TURN = 5;
 
-const CORE_SOURCE_BONUS_RE = /^(lib|src|core|internal|pkg|cmd|server)\//;
-const TEST_FILE_PENALTY_RE = /\.(test|spec)\.[a-z]+$|\/test\/|\/tests?\//;
-
-function isNeverRelevant(filePath: string): boolean {
-  const p = filePath.toLowerCase();
-  if (p.startsWith(".github/") || p === ".github") return true;
-  if (p.startsWith("docs/")) return true;
-  if (p.startsWith("build/")) return true;
-  if (p.startsWith("scripts/")) return true;
-  if (p.startsWith("examples/") && !p.includes("benchmark")) return true;
-  if (p.endsWith(".yml") || p.endsWith(".yaml")) return true;
-  if (p.endsWith(".md")) return true;
-  if (p.endsWith(".json") && !p.endsWith("package.json")) return true;
-  return false;
-}
-
-function extractQueryTokens(query: string): Set<string> {
-  const tokens = new Set<string>();
-  const normalized = query.toLowerCase().replace(/[^a-z0-9\s_./-]/g, " ");
-
-  for (const m of normalized.matchAll(/\b[\w-]+\/[\w-]+(?:\.[a-z]{1,5})?\b/g)) {
-    tokens.add(m[0]);
-  }
-  for (const m of query.matchAll(/\b[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*\b/g)) {
-    tokens.add(m[0].toLowerCase());
-  }
-  for (const m of query.matchAll(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+){1,}\b/g)) {
-    tokens.add(m[0]);
-  }
-  for (const w of normalized.split(/\s+/)) {
-    const clean = w.replace(/[^a-z0-9]/g, "");
-    if (clean.length >= 3 && !SCORER_STOP_WORDS.has(clean)) {
-      tokens.add(clean);
-    }
-  }
-
-  return tokens;
-}
-
-interface NotebookScore {
-  notebookName: string;
-  score: number;
-  tier: "HIGH" | "MEDIUM" | "LOW";
-  matchedFiles: string[];
-  totalFiles: number;
-}
-
-function scoreNotebooksForQuery(
+async function fetchFile(
   outDir: string,
-  query: string,
-): NotebookScore[] {
-  const tokens = extractQueryTokens(query);
-  const scores: NotebookScore[] = [];
-
-  const manifestPath = path.join(outDir, "00_Root_Manifest.txt");
-  if (!fs.existsSync(manifestPath)) {
-    console.error("[SCORER] 00_Root_Manifest.txt not found at:", manifestPath);
-    return [];
-  }
-
-  const manifestContent = fs.readFileSync(manifestPath, "utf-8");
-
-  // FIX: \r? handles both CRLF (Windows) and LF (Unix) line endings.
-  // The old regex /^## (notebook_\d+)$/gm failed on CRLF because $
-  // matched before \r, so "## notebook_01\r" did not match.
-  const notebookMatches = manifestContent.matchAll(/^## (notebook_\d+)\r?$/gm);
-  const notebookNames: string[] = [];
-  for (const m of notebookMatches) {
-    notebookNames.push(m[1]);
-  }
-
-  // FALLBACK: if manifest regex found nothing, scan disk directly.
-  // Handles edge cases where manifest format has drifted.
-  if (notebookNames.length === 0) {
-    console.warn(
-      "[SCORER] No notebook names found via manifest regex — scanning disk",
-    );
-    try {
-      const entries = fs.readdirSync(outDir);
-      for (const entry of entries) {
-        if (/^notebook_\d+$/.test(entry)) {
-          const fullPath = path.join(outDir, entry);
-          if (fs.statSync(fullPath).isDirectory()) {
-            notebookNames.push(entry);
-          }
-        }
-      }
-      notebookNames.sort();
-    } catch (e) {
-      console.error("[SCORER] Failed to scan disk for notebooks:", e);
-    }
-  }
-
-  if (notebookNames.length === 0) {
-    console.error(
-      "[SCORER] No notebooks found in manifest or on disk. outDir:",
-      outDir,
-    );
-    return [];
-  }
-
-  for (const notebookName of notebookNames) {
-    const localManifestPath = path.join(
-      outDir,
-      notebookName,
-      "00_manifest.txt",
-    );
-    if (!fs.existsSync(localManifestPath)) continue;
-
-    const localManifest = fs.readFileSync(localManifestPath, "utf-8");
-
-    const fileEntries: string[] = [];
-    for (const m of localManifest.matchAll(/^file_\d+_NB\d+\.txt -> (.+)$/gm)) {
-      fileEntries.push(m[1].trim());
-    }
-
-    let notebookScore = 0;
-    const matchedFilesWithScore: { path: string; score: number }[] = [];
-
-    // Collect directories of directly-matched files for co-location bonus
-    const directMatchDirs = new Set<string>();
-
-    for (const filePath of fileEntries) {
-      if (isNeverRelevant(filePath)) continue;
-
-      const filePathLower = filePath.toLowerCase();
-      let fileScore = 0;
-
-      // Token match in file path
-      if (tokens.size > 0) {
-        for (const token of tokens) {
-          if (filePathLower.includes(token)) {
-            fileScore += 10;
-          }
-        }
-      }
-
-      if (fileScore > 0 || CORE_SOURCE_BONUS_RE.test(filePath)) {
-        const lineMatch = localManifest.match(
-          new RegExp(
-            `(file_\\d+_NB\\d+\\.txt) -> ${filePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
-          ),
-        );
-        if (lineMatch) {
-          const txtFilePath = path.join(outDir, notebookName, lineMatch[1]);
-          if (fs.existsSync(txtFilePath)) {
-            const content = fs.readFileSync(txtFilePath, "utf-8").toLowerCase();
-            if (tokens.size > 0) {
-              for (const token of tokens) {
-                const occurrences = (
-                  content.match(new RegExp(`\\b${token}\\b`, "g")) ?? []
-                ).length;
-                fileScore += Math.min(occurrences, 5) * 3;
-              }
-            } else {
-              fileScore += 10;
-            }
-          }
-        }
-      }
-
-      // C source path bonus — covers backend/ src/ include/ core/ etc.
-      if (
-        /^src\/backend\/|^src\/include\/|^src\/common\/|^include\//.test(
-          filePath,
-        )
-      ) {
-        fileScore = Math.round(fileScore * 1.5);
-      } else if (CORE_SOURCE_BONUS_RE.test(filePath)) {
-        fileScore = Math.round(fileScore * 1.5);
-      }
-
-      if (TEST_FILE_PENALTY_RE.test(filePath) && fileScore > 0) {
-        fileScore = Math.round(fileScore * 0.4);
-      }
-
-      if (fileScore > 0) {
-        notebookScore += fileScore;
-        matchedFilesWithScore.push({ path: filePath, score: fileScore });
-        // Record the directory for co-location bonus
-        const dir = filePath.includes("/")
-          ? filePath.split("/").slice(0, -1).join("/")
-          : "";
-        if (dir) directMatchDirs.add(dir);
-      }
-    }
-
-    // Directory co-location bonus: if other files in this notebook share a directory
-    // with a matched file, they get a proximity bonus (catches arrayfuncs siblings like
-    // array_userfuncs.c, arraysubs.c even if they don't token-match directly)
-    if (directMatchDirs.size > 0) {
-      for (const filePath of fileEntries) {
-        if (matchedFilesWithScore.some((f) => f.path === filePath)) continue; // already scored
-        if (isNeverRelevant(filePath)) continue;
-        const dir = filePath.includes("/")
-          ? filePath.split("/").slice(0, -1).join("/")
-          : "";
-        if (dir && directMatchDirs.has(dir)) {
-          notebookScore += 15; // co-located sibling bonus
-        }
-      }
-    }
-
-    let tier: "HIGH" | "MEDIUM" | "LOW";
-    if (notebookScore >= 200) tier = "HIGH";
-    else if (notebookScore >= 50) tier = "MEDIUM";
-    else tier = "LOW";
-
-    const matchedFiles = matchedFilesWithScore
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 8)
-      .map((f) => f.path);
-
-    scores.push({
-      notebookName,
-      score: notebookScore,
-      tier,
-      matchedFiles,
-      totalFiles: fileEntries.length,
-    });
-  }
-
-  return scores.sort((a, b) => b.score - a.score);
-}
-
-function buildQueryRelevanceSection(
-  scores: NotebookScore[],
-  query: string,
-): string {
-  if (scores.length === 0) return "";
-
-  const queryPreview = query.length > 100 ? query.slice(0, 100) + "..." : query;
-
-  const lines: string[] = [
-    `## QUERY RELEVANCE ANALYSIS`,
-    `Query: "${queryPreview}"`,
-    ``,
-    `The following notebooks have been pre-scored for relevance to this query.`,
-    `Use this as your PRIMARY signal for notebook assignment.`,
-    `HIGH relevance notebooks contain the files most likely needed to answer the query.`,
-    `Do NOT assign LOW relevance notebooks as primary sources for code questions.`,
-    ``,
-  ];
-
-  for (const s of scores) {
-    const matchedStr =
-      s.matchedFiles.length > 0
-        ? s.matchedFiles.join(", ")
-        : "no directly matched files";
-    lines.push(
-      `- ${s.notebookName} [${s.tier}] score:${s.score} — relevant files: ${matchedStr}`,
-    );
-  }
-
-  lines.push(``);
-  lines.push(
-    `PLANNER INSTRUCTION: Your notebook assignments in the "covers" array MUST`,
-  );
-  lines.push(
-    `prioritize HIGH-scored notebooks. For each HIGH notebook, write a sub_question`,
-  );
-  lines.push(
-    `that is SPECIFIC to the query — not a general architectural overview.`,
-  );
-  lines.push(
-    `If the query mentions a bug or fix, the sub_question must ask about that`,
-  );
-  lines.push(`specific bug in the context of the files in that notebook.`);
-
-  return lines.join("\n");
-}
-
-function deriveNotebookPlan(
-  scores: NotebookScore[],
-  query: string,
-): NotebookPlan {
-  // 1. Try to get all HIGH notebooks
-  let selected = scores.filter((s) => s.tier === "HIGH");
-
-  // 2. If no HIGH, take the top 3 MEDIUM notebooks (increased from 2)
-  if (selected.length === 0) {
-    selected = scores.filter((s) => s.tier === "MEDIUM").slice(0, 3);
-  }
-
-  // 3. FALLBACK: If still empty or all are LOW, take the top 3 (increased from 2)
-  if (selected.length === 0 && scores.length > 0) {
-    console.warn(
-      "[PLANNER] All notebooks scored LOW — using top 3 by score as fallback",
-    );
-    selected = scores.slice(0, 3);
-  }
-
-  // 4. Increase global limit to 3 notebooks total
-  selected = selected.slice(0, 3);
-
-  return {
-    include_meta: false,
-    notebooks: selected.map((s) => ({
-      name: s.notebookName,
-      covers: s.matchedFiles, // This list is controlled by the Scorer
-      reason: `Scorer assigned ${s.tier} tier (score: ${s.score}). Top matched files: ${s.matchedFiles.slice(0, 3).join(", ")}`,
-      sub_question: query,
-    })),
-  };
-}
-
-// ─── processNotebookPlan ──────────────────────────────────────────────────────
-
-async function processNotebookPlan(
-  context: BrowserContext,
-  plan: NotebookPlan,
-  baseDir: string,
-  repoName: string,
-  lang?: RepoLanguage,
-  onStatus?: (msg: string, partial?: string, progress?: number) => void,
+  owner: string,
+  repo: string,
+  branch: string,
+  filePath: string,
+  lineRange?: [number, number],
 ): Promise<string> {
-  const pages = context.pages();
-  let page = pages.find((p) => p.url()?.includes("notebooklm.google.com"));
+  const safeBranch = branch && branch.trim() ? branch.trim() : "main";
+  const url = `https://raw.githubusercontent.com/${owner}/${repo}/${safeBranch}/${filePath}`;
+  console.log(`[GITHUB] Fetching: ${url}`);
 
-  if (!page) {
-    page = await context.newPage();
-    await page.goto(NOTEBOOKLM_URL, {
-      waitUntil: "domcontentloaded",
-      timeout: 60000,
-    });
-  } else {
-    await page.goto(NOTEBOOKLM_URL, {
-      waitUntil: "domcontentloaded",
-      timeout: 30000,
-    });
+  try {
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.warn(`[GITHUB] 404/Error: ${url} (Status: ${res.status})`);
+      return `// [NOT FOUND] ${filePath} — HTTP ${res.status}`;
+    }
+    const text = await res.text();
+    const lines = text.split("\n");
+
+    console.log(
+      `[GITHUB] Success: ${filePath} (${lines.length} lines). Preview: ${lines[0].substring(0, 50)}...`,
+    );
+
+    if (lineRange) {
+      let start = lineRange[0];
+      let end = lineRange[1];
+
+      // Interpret 0 as 'beginning' or 'end'
+      const startIdx = start > 0 ? start - 1 : 0;
+      const endIdx = end > 0 ? Math.min(lines.length - 1, end - 1) : lines.length - 1;
+
+      const slice = lines.slice(startIdx, endIdx + 1);
+      
+      // If they asked for a range, we give them what they asked for (up to 1500 lines)
+      const MAX_RANGE_LIMIT = 1500;
+      if (slice.length > MAX_RANGE_LIMIT) {
+        return (
+          slice.slice(0, MAX_RANGE_LIMIT).join("\n") +
+          `\n\n// [TRUNCATED] Only first ${MAX_RANGE_LIMIT} lines of the requested range are shown. Ask for the next segment if needed.`
+        );
+      }
+      return slice.join("\n");
+    }
+
+    if (lines.length > MAX_LINES_PER_FILE) {
+      return (
+        lines.slice(0, MAX_LINES_PER_FILE).join("\n") +
+        `\n\n// [TRUNCATED] Only first ${MAX_LINES_PER_FILE} lines shown. Use "line_range": [start, end] to request more.`
+      );
+    }
+    return text;
+  } catch (err: any) {
+    console.error(`[GITHUB] Error fetching ${url}:`, err.message);
+    return `// Error fetching ${filePath}`;
+  }
+}
+
+async function fillMissingFiles(
+  missingFiles: any[],
+  filledSet: Set<string>,
+  modelName: string,
+  modelInvestDir: string,
+  owner: string,
+  repo: string,
+  branch: string,
+): Promise<number> {
+  const filesToFetch = missingFiles.slice(0, MAX_FILES_PER_TURN);
+  let count = 0;
+
+  for (const f of filesToFetch) {
+    const filePath = f.path || f.file_path;
+    if (!filePath) continue;
+    const lineRange = Array.isArray(f.line_range) ? f.line_range : undefined;
+    const key = `${filePath}|${lineRange?.join(",") || ""}`.toLowerCase();
+    if (filledSet.has(key)) continue;
+    filledSet.add(key);
+
+    console.log(
+      `[ORCHESTRATOR] ${modelName} fetching: ${filePath}${lineRange ? ` lines ${lineRange.join("-")}` : ""}`,
+    );
+    const content = await fetchFile(
+      modelInvestDir
+        .split("/ds_investigation")[0]
+        .split("/qwen_investigation")[0],
+      owner,
+      repo,
+      branch,
+      filePath,
+      lineRange as [number, number],
+    );
+
+    const safeName = filePath.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const extraFileName = `extra_${count.toString().padStart(2, "0")}_${safeName}.txt`;
+    const extraFilePath = path.join(modelInvestDir, extraFileName);
+    fs.mkdirSync(modelInvestDir, { recursive: true });
+    fs.writeFileSync(extraFilePath, content, "utf-8");
+    console.log(
+      `[ORCHESTRATOR] ${modelName}: Saved extra context to ${extraFileName}`,
+    );
+    count++;
   }
 
-  const answers: string[] = [];
-  if (!plan.notebooks) return "";
-  const total = plan.notebooks.length;
+  console.log(
+    `[ORCHESTRATOR] ${modelName}: Total extra files fetched this turn: ${count}`,
+  );
+  return count;
+}
 
-  for (let i = 0; i < total; i++) {
-    const nb = plan.notebooks[i];
+function getStatusMessage(job: JobStatus): string {
+  const turn = job.turn === 0 ? "Initial" : `Turn ${job.turn}`;
+  if (job.status === "running") {
+    return `Agent is working (${turn}, step: ${job.step || "investigating"})...`;
+  }
+  if (job.status === "completed") {
+    return "Investigation complete. Synthesizing fix...";
+  }
+  return job.status || "Processing...";
+}
 
-    const numMatch = nb.name.match(/notebook[_-]?(\d+)/i);
-    const resolvedFolderName = numMatch
-      ? `notebook_${numMatch[1].padStart(2, "0")}`
-      : `notebook_${String(i + 1).padStart(2, "0")}`;
-    const notebookFolder = path.join(baseDir, resolvedFolderName);
+function fileFingerprint(filePath: string): string {
+  try {
+    const content = fs.readFileSync(filePath, "utf-8");
+    return `${content.length}:${content.slice(0, 64)}`;
+  } catch {
+    return `missing:${filePath}`;
+  }
+}
 
-    onStatus?.(
-      `Querying ${resolvedFolderName} (${i + 1}/${total})...`,
-      undefined,
-      Math.round(((i + 1) / total) * 100),
-    );
-
-    if (!fs.existsSync(notebookFolder)) {
-      answers.push(
-        `### ${resolvedFolderName}\n[ERROR] Folder "${resolvedFolderName}" does not exist (planner name: "${nb.name}").\n`,
+function filterNewFiles(
+  files: string[],
+  seenHashes: Map<string, string>,
+  modelName: string,
+): string[] {
+  const newFiles: string[] = [];
+  for (const f of files) {
+    if (!fs.existsSync(f)) continue;
+    const fname = path.basename(f);
+    const fp = fileFingerprint(f);
+    if (seenHashes.get(fname) === fp) {
+      console.log(
+        `[ORCHESTRATOR] ${modelName}: skipping already-uploaded "${fname}"`,
       );
       continue;
     }
+    seenHashes.set(fname, fp);
+    newFiles.push(f);
+  }
+  return newFiles;
+}
 
-    const allTxts = fs
-      .readdirSync(notebookFolder)
-      .filter((f) => f.endsWith(".txt"))
-      .sort();
+function prepareTurnDir(
+  outDir: string,
+  modelPrefix: string,
+  attempt: number,
+  dsBaseContextDir: string,
+  modelInvestDir: string,
+  seenHashes: Map<string, string>,
+): string {
+  const turnDir = path.join(outDir, `${modelPrefix}_upload_${attempt}`);
+  if (fs.existsSync(turnDir))
+    fs.rmSync(turnDir, { recursive: true, force: true });
+  fs.mkdirSync(turnDir, { recursive: true });
 
-    const manifestFile = allTxts.find((f) => f === "00_manifest.txt");
-    const sourceFiles = allTxts.filter(
-      (f) => f !== "00_manifest.txt" && f !== "QUERY_PROMPT.txt",
-    );
-    const orderedFiles = [
-      ...sourceFiles,
-      ...(manifestFile ? [manifestFile] : []),
-    ].map((f) => path.join(notebookFolder, f));
-    const finalOrderedFiles = [...orderedFiles];
+  let newFilesCount = 0;
 
-    if (finalOrderedFiles.length === 0) {
-      answers.push(
-        `### ${resolvedFolderName}\n[ERROR] No source files found in "${notebookFolder}".\n`,
-      );
-      continue;
+  // 1. Base Context: ONLY on first turn (attempt 0)
+  if (attempt === 0 && fs.existsSync(dsBaseContextDir)) {
+    for (const f of fs.readdirSync(dsBaseContextDir)) {
+      if (f === "gap_filler.txt") continue;
+      const src = path.join(dsBaseContextDir, f);
+      const dst = path.join(turnDir, f);
+      const fingerprint = fileFingerprint(src);
+      fs.copyFileSync(src, dst);
+      seenHashes.set(f, fingerprint);
+      newFilesCount++;
     }
+  }
 
-    const notebookTitle = `@${repoName} - ${nb.name}`;
-    const queryPromptPath = path.join(notebookFolder, "QUERY_PROMPT.txt");
+  // 2. Extra Context: ONLY new files that haven't been uploaded yet
+  if (fs.existsSync(modelInvestDir)) {
+    for (const f of fs.readdirSync(modelInvestDir)) {
+      const src = path.join(modelInvestDir, f);
+      const fingerprint = fileFingerprint(src);
+      const existing = seenHashes.get(f);
 
-    let answer = "";
-    try {
-      const architectPrompt = getArchitectPrompt(
-        nb.sub_question,
-        nb.reason,
-        nb.covers,
-      );
-      fs.writeFileSync(queryPromptPath, architectPrompt, "utf-8");
+      if (existing === fingerprint) continue;
 
-      answer = await automateNotebookLM(
+      fs.copyFileSync(src, path.join(turnDir, f));
+      seenHashes.set(f, fingerprint);
+      newFilesCount++;
+    }
+  }
+
+  console.log(
+    `[ORCHESTRATOR] ${modelPrefix} turn ${attempt}: prepared ${newFilesCount} NEW files in ${turnDir}`,
+  );
+  return turnDir;
+}
+
+async function runModelPlanner(
+  modelName: string,
+  page: Page,
+  query: string,
+  manifestContent: string,
+  repoUrl: string,
+  defaultBranch: string,
+  plannerFiles: string[],
+  outDir: string,
+  onStatus: (msg: string) => void,
+): Promise<any> {
+  let attempts = 0;
+  let history = "";
+  const initialPrompt = getGeminiPlannerPrompt(query);
+  history = initialPrompt;
+
+  const parts = repoUrl.split("/");
+  const owner = parts[parts.length - 2];
+  const repo = parts[parts.length - 1];
+
+  let currentFiles = [...plannerFiles];
+
+  while (attempts < 3) {
+    let response = "";
+    if (modelName === "Gemini") {
+      response = await askGemini(
         page,
-        [queryPromptPath, ...finalOrderedFiles],
-        "Process the instructions in QUERY_PROMPT.txt",
-        notebookTitle,
-        onStatus,
-        false,
-        [queryPromptPath],
+        history,
+        attempts === 0 ? currentFiles : [],
+        (msg) => onStatus(`[Gemini Planner] ${msg}`),
       );
-    } catch (err: any) {
-      answer = `[Error] ${err.message}`;
+    } else if (modelName === "DeepSeek") {
+      const planContextDir = path.join(outDir, "planner_context_ds");
+      if (attempts === 0) {
+        fs.mkdirSync(planContextDir, { recursive: true });
+        currentFiles.forEach((f) =>
+          fs.copyFileSync(f, path.join(planContextDir, path.basename(f))),
+        );
+      }
+      response = await askDeepseek(
+        page,
+        history,
+        manifestContent,
+        attempts === 0 ? planContextDir : "",
+        (msg) => onStatus(`[DeepSeek Planner] ${msg}`),
+        outDir,
+        attempts === 0,
+      );
+    } else if (modelName === "Qwen") {
+      const planContextDir = path.join(outDir, "planner_context_qwen");
+      if (attempts === 0) {
+        fs.mkdirSync(planContextDir, { recursive: true });
+        currentFiles.forEach((f) =>
+          fs.copyFileSync(f, path.join(planContextDir, path.basename(f))),
+        );
+      }
+      response = await askQwen(
+        page,
+        history,
+        manifestContent,
+        attempts === 0 ? planContextDir : "",
+        (msg) => onStatus(`[Qwen Planner] ${msg}`),
+        outDir,
+        attempts === 0,
+      );
     }
 
-    answers.push(`### ${resolvedFolderName}\n\n${answer}\n`);
+    let plan: any;
+    try {
+      const cleaned = response.replace(/```json|```/g, "").trim();
+      const s = cleaned.indexOf("{");
+      const e = cleaned.lastIndexOf("}");
+      if (s === -1) throw new Error("No JSON object found");
+      plan = JSON.parse(cleaned.slice(s, e + 1));
+    } catch {
+      return { status: "FAILED", raw: response };
+    }
 
-    if (i < total - 1) {
-      await page.goto(NOTEBOOKLM_URL, {
-        waitUntil: "domcontentloaded",
-        timeout: 30000,
-      });
-      await page.waitForTimeout(2000);
+    if (plan.status === "READY" || plan.status === "GENERIC") return plan;
+
+    if (plan.status === "NEED_FILE" && Array.isArray(plan.files)) {
+      onStatus(`[${modelName} Planner] Fetching requested files...`);
+      const results = [];
+      for (const f of plan.files.slice(0, 5)) {
+        const content = await fetchFile(
+          outDir,
+          owner,
+          repo,
+          defaultBranch,
+          f.path,
+        );
+        results.push(`${f.path}:\n${content}`);
+      }
+
+      history += "\n\n" + response;
+      history += "\n\n" + results.join("\n\n");
+      attempts++;
+      continue;
+    }
+    return plan;
+  }
+  return { status: "FAILED" };
+}
+
+async function runTriplePlanner(
+  context: BrowserContext,
+  query: string,
+  manifestContent: string,
+  repoUrl: string,
+  defaultBranch: string,
+  plannerFiles: string[],
+  outDir: string,
+  onStatus: (msg: string) => void,
+): Promise<any> {
+  const pages = await Promise.all([
+    context.newPage(), // Gemini
+    context.newPage(), // DeepSeek
+    context.newPage(), // Qwen
+  ]);
+
+  const [geminiPage, deepPage, qwenPage] = pages;
+
+  onStatus("Triple-model planning initiated (Gemini + DeepSeek + Qwen)...");
+
+  const results = await Promise.all([
+    runModelPlanner(
+      "Gemini",
+      geminiPage,
+      query,
+      manifestContent,
+      repoUrl,
+      defaultBranch,
+      plannerFiles,
+      outDir,
+      onStatus,
+    ),
+    runModelPlanner(
+      "DeepSeek",
+      deepPage,
+      query,
+      manifestContent,
+      repoUrl,
+      defaultBranch,
+      plannerFiles,
+      outDir,
+      onStatus,
+    ),
+    runModelPlanner(
+      "Qwen",
+      qwenPage,
+      query,
+      manifestContent,
+      repoUrl,
+      defaultBranch,
+      plannerFiles,
+      outDir,
+      onStatus,
+    ),
+  ]);
+
+  const [gPlan, dPlan, qPlan] = results;
+
+  // Close non-Gemini planner tabs to save resources
+  await Promise.allSettled([deepPage.close(), qwenPage.close()]);
+
+  // If all failed, return failed
+  if (
+    gPlan.status === "FAILED" &&
+    dPlan.status === "FAILED" &&
+    qPlan.status === "FAILED"
+  ) {
+    return { status: "FAILED" };
+  }
+
+  onStatus("Synthesizing unified plan with Gemini...");
+  const synthPrompt = `Synthesize these 3 investigation plans into a SINGLE, EXHAUSTIVE, and COMPREHENSIVE master plan.
+
+PRIORITY: MAXIMIZE COVERAGE
+1. MISSION: It is better to include an extra notebook than to miss the bug. If any agent (GEMINI, DEEPSEEK, or QWEN) identifies a specific notebook or logic area (e.g. storage, networking, specific integrations), INCLUDE IT in the final plan.
+2. DO NOT be overly selective. Combine the unique insights from all three planners.
+3. MERGE DUPLICATES: Each notebook name must appear ONLY ONCE in your JSON. If multiple models suggested the same notebook, merge their sub-questions into a single, highly detailed, multi-part investigation query for that notebook.
+4. VALIDATION: Return ONLY a valid JSON object with {"status": "READY", "notebooks": [...]}.
+
+### DRAFT PLANS:
+GEMINI: ${JSON.stringify(gPlan)}
+DEEPSEEK: ${JSON.stringify(dPlan)}
+QWEN: ${JSON.stringify(qPlan)}
+
+Return ONLY JSON. No explanation. No markdown.`;
+
+  const synthResponse = await askGemini(geminiPage, synthPrompt, [], (msg) =>
+    onStatus(`[Synthesis] ${msg}`),
+  );
+  try {
+    const cleaned = synthResponse.replace(/```json|```/g, "").trim();
+    const s = cleaned.indexOf("{");
+    const e = cleaned.lastIndexOf("}");
+    return JSON.parse(cleaned.slice(s, e + 1));
+  } catch {
+    return gPlan.status === "READY"
+      ? gPlan
+      : dPlan.status === "READY"
+        ? dPlan
+        : qPlan;
+  }
+}
+
+async function collectRelevantFiles(
+  page: Page,
+  query: string,
+  notebookPlans: any[],
+  outDir: string,
+): Promise<string[]> {
+  const allFiles = new Set<string>();
+
+  const notebooksPath = path.join(outDir, "notebooks.json");
+  let notebooks: any[] = [];
+  if (fs.existsSync(notebooksPath)) {
+    try {
+      notebooks = JSON.parse(fs.readFileSync(notebooksPath, "utf-8"));
+    } catch (err) {
+      console.error("[NotebookLM] Failed to parse notebooks.json:", err);
     }
   }
 
-  return answers.join("\n---\n\n");
+  for (const plan of notebookPlans) {
+    const plannedName = plan.name;
+    const subQuestion = plan.sub_question;
+
+    const nb = notebooks.find(
+      (n) => n.name === plannedName || n.title === plannedName,
+    );
+    if (!nb) {
+      console.warn(
+        `[NotebookLM] Planner requested unknown notebook: ${plannedName}`,
+      );
+      continue;
+    }
+
+    console.log(
+      `[ORCHESTRATOR] Querying NotebookLM: "${nb.title}" with ${nb.localFiles?.length || 0} files...`,
+    );
+    const files = await automateSubQuestion(
+      page,
+      nb.title,
+      getNotebookSubQuestionPrompt(subQuestion),
+      nb.localFiles,
+    );
+
+    if (Array.isArray(files)) {
+      console.log(
+        `[ORCHESTRATOR] NotebookLM "${nb.title}" returned ${files.length} files.`,
+      );
+      files.forEach((f) => {
+        if (f !== "notebook_instructions.txt" && f !== "00_manifest.txt") {
+          allFiles.add(f);
+        }
+      });
+    }
+  }
+
+  console.log(
+    `[ORCHESTRATOR] Total unique context files gathered from NotebookLM: ${allFiles.size}`,
+  );
+  return Array.from(allFiles);
 }
 
 export async function GET(req: Request) {
@@ -576,20 +525,17 @@ export async function POST(req: Request) {
   try {
     const { query, repoContext, owner, repo, tree, defaultBranch } =
       await req.json();
-
     const taskId = Math.random().toString(36).substring(7);
     activeJobs.set(taskId, { status: "pending" });
-
     const outDir = path.join(CONTEXT_DIR_PATH, owner, repo);
-    const gapNBPath = path.join(outDir, "gap_filler_NB.txt");
     const insightsPath = path.join(outDir, "phase2_insights.txt");
     const queryPromptPath = path.join(outDir, "QUERY_PROMPT.txt");
-
-    [gapNBPath, insightsPath, queryPromptPath].forEach((file) => {
+    [insightsPath, queryPromptPath].forEach((file) => {
       if (fs.existsSync(file)) fs.unlinkSync(file);
     });
 
     const processJob = async () => {
+      const manifestPath = path.join(outDir, "00_Root_Manifest.txt");
       let repoLang: RepoLanguage | undefined;
       try {
         const setStatus = (
@@ -598,1063 +544,548 @@ export async function POST(req: Request) {
           overrideProgress?: number,
         ) => {
           const job = activeJobs.get(taskId);
-          if (job) {
+          if (job)
             activeJobs.set(taskId, {
               ...job,
               statusText: msg,
               partialResult: partial,
               progress: overrideProgress,
             });
-          }
         };
 
-        // ── First-run: fetch repo and build notebook folders ───────────────
+        // ── Step 1: Clone repo and build notebooks (only on first run) ────────
         if (!fs.existsSync(outDir)) {
           fs.mkdirSync(outDir, { recursive: true });
-          setStatus("Resolving repository tree...");
-
-          const coreFiles = tree.filter((f: any) => {
-            const pLower = f.path.toLowerCase();
-            if (pLower.includes("node_modules/") || pLower.includes(".git/"))
-              return false;
-            if (
-              pLower.includes("dist/") ||
-              pLower.includes("build/") ||
-              pLower.includes("out/")
-            )
-              return false;
-            if (
-              pLower.includes("__snapshots__") ||
-              pLower.includes("fixtures/") ||
-              pLower.endsWith(".snap")
-            )
-              return false;
-            const ignoredExtensions = [
-              ".png",
-              ".jpg",
-              ".jpeg",
-              ".gif",
-              ".ico",
-              ".svg",
-              ".bmp",
-              ".webp",
-              ".mp4",
-              ".mp3",
-              ".wav",
-              ".zip",
-              ".tar",
-              ".gz",
-              ".pdf",
-              ".ttf",
-              ".woff",
-              ".woff2",
-              ".lock",
-              ".log",
-              ".DS_Store",
-              ".eslintcache",
-              ".sketch",
-            ];
-            const ignoredNames = [
-              ".playwright-auth.json",
-              "auth.json",
-              ".gitignore",
-              ".gitattributes",
-              ".gitmodules",
-              "package-lock.json",
-              "yarn.lock",
-              "pnpm-lock.yaml",
-              "composer.lock",
-              "Cargo.lock",
-              "poetry.lock",
-              "Gemfile.lock",
-            ];
-            return (
-              !ignoredExtensions.some((ext) => pLower.endsWith(ext)) &&
-              !ignoredNames.some((name) => pLower.endsWith(name))
+          const tmpRepoDir = path.join(outDir, `tmp_clone_${Date.now()}`);
+          setStatus("Cloning repository...");
+          try {
+            execSync(
+              `git clone --depth=1 https://github.com/${owner}/${repo}.git ${tmpRepoDir}`,
+              { stdio: "pipe" },
             );
-          });
+          } catch (cloneErr: any) {
+            console.error("[CLONE] git clone failed:", cloneErr.message);
+            activeJobs.set(taskId, {
+              status: "error",
+              error: `git clone failed: ${cloneErr.message}`,
+            });
+            return;
+          }
 
-          const contents = await fetchFileContents(
-            owner,
-            repo,
-            coreFiles,
-            defaultBranch || "main",
-            setStatus,
-          );
+          setStatus("Gathering repository metadata...");
+          const ignoredExtensions = [
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".ico",
+            ".svg",
+            ".bmp",
+            ".webp",
+            ".mp4",
+            ".mp3",
+            ".wav",
+            ".zip",
+            ".tar",
+            ".gz",
+            ".pdf",
+            ".ttf",
+            ".woff",
+            ".woff2",
+            ".lock",
+            ".log",
+            ".DS_Store",
+            ".eslintcache",
+            ".sketch",
+          ];
+          const ignoredNames = [
+            "package-lock.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "composer.lock",
+            "Cargo.lock",
+            "poetry.lock",
+            "Gemfile.lock",
+            ".gitignore",
+            ".gitattributes",
+          ];
+          const filesMetadata: any[] = [];
 
-          const fileSet = new Set<string>(coreFiles.map((f: any) => f.path));
+          const walkRepo = (dir: string) => {
+            let entries: string[];
+            try {
+              entries = fs.readdirSync(dir);
+            } catch {
+              return;
+            }
+            for (const entry of entries) {
+              const fullPath = path.join(dir, entry);
+              let stat: fs.Stats;
+              try {
+                stat = fs.statSync(fullPath);
+              } catch {
+                continue;
+              }
+              if (stat.isDirectory()) {
+                if ([".git", "node_modules", "vendor"].includes(entry))
+                  continue;
+                walkRepo(fullPath);
+                continue;
+              }
+              const relPath = path.relative(tmpRepoDir, fullPath);
+              const pLower = relPath.toLowerCase();
+              if (ignoredExtensions.some((ext) => pLower.endsWith(ext)))
+                continue;
+              if (ignoredNames.some((name) => pLower.endsWith(name))) continue;
+              if (stat.size > 500000) continue;
+              try {
+                const content = fs.readFileSync(fullPath, "utf-8");
+                filesMetadata.push({
+                  path: relPath,
+                  content,
+                  size: stat.size,
+                  name: entry,
+                  type: "file",
+                  ext: entry.split(".").pop() || "",
+                });
+              } catch {
+                continue;
+              }
+            }
+          };
+          walkRepo(tmpRepoDir);
+          console.log(`[CLONE] Collected ${filesMetadata.length} files`);
 
-          const metadata = Array.from(contents.entries()).map(([p, c]) => {
-            const analysis =
-              c.length < 500000
-                ? analyzeFile(p, c, fileSet)
-                : { imports: [] as string[] };
-            return { path: p, content: c, ...analysis };
-          });
+          setStatus("Building master context via Central Builder...");
+          const miniRepoContext = {
+            meta: { fullName: `${owner}/${repo}`, owner, name: repo },
+            stats: { extFrequency: {} },
+          };
 
-          const importGraph: Record<
-            string,
-            { imports: string[]; imported_by: string[] }
-          > = {};
-          for (const file of metadata) {
-            importGraph[file.path] = {
-              imports: (file as any).imports || [],
+          const fileSet = new Set<string>(filesMetadata.map((f) => f.path));
+          const importGraph: any = {};
+          for (const f of filesMetadata) {
+            const analysis = analyzeFile(f.path, f.content, fileSet);
+            importGraph[f.path] = {
+              imports: analysis.imports,
               imported_by: [],
             };
           }
-          for (const file in importGraph) {
-            for (const dep of importGraph[file].imports) {
-              if (importGraph[dep]) importGraph[dep].imported_by.push(file);
-            }
-          }
 
-          setStatus("Chunking and structuring contexts...");
-          const { lang: detectedLang } = await buildMasterContext(
-            query,
-            metadata,
-            importGraph,
-            repoContext,
-            undefined,
+          await buildMasterContext(
             outDir,
-            true,
+            filesMetadata,
+            importGraph,
+            miniRepoContext,
+            query,
+            undefined, // expertPlan
+            true, // dumpAll
           );
-          repoLang = detectedLang;
+
+          // Cleanup raw clone
+          fs.rmSync(tmpRepoDir, { recursive: true, force: true });
+          setStatus("Context built. Starting planning...");
         }
 
+        // ── Step 2: Intelligent Triple-Model Planning ────────────────────────
         const context = await getOrCreateContext();
-        const manifestPath = path.join(outDir, "00_Root_Manifest.txt");
-        const metaFilePath = path.join(outDir, "01_Meta.txt");
+        const repoUrl = `https://github.com/${owner}/${repo}`;
+        const rootManifestContent = fs.readFileSync(manifestPath, "utf-8");
+        const readmePath = path.join(outDir, "README.md");
+        const notebooksPath = path.join(outDir, "notebooks.json");
+        const symbolsPath = path.join(outDir, "symbols.json");
+        const plannerFiles = [manifestPath];
+        if (fs.existsSync(readmePath)) plannerFiles.push(readmePath);
+        if (fs.existsSync(notebooksPath)) plannerFiles.push(notebooksPath);
 
-        // ── Score notebooks for this query ────────────────────────────────
-        setStatus("Scoring notebooks for query relevance...");
-        const notebookScores = scoreNotebooksForQuery(outDir, query);
-
-        console.log("[SCORER] outDir:", outDir);
-        console.log(
-          "[SCORER] scores:",
-          JSON.stringify(
-            notebookScores.map((s) => ({
-              name: s.notebookName,
-              tier: s.tier,
-              score: s.score,
-            })),
-          ),
-        );
-
-        const relevanceSection = buildQueryRelevanceSection(
-          notebookScores,
+        const plan = await runTriplePlanner(
+          context,
           query,
-        );
-        const annotatedManifestPath = path.join(
+          rootManifestContent,
+          repoUrl,
+          defaultBranch,
+          plannerFiles,
           outDir,
-          "00_Root_Manifest_Annotated.txt",
-        );
-        const rawManifest = fs.readFileSync(manifestPath, "utf-8");
-        fs.writeFileSync(
-          annotatedManifestPath,
-          relevanceSection + "\n\n---\n\n" + rawManifest,
-          "utf-8",
+          (msg) => setStatus(msg),
         );
 
-        // ── Derive notebook plan from scorer ──────────────────────────────
-        setStatus("Deriving notebook plan from relevance scores...");
-        const notebookPlan = deriveNotebookPlan(notebookScores, query);
+        if (plan.status === "GENERIC") {
+          setStatus("Generic question detected. Redirecting to ChatGPT...");
+          const readmePath = path.join(outDir, "README.md");
+          const readme = fs.existsSync(readmePath)
+            ? fs.readFileSync(readmePath, "utf-8")
+            : "";
+          const manifest = rootManifestContent.slice(0, 10000);
 
-        if (!notebookPlan.notebooks || notebookPlan.notebooks.length === 0) {
+          const chatGPTPrompt = `You are a Staff Systems Engineer analyzing a repository.
+
+### REPOSITORY CONTEXT
+README Summary:
+${readme.slice(0, 2000)}
+
+Root Manifest:
+${manifest}
+
+### USER QUERY
+${query}
+
+Provide a structured, deeply insightful answer based on the provided context. If the query asks for architecture, explain the high-level flows. If it asks what the repo is for, describe its core value and stack.`;
+
+          const chatPage =
+            context.pages().find((p) => p.url().includes("chatgpt.com")) ||
+            (await context.newPage());
+          const genericResult = await automateChatGPT(
+            chatPage,
+            chatGPTPrompt,
+            (msg) => setStatus(`[ChatGPT] ${msg}`),
+          );
+
           activeJobs.set(taskId, {
-            status: "error",
-            error:
-              "Scorer found no relevant notebooks for this query. The repo may need to be re-fetched.",
+            status: "done",
+            result: genericResult,
+            answerSource: "final",
           });
           return;
         }
 
-        // ── TRIAGE STEP ───────────────────────────────────────────────────
-        setStatus("Running NotebookLM Triage...");
+        if (plan.status === "FAILED") {
+          activeJobs.set(taskId, {
+            status: "error",
+            error:
+              "Gemini planner failed to generate a valid investigation plan.",
+          });
+          return;
+        }
 
-        let triagePage = context
+        // ── Step 3: Collect relevant files via NotebookLM ────────────────────
+        setStatus("NotebookLM is gathering evidence...");
+        let notebookPage = context
           .pages()
           .find((p: any) => p.url()?.includes("notebooklm.google.com"));
-        if (!triagePage) triagePage = await context.newPage();
+        if (!notebookPage) notebookPage = await context.newPage();
 
-        const triagePromptCmd = getTriagePrompt(query);
-        const triagePromptPath = path.join(outDir, "TRIAGE_PROMPT.txt");
-        fs.writeFileSync(triagePromptPath, triagePromptCmd, "utf-8");
-
-        const topFilesPaths = notebookPlan.notebooks
-          .flatMap((nb: any) => nb.covers || [])
-          .map((f: string) => path.join(outDir, "source_mirror", f))
-          .filter((f: string) => fs.existsSync(f))
-          .slice(0, 10);
-
-        const triageFiles: string[] = [triagePromptPath, annotatedManifestPath];
-        const triageContentBlocks: string[] = [];
-
-        for (const mirrorPath of topFilesPaths) {
-          if (fs.statSync(mirrorPath).isDirectory()) continue;
-          const relPathStr = path.relative(
-            path.join(outDir, "source_mirror"),
-            mirrorPath,
-          );
-          const content = fs.readFileSync(mirrorPath, "utf-8");
-          triageContentBlocks.push(
-            `// --- SOURCE FILE: ${relPathStr} ---\n${content}\n`,
-          );
-        }
-
-        if (triageContentBlocks.length > 0) {
-          const combinedTriagePath = path.join(
-            outDir,
-            "triage_source_context.txt",
-          );
-          fs.writeFileSync(
-            combinedTriagePath,
-            triageContentBlocks.join("\n\n"),
-            "utf-8",
-          );
-          triageFiles.push(combinedTriagePath);
-          console.log(
-            `[TRIAGE] Bundled ${triageContentBlocks.length} files into triage_source_context.txt`,
-          );
-        }
-
-        const triageTitle = `@${repo} - [Triage]`;
-        let triageJsonStr = "";
-        try {
-          triageJsonStr = await automateNotebookLM(
-            triagePage,
-            triageFiles,
-            "Execute the instructions in TRIAGE_PROMPT.txt. Output JSON only.",
-            triageTitle,
-            setStatus,
-            true,
-            [triagePromptPath],
-          );
-        } catch (err: any) {
-          console.warn("[TRIAGE] Failed:", err.message);
-        }
-
-        let parsedTriage: any = null;
-        if (triageJsonStr) {
-          try {
-            const cleanedJson = triageJsonStr
-              .replace(/```(?:json)?\s*/gi, "")
-              .replace(/```/g, "")
-              .trim();
-            const start = cleanedJson.indexOf("{");
-            const end = cleanedJson.lastIndexOf("}");
-            if (start !== -1 && end !== -1 && end > start) {
-              parsedTriage = JSON.parse(
-                cleanedJson.slice(start, end + 1).replace(/[\x00-\x1F]+/g, " "),
-              );
-            }
-          } catch (err) {
-            console.warn("[TRIAGE] Failed to parse JSON:", err);
-          }
-        }
-
-        let phase2Insights = "";
-
-        if (parsedTriage && parsedTriage.intent === "FIX") {
-          setStatus(
-            "Triage determined intent is FIX. Fast-tracking to DeepSeek...",
-          );
-        } else {
-          // ── Phase 2: query each selected notebook ─────────────────────────
-          setStatus("Consulting NotebookLM...");
-          phase2Insights = await processNotebookPlan(
-            context,
-            notebookPlan,
-            outDir,
-            repo,
-            repoLang,
-            (msg, part, prog) => setStatus(msg, part, prog),
-          );
-        }
-
-        // ── Phase 3: final synthesis loop with gap fill ───────────────────
-        setStatus("Running final phase 3 synthesis...");
-        const finalInsightsPath = path.join(outDir, "phase2_insights.txt");
-        const finalNotebookTitle = `@${repo} - [final answer]`;
-        const MAX_GAP_FILLS = 3;
-        let hasGapFilled = false;
-        let currentInsights = phase2Insights;
-        const filledSymbols = new Set<string>();
-
-        const roadmapPath = path.join(outDir, "graph.json");
-        let roadmapHeader = "";
-        try {
-          if (fs.existsSync(roadmapPath)) {
-            const graphData = JSON.parse(fs.readFileSync(roadmapPath, "utf-8"));
-            const entries = Object.entries(graphData) as [
-              string,
-              { imports: string[]; imported_by: string[] },
-            ][];
-
-            const entryPoints = entries
-              .filter(([, info]) => info.imported_by.length === 0)
-              .map(([p]) => p)
-              .slice(0, 5);
-
-            const sinks = entries
-              .filter(([, info]) => info.imports.length === 0)
-              .map(([p]) => p)
-              .slice(0, 5);
-
-            const hubFiles = entries
-              .sort(
-                ([, a], [, b]) => b.imported_by.length - a.imported_by.length,
-              )
-              .slice(0, 5)
-              .map(
-                ([p, info]) => `${p} (${info.imported_by.length} consumers)`,
-              );
-
-            roadmapHeader = [
-              `### SYSTEM ROADMAP`,
-              ``,
-              `**Primary Entry Points (no upstream imports):** ${entryPoints.join(", ") || "none detected"}`,
-              `**Terminal Sinks (no imports):** ${sinks.join(", ") || "none detected"}`,
-              `**Most-Consumed Hub Files:** ${hubFiles.join("; ") || "none detected"}`,
-              `**Total files in dependency graph:** ${entries.length}`,
-              `(Full bidirectional graph available in graph.json and 00_Root_Manifest.txt)`,
-              ``,
-              `---`,
-              ``,
-            ].join("\n");
-          }
-        } catch (_) {}
-
-        if (fs.existsSync(finalInsightsPath)) fs.unlinkSync(finalInsightsPath);
-        fs.writeFileSync(
-          finalInsightsPath,
-          roadmapHeader + currentInsights,
-          "utf-8",
+        const contextFiles = await collectRelevantFiles(
+          notebookPage,
+          query,
+          plan.notebooks || [],
+          outDir,
         );
 
-        for (let attempts = 0; attempts <= MAX_GAP_FILLS; attempts++) {
-          const sourceFileRegex = /file_\d{3}_NB\d+\.txt/g;
-          const matches = [...currentInsights.matchAll(sourceFileRegex)];
-          const uniqueSourceFiles = Array.from(
-            new Set(matches.map((m) => m[0])),
+        // ── Step 4: Final Synthesis Setup ─────────────────────────────────────
+        setStatus("Building precise code context for model orchestration...");
+        const dsBaseContextDir = path.join(outDir, "deepseek_context");
+        if (fs.existsSync(dsBaseContextDir))
+          fs.rmSync(dsBaseContextDir, { recursive: true, force: true });
+        fs.mkdirSync(dsBaseContextDir, { recursive: true });
+
+        // Fetch the collected files (individual files for upload)
+        for (let i = 0; i < contextFiles.length; i++) {
+          const filePath = contextFiles[i];
+          const content = await fetchFile(
+            outDir,
+            owner,
+            repo,
+            defaultBranch,
+            filePath,
           );
-
-          const finalPhaseFiles: string[] = [];
-          for (const fileName of uniqueSourceFiles) {
-            const nbMatch = fileName.match(/_NB(\d+)\.txt$/);
-            if (nbMatch) {
-              const nbNum = parseInt(nbMatch[1], 10);
-              const folderName = `notebook_${String(nbNum).padStart(2, "0")}`;
-              const filePath = path.join(outDir, folderName, fileName);
-              if (fs.existsSync(filePath)) finalPhaseFiles.push(filePath);
-            }
-          }
-
-          // [PINNING] Combine pinned source files from ALL notebooks in the plan
-          // into batched text bundles to respect NotebookLM's 50-file limit.
-          const sourceMirrorDir = path.join(outDir, "source_mirror");
-          if (fs.existsSync(sourceMirrorDir)) {
-            const pinnedSet = new Set<string>();
-            const pinnedContentBlocks: string[] = [];
-
-            for (const nb of notebookPlan.notebooks) {
-              for (const coveredFile of nb.covers ?? []) {
-                const mirrorPath = path.join(sourceMirrorDir, coveredFile);
-                if (fs.existsSync(mirrorPath) && !pinnedSet.has(mirrorPath)) {
-                  if (fs.statSync(mirrorPath).isDirectory()) continue;
-                  pinnedSet.add(mirrorPath);
-                  const content = fs.readFileSync(mirrorPath, "utf-8");
-                  pinnedContentBlocks.push(
-                    `// --- INITIAL SOURCE FILE: ${coveredFile} ---\n${content}\n`,
-                  );
-                }
-              }
-            }
-
-            const BUNDLE_MAX_FILES = 20;
-            if (pinnedContentBlocks.length > 0) {
-              for (
-                let i = 0;
-                i < pinnedContentBlocks.length;
-                i += BUNDLE_MAX_FILES
-              ) {
-                const chunk = pinnedContentBlocks.slice(
-                  i,
-                  i + BUNDLE_MAX_FILES,
-                );
-                const chunkPath = path.join(
-                  outDir,
-                  `pinned_source_context_part_${Math.floor(i / BUNDLE_MAX_FILES) + 1}.txt`,
-                );
-                fs.writeFileSync(chunkPath, chunk.join("\n\n"), "utf-8");
-                finalPhaseFiles.push(chunkPath);
-                console.log(
-                  `[NOTEBOOK-FINAL] Bundled ${chunk.length} pinned files into ${path.basename(chunkPath)}`,
-                );
-              }
-            }
-          }
-          finalPhaseFiles.push(finalInsightsPath);
-          if (fs.existsSync(gapNBPath)) finalPhaseFiles.push(gapNBPath);
-          if (notebookPlan.include_meta && fs.existsSync(metaFilePath)) {
-            finalPhaseFiles.push(metaFilePath);
-          }
-
-          const finalPhasePrompt = getFinalPhasePrompt(query, hasGapFilled);
-          fs.writeFileSync(queryPromptPath, finalPhasePrompt, "utf-8");
-          finalPhaseFiles.unshift(queryPromptPath);
-
-          const chatTrigger =
-            "Execute the full instructions from QUERY_PROMPT.txt. Output JSON only.";
-
-          let page = context
-            .pages()
-            .find((p: any) => p.url()?.includes("notebooklm.google.com"));
-          if (!page) page = await context.newPage();
-
-          let structuralJsonResult = "";
-          if (parsedTriage && parsedTriage.intent === "FIX" && attempts === 0) {
-            structuralJsonResult = JSON.stringify(parsedTriage);
-            setStatus(
-              "Bypassing NotebookLM Phase 3 — injecting Triage JSON for DeepSeek...",
-            );
-          } else {
-            structuralJsonResult = await automateNotebookLM(
-              page,
-              finalPhaseFiles,
-              chatTrigger,
-              finalNotebookTitle,
-              setStatus,
-              true,
-              [finalInsightsPath, gapNBPath, queryPromptPath],
-            );
-          }
-
-          let parsedGap: MissingContextResult | null = null;
-          let parsedPathA: FinalPhaseResult | null = null;
-          try {
-            let jsonString = structuralJsonResult
-              .replace(new RegExp("```(?:json)?\\s*", "gi"), "")
-              .replace(new RegExp("```", "g"), "")
-              .trim();
-            const start = jsonString.indexOf("{");
-            const end = jsonString.lastIndexOf("}");
-            if (start !== -1 && end !== -1 && end > start) {
-              const cleanedJson = jsonString
-                .slice(start, end + 1)
-                .replace(/[\x00-\x1F]+/g, " ");
-              const resultJson = JSON.parse(cleanedJson);
-
-              if (resultJson.status === "MISSING_CONTEXT") {
-                parsedGap = resultJson as MissingContextResult;
-              } else if (
-                resultJson.files ||
-                resultJson.call_chains ||
-                resultJson.intent === "FIX"
-              ) {
-                parsedPathA = resultJson as FinalPhaseResult;
-
-                if (resultJson.intent === "FIX") {
-                  setStatus("Building precise code context for Deepseek...");
-
-                  const rootManifestContent = fs.existsSync(manifestPath)
-                    ? fs.readFileSync(manifestPath, "utf-8")
-                    : "// [WARNING] Root manifest not found.";
-
-                  const dsPromptString = getDeepseekCodingPrompt({
-                    userQuery: query,
-                  });
-
-                  let deepPage = context
-                    .pages()
-                    .find((p: any) => p.url()?.includes("chat.deepseek.com"));
-                  if (!deepPage) deepPage = await context.newPage();
-
-                  let qwenPage = context
-                    .pages()
-                    .find((p: any) => p.url()?.includes("chat.qwen.ai"));
-                  if (!qwenPage) qwenPage = await context.newPage();
-
-                  const MAX_DS_GAP_FILLS = 2;
-                  const dsFilledSymbols = new Set<string>();
-                  let currentPathBJson = resultJson;
-
-                  const dsBaseContextDir = path.join(
-                    outDir,
-                    "deepseek_context",
-                  );
-                  if (fs.existsSync(dsBaseContextDir)) {
-                    fs.rmSync(dsBaseContextDir, {
-                      recursive: true,
-                      force: true,
-                    });
-                  }
-                  fs.mkdirSync(dsBaseContextDir, { recursive: true });
-
-                  // Build base context ONCE
-                  buildDeepseekContext(currentPathBJson, outDir);
-
-                  for (
-                    let dsAttempt = 0;
-                    dsAttempt <= MAX_DS_GAP_FILLS;
-                    dsAttempt++
-                  ) {
-                    const turnUploadDir = path.join(
-                      outDir,
-                      `ds_upload_${dsAttempt}`,
-                    );
-                    if (!fs.existsSync(turnUploadDir)) {
-                      fs.mkdirSync(turnUploadDir, { recursive: true });
-                    }
-
-                    // Copy base context (context.js, symbols.txt, manifest.txt) to THIS turn's upload folder.
-                    // This ensures DeepSeek doesn't lose the user's query or the original source mirror on Turn 1+.
-                    if (fs.existsSync(dsBaseContextDir)) {
-                      for (const f of fs.readdirSync(dsBaseContextDir)) {
-                        fs.copyFileSync(
-                          path.join(dsBaseContextDir, f),
-                          path.join(turnUploadDir, f),
-                        );
-                      }
-                    }
-
-                    setStatus(
-                      dsAttempt === 0
-                        ? "Routing Path B payload to Deepseek..."
-                        : `Deepseek gap fill attempt ${dsAttempt} — retrying with newly extracted requested context...`,
-                    );
-
-                    const turnPrompt =
-                      dsAttempt === 0
-                        ? dsPromptString
-                        : "Here is the requested missing context extracted from the codebase. Please re-evaluate the logic and output only the final JSON as before.";
-
-                    let dsRaw = "";
-                    let qwenRaw = "";
-                    try {
-                      // Execute DeepSeek first
-                      console.log("[ORCHESTRATOR] Starting DeepSeek...");
-                      dsRaw = await askDeepseek(
-                        deepPage,
-                        turnPrompt,
-                        rootManifestContent,
-                        turnUploadDir,
-                        (msg, partial, prog) =>
-                          setStatus(`[Deepseek] ${msg}`, partial, prog),
-                        outDir,
-                        dsAttempt === 0,
-                      );
-
-                      // Then execute Qwen
-                      console.log("[ORCHESTRATOR] Starting Qwen...");
-                      qwenRaw = await askQwen(
-                        qwenPage,
-                        turnPrompt,
-                        rootManifestContent,
-                        turnUploadDir,
-                        (msg, partial, prog) =>
-                          setStatus(`[Qwen] ${msg}`, partial, prog),
-                        outDir,
-                        dsAttempt === 0,
-                      );
-                    } catch (err: any) {
-                      console.warn(
-                        "[Automator] Error during sequential execution:",
-                        err.message,
-                      );
-                      // Try to recover if at least one succeeded
-                      if (!dsRaw && !qwenRaw) {
-                        activeJobs.set(taskId, {
-                          status: "error",
-                          error: err.message,
-                        });
-                        return;
-                      }
-                    }
-
-                    // ── Check if DeepSeek needs more context ───────────────
-                    let dsNeedsMore = false;
-                    try {
-                      const cleanedDs = dsRaw
-                        .replace(new RegExp("```(?:json)?\\s*", "gi"), "")
-                        .replace(new RegExp("```", "g"), "")
-                        .trim();
-                      const dsStart = cleanedDs.indexOf("{");
-                      const dsEnd = cleanedDs.lastIndexOf("}");
-                      if (dsStart !== -1 && dsEnd !== -1 && dsEnd > dsStart) {
-                        const dsParsed = JSON.parse(
-                          cleanedDs.slice(dsStart, dsEnd + 1),
-                        );
-
-                        if (
-                          dsParsed.status === "NEED_MORE_CONTEXT" &&
-                          Array.isArray(dsParsed.missing_symbols) &&
-                          dsParsed.missing_symbols.length > 0 &&
-                          dsAttempt < MAX_DS_GAP_FILLS
-                        ) {
-                          dsNeedsMore = true;
-                          const symbolsToFetch: Array<{
-                            name: string;
-                            source_file: string;
-                          }> = dsParsed.missing_symbols;
-
-                          setStatus(
-                            `Deepseek requested: ${symbolsToFetch.map((s: any) => s.name).join(", ")} — fetching...`,
-                          );
-
-                          // ── Stub detection helpers ────────────────────────────────────────────
-                          const STUB_SIGNALS = [
-                            /throw new Error\(['"`]Not implemented/i,
-                            /\/\/ stub/i,
-                            /\/\/ not implemented/i,
-                            /^\s*\/\/ \[GAP FILE TOO LARGE/m,
-                            /^\s*\/\/ \[WHOLE-FILE FALLBACK\]/m,
-                          ];
-
-                          function isStubContent(content: string): boolean {
-                            // If the meaningful non-comment, non-whitespace lines are very few
-                            const meaningfulLines = content
-                              .split("\n")
-                              .filter(
-                                (l) => l.trim() && !l.trim().startsWith("//"),
-                              );
-                            if (meaningfulLines.length < 5) return true;
-                            return STUB_SIGNALS.some((re) => re.test(content));
-                          }
-
-                          // ── Accumulate gap bundles, skip stubs ────────────────────────────────
-                          const gapBundles: string[] = [];
-                          const skippedStubs: string[] = [];
-
-                          for (const sym of symbolsToFetch) {
-                            if (
-                              sym.name.includes("/") ||
-                              sym.name.match(/\.[jt]sx?$/)
-                            ) {
-                              const baseName = path
-                                .basename(sym.name)
-                                .replace(/\.[jt]sx?$/, "");
-                              sym.name =
-                                baseName.charAt(0).toUpperCase() +
-                                baseName.slice(1);
-                              console.warn(
-                                `[DS-GAP] Normalized path-as-name → "${sym.name}"`,
-                              );
-                            }
-                            const symKey =
-                              `${sym.name}|${sym.source_file}`.toLowerCase();
-                            if (dsFilledSymbols.has(symKey)) {
-                              console.warn(
-                                `[DS-GAP] Already filled "${sym.name}" — skipping.`,
-                              );
-                              continue;
-                            }
-                            dsFilledSymbols.add(symKey);
-
-                            console.log("[DS-GAP] outDir:", outDir);
-                            console.log("[DS-GAP] sym.name:", sym.name);
-                            console.log(
-                              "[DS-GAP] sym.source_file:",
-                              sym.source_file,
-                            );
-                            console.log(
-                              "[DS-GAP] source_mirror exists:",
-                              fs.existsSync(path.join(outDir, "source_mirror")),
-                            );
-                            console.log(
-                              "[DS-GAP] target file exists:",
-                              fs.existsSync(
-                                path.join(
-                                  outDir,
-                                  "source_mirror",
-                                  sym.source_file,
-                                ),
-                              ),
-                            );
-
-                            const { gapAnalysisBundle } =
-                              generateGapFillerNotebook(
-                                outDir,
-                                sym.name,
-                                sym.source_file,
-                                [],
-                                sym.source_file,
-                                currentPathBJson.context_files || [],
-                              );
-
-                            if (!gapAnalysisBundle) {
-                              console.warn(
-                                `[DS-GAP] No bundle generated for "${sym.name}".`,
-                              );
-                              continue;
-                            }
-
-                            if (isStubContent(gapAnalysisBundle)) {
-                              console.warn(
-                                `[DS-GAP] Stub detected for "${sym.name}" in ${sym.source_file} — skipping to avoid loop.`,
-                              );
-                              skippedStubs.push(
-                                `${sym.name} (${sym.source_file}): stub or not implemented`,
-                              );
-                              continue;
-                            }
-
-                            gapBundles.push(
-                              `// Gap-filled: ${sym.name} from ${sym.source_file}\n\n${gapAnalysisBundle}`,
-                            );
-                            console.log(
-                              `[DS-GAP] Accepted gap bundle for "${sym.name}"`,
-                            );
-                          }
-
-                          // ── If everything was stubs, abort the gap fill loop ─────────────────
-                          if (gapBundles.length === 0) {
-                            console.warn(
-                              `[DS-GAP] All requested symbols were stubs or already filled. Forcing final output.`,
-                            );
-                            dsNeedsMore = false;
-
-                            const stubNote =
-                              skippedStubs.length > 0
-                                ? `\n\n// [GAP-FILL ABORTED] The following symbols resolved to stubs (not implemented) and cannot be filled:\n` +
-                                  skippedStubs
-                                    .map((s) => `// - ${s}`)
-                                    .join("\n")
-                                : "";
-
-                            // Append stub note to context.js so DeepSeek sees why we stopped
-                            const ctxPath = path.join(
-                              outDir,
-                              "deepseek_context",
-                              "context.js",
-                            );
-                            if (fs.existsSync(ctxPath)) {
-                              fs.appendFileSync(ctxPath, stubNote, "utf-8");
-                            }
-
-                            // Don't loop again — fall through to final output with what we have
-                            activeJobs.set(taskId, {
-                              status: "done",
-                              result: dsRaw,
-                              answerSource: "final",
-                            });
-                            return;
-                          }
-
-                          // ── Write gap_filler.txt directly to the NEXT turn's upload folder ──
-                          const nextTurnDir = path.join(
-                            outDir,
-                            `ds_upload_${dsAttempt + 1}`,
-                          );
-                          fs.mkdirSync(nextTurnDir, { recursive: true });
-
-                          const gapFillerPath = path.join(
-                            nextTurnDir,
-                            "gap_filler.txt",
-                          );
-                          fs.writeFileSync(
-                            gapFillerPath,
-                            gapBundles.join("\n\n---\n\n"),
-                            "utf-8",
-                          );
-                          console.log(
-                            `[DS-GAP] Wrote gap_filler.txt to ${nextTurnDir}`,
-                          );
-                        }
-                      }
-                    } catch {
-                      // Not JSON or not NEED_MORE_CONTEXT — treat as final output
-                    }
-
-                    if (!dsNeedsMore) {
-                      const combinedResult = [
-                        `// =============================================================================`,
-                        `// DEEPSEEK RESPONSE`,
-                        `// =============================================================================`,
-                        dsRaw,
-                        ``,
-                        `// =============================================================================`,
-                        `// QWEN RESPONSE`,
-                        `// =============================================================================`,
-                        qwenRaw,
-                      ].join("\n");
-
-                      const combinedPath = path.join(
-                        outDir,
-                        "combined_responses.txt",
-                      );
-                      fs.writeFileSync(combinedPath, combinedResult, "utf-8");
-                      console.log(
-                        `[ORCHESTRATOR] Saved combined responses to ${combinedPath}`,
-                      );
-
-                      let finalResult = combinedResult;
-                      try {
-                        const geminiPage =
-                          context
-                            .pages()
-                            .find((p) =>
-                              p.url().includes("gemini.google.com"),
-                            ) || (await context.newPage());
-                        const synthesisPrompt = getGeminiSynthesisPrompt();
-
-                        setStatus(
-                          "Uploading combined proposals to Gemini for final synthesis...",
-                        );
-                        const synthesisRaw = await askGemini(
-                          geminiPage,
-                          synthesisPrompt,
-                          [combinedPath],
-                          (msg) => setStatus(`[Gemini] ${msg}`),
-                        );
-
-                        // Save the synthesized result for debugging and final output
-                        const finalSynthesisPath = path.join(
-                          outDir,
-                          "final_synthesis.txt",
-                        );
-                        fs.writeFileSync(
-                          finalSynthesisPath,
-                          synthesisRaw,
-                          "utf-8",
-                        );
-                        console.log(
-                          `[ORCHESTRATOR] Saved final synthesis to ${finalSynthesisPath}`,
-                        );
-
-                        // Use only the synthesized code for the final result
-                        finalResult = synthesisRaw;
-                      } catch (geminiErr: any) {
-                        console.warn(
-                          "[Gemini] Synthesis failed, falling back to combined responses:",
-                          geminiErr.message,
-                        );
-                      }
-
-                      activeJobs.set(taskId, {
-                        status: "done",
-                        result: finalResult,
-                        answerSource: "final",
-                      });
-                      return;
-                    }
-                  }
-
-                  // Exhausted DeepSeek gap fill attempts
-                  activeJobs.set(taskId, {
-                    status: "done",
-                    result:
-                      "DeepSeek requested more context but gap fill limit was reached. Check deepseek_context/ folder.",
-                    answerSource: "final",
-                  });
-                  return;
-                }
-
-                if (parsedPathA.coverage_gaps?.length > 0) {
-                  console.info(
-                    `[FINAL-PHASE] PATH A coverage gaps (non-breaking):`,
-                    parsedPathA.coverage_gaps,
-                  );
-                }
-              }
-            }
-          } catch (parseErr: any) {
-            console.warn(
-              `[FINAL-PHASE] JSON parse failed on attempt ${attempts}:`,
-              parseErr.message,
-            );
-          }
-
-          if (!parsedGap || attempts >= MAX_GAP_FILLS) {
-            let finalResult = structuralJsonResult;
-
-            try {
-              if (structuralJsonResult.trim().startsWith("{")) {
-                setStatus(
-                  "Requesting Staff-Level Engineering Manual from ChatGPT...",
-                );
-                const chatgptPrompt = getStaffEngineerPrompt(
-                  query,
-                  parsedPathA
-                    ? JSON.stringify(parsedPathA, null, 2)
-                    : structuralJsonResult,
-                );
-
-                let chatPage = context
-                  .pages()
-                  .find((p: any) => p.url()?.includes("chatgpt.com"));
-                if (!chatPage) chatPage = await context.newPage();
-
-                const manual = await automateChatGPT(
-                  chatPage,
-                  chatgptPrompt,
-                  (msg) => setStatus(`[ChatGPT] ${msg}`),
-                );
-                finalResult = manual;
-              }
-            } catch (chatgptErr: any) {
-              console.warn(
-                "[ChatGPT Automator] Failed to generate manual:",
-                chatgptErr.message,
-              );
-            }
-
-            activeJobs.set(taskId, {
-              status: "done",
-              result: finalResult,
-              answerSource: "final",
-            });
-            return;
-          }
-
-          // ── Gap fill ───────────────────────────────────────────────────
-          const { target_symbol, search_keywords, last_known_node } =
-            parsedGap.missing_link;
-
-          const target_file =
-            last_known_node ||
-            (parsedGap.missing_link as any).target_file ||
-            "";
-
-          const gapKeywords: string[] = Array.isArray(search_keywords)
-            ? search_keywords
-            : [];
-
-          setStatus(
-            `Gap detected: ${
-              Array.isArray(target_symbol)
-                ? target_symbol.join(", ")
-                : target_symbol
-            }${last_known_node ? ` (last known node: ${last_known_node})` : ""}. Scouting sources...`,
+          const safeName = filePath.replace(/[^a-zA-Z0-9_-]/g, "_");
+          fs.writeFileSync(
+            path.join(
+              dsBaseContextDir,
+              `file_${i.toString().padStart(2, "0")}_${safeName}.js`,
+            ),
+            content,
+            "utf-8",
           );
-
-          const symbolList: string[] = Array.isArray(target_symbol)
-            ? target_symbol
-            : (target_symbol || "")
-                .toString()
-                .split(",")
-                .map((s: string) => s.trim())
-                .filter(Boolean);
-
-          const gapKey =
-            symbolList
-              .map((s) => s.trim().toLowerCase())
-              .sort()
-              .join("|") +
-            "|" +
-            (target_file || "").toLowerCase();
-
-          if (filledSymbols.has(gapKey)) {
-            console.warn(
-              `[GAP-FILLER] Symbol "${target_symbol}" was already gap-filled. Forcing synthesis.`,
-            );
-            let finalResult = currentInsights;
-            try {
-              const chatgptPrompt = getStaffEngineerPrompt(
-                query,
-                currentInsights,
-              );
-              let chatPage = context
-                .pages()
-                .find((p: any) => p.url()?.includes("chatgpt.com"));
-              if (!chatPage) chatPage = await context.newPage();
-              finalResult = await automateChatGPT(
-                chatPage,
-                chatgptPrompt,
-                (msg) => setStatus(`[ChatGPT] ${msg}`),
-              );
-            } catch {
-              /* use currentInsights as fallback */
-            }
-            activeJobs.set(taskId, {
-              status: "done",
-              result: finalResult,
-              answerSource: "chatgpt",
-            });
-            return;
-          }
-          filledSymbols.add(gapKey);
-
-          const mergedSourceFiles = new Set<string>();
-          let mergedBundle = "";
-
-          const plannerContextFiles: string[] = (
-            notebookPlan.notebooks ?? []
-          ).flatMap((nb) => nb.covers ?? []);
-
-          for (const sym of symbolList) {
-            const { gapSourceFiles: sf, gapAnalysisBundle: ab } =
-              generateGapFillerNotebook(
-                outDir,
-                sym.toString(),
-                target_file.toString(),
-                gapKeywords,
-                last_known_node,
-                plannerContextFiles,
-              );
-            sf.forEach((f) => mergedSourceFiles.add(f));
-            if (ab) mergedBundle += ab + "\n\n";
-          }
-
-          const gapSourceFiles = Array.from(mergedSourceFiles);
-          const gapAnalysisBundle = mergedBundle.trim();
-
-          if (gapSourceFiles.length === 0) {
-            console.warn(
-              `[GAP-FILLER] No source files found for "${target_symbol}". Falling back to ChatGPT.`,
-            );
-            let finalResult = currentInsights;
-            try {
-              setStatus(
-                "Gap unresolvable — synthesizing from phase2 insights...",
-              );
-              const chatgptPrompt = getStaffEngineerPrompt(
-                query,
-                currentInsights,
-              );
-              let chatPage = context
-                .pages()
-                .find((p: any) => p.url()?.includes("chatgpt.com"));
-              if (!chatPage) chatPage = await context.newPage();
-              const manual = await automateChatGPT(
-                chatPage,
-                chatgptPrompt,
-                (msg) => setStatus(`[ChatGPT] ${msg}`),
-              );
-              finalResult = manual;
-            } catch (chatgptErr: any) {
-              console.warn("[ChatGPT Fallback] Failed:", chatgptErr.message);
-            }
-            activeJobs.set(taskId, {
-              status: "done",
-              result: finalResult,
-              answerSource: "chatgpt",
-            });
-            return;
-          }
-
-          if (fs.existsSync(gapNBPath)) {
-            const existingGap = fs.readFileSync(gapNBPath, "utf-8");
-            fs.writeFileSync(
-              gapNBPath,
-              existingGap + "\n\n" + gapAnalysisBundle,
-              "utf-8",
-            );
-          } else {
-            fs.writeFileSync(gapNBPath, gapAnalysisBundle, "utf-8");
-          }
-
-          const filesList = gapSourceFiles
-            .map((f) => path.basename(f))
-            .join(", ");
-          const breadcrumb = `\n\n### [GAP-FILLER ATTEMPT ${attempts + 1}]\n- **Target**: ${target_symbol}\n- **Status**: Full source extracted to gap_filler_NB.txt.\n- **Resolved Files**: ${filesList}.\n- **IMPORTANT FOR AI**: The implementation of \`${target_symbol}\` is now in gap_filler_NB.txt. Do NOT declare a gap for this symbol again.\n`;
-
-          currentInsights =
-            fs.readFileSync(finalInsightsPath, "utf-8") + breadcrumb;
-          fs.writeFileSync(finalInsightsPath, currentInsights, "utf-8");
-          hasGapFilled = true;
         }
+
+        // ── Step 5: Model Orchestration Loop ──────────────────────────────────
+        const dsPromptString = getDeepseekCodingPrompt({
+          userQuery: query,
+          mode: "FIX",
+        });
+
+        let deepPage = context
+          .pages()
+          .find((p: any) => p.url()?.includes("chat.deepseek.com"));
+        if (!deepPage) deepPage = await context.newPage();
+        let qwenPage = context
+          .pages()
+          .find((p: any) => p.url()?.includes("chat.qwen.ai"));
+        if (!qwenPage) qwenPage = await context.newPage();
+
+        let dsDone = false;
+        let qwenDone = false;
+        let dsRaw = "";
+        let qwenRaw = "";
+        const dsFilledSymbols = new Set<string>();
+        const qwenFilledSymbols = new Set<string>();
+        const dsUploadedHashes = new Map<string, string>();
+        const qwenUploadedHashes = new Map<string, string>();
+
+        const dsInvestDir = path.join(outDir, "ds_investigation");
+        const qwenInvestDir = path.join(outDir, "qwen_investigation");
+        fs.mkdirSync(dsInvestDir, { recursive: true });
+        fs.mkdirSync(qwenInvestDir, { recursive: true });
+
+        let dsAttempt = 0;
+        while (!dsDone || !qwenDone) {
+          if (dsAttempt > 50) {
+            console.warn("[ORCHESTRATOR] Safety break: reached 50 turns.");
+            break;
+          }
+
+          const dsTurnDir = dsDone
+            ? ""
+            : prepareTurnDir(
+                outDir,
+                "ds",
+                dsAttempt,
+                dsBaseContextDir,
+                dsInvestDir,
+                dsUploadedHashes,
+              );
+          const qwenTurnDir = qwenDone
+            ? ""
+            : prepareTurnDir(
+                outDir,
+                "qwen",
+                dsAttempt,
+                dsBaseContextDir,
+                qwenInvestDir,
+                qwenUploadedHashes,
+              );
+
+          const dsNewFilesCount = dsDone ? 0 : fs.readdirSync(dsTurnDir).length;
+          const qwenNewFilesCount = qwenDone
+            ? 0
+            : fs.readdirSync(qwenTurnDir).length;
+
+          console.log(
+            `[ORCHESTRATOR] Starting Turn ${dsAttempt} in parallel...`,
+          );
+          setStatus(
+            `Turn ${dsAttempt} [DS: ${dsDone ? "✓" : "pending"}, Qwen: ${qwenDone ? "✓" : "pending"}]`,
+          );
+
+          const turnPrompt =
+            dsAttempt === 0
+              ? dsPromptString
+              : "Here are the files you requested. Please continue with your investigation.";
+
+          // Parallel Execution with allSettled — both models run concurrently
+          const [dsRes, qwenRes] = await Promise.allSettled([
+            !dsDone && (dsAttempt === 0 || dsNewFilesCount > 0)
+              ? askDeepseek(
+                  deepPage!,
+                  turnPrompt,
+                  rootManifestContent,
+                  dsTurnDir,
+                  (msg, partial, prog) =>
+                    setStatus(`[Deepseek] ${msg}`, partial, prog),
+                  outDir,
+                  dsAttempt === 0,
+                )
+              : Promise.resolve(dsRaw),
+            !qwenDone && (dsAttempt === 0 || qwenNewFilesCount > 0)
+              ? askQwen(
+                  qwenPage!,
+                  turnPrompt,
+                  rootManifestContent,
+                  qwenTurnDir,
+                  (msg, partial, prog) =>
+                    setStatus(`[Qwen] ${msg}`, partial, prog),
+                  outDir,
+                  dsAttempt === 0,
+                )
+              : Promise.resolve(qwenRaw),
+          ]);
+
+          if (dsRes.status === "fulfilled") {
+            // ONLY update dsRaw if we actually made a call!
+            // If dsRes was bypassed, it resolved with the existing dsRaw anyway.
+            if (!dsDone && (dsAttempt === 0 || dsNewFilesCount > 0)) {
+               dsRaw = dsRes.value;
+            }
+          } else {
+            console.warn("[ORCHESTRATOR] DeepSeek error:", dsRes.reason);
+            dsDone = true; // Abort DS if it errored to escape loop
+          }
+          if (qwenRes.status === "fulfilled") {
+            if (!qwenDone && (dsAttempt === 0 || qwenNewFilesCount > 0)) {
+               qwenRaw = qwenRes.value;
+            }
+          } else {
+            console.warn("[ORCHESTRATOR] Qwen error:", qwenRes.reason);
+            qwenDone = true;
+          }
+
+          if (!dsDone) {
+            try {
+              if (!dsRaw) {
+                console.warn(
+                  "[ORCHESTRATOR] DeepSeek raw response is empty. Retrying next turn...",
+                );
+              } else {
+                const cleaned = dsRaw.replace(/```json|```/g, "").trim();
+                const s = cleaned.indexOf("{");
+                const e = cleaned.lastIndexOf("}");
+                if (s !== -1 && e > s) {
+                  const data = JSON.parse(cleaned.slice(s, e + 1));
+                  if (data.status === "NEED_MORE_CONTEXT") {
+                    const mFiles = data.missing_files || data.missing_symbols;
+                    const realCount = await fillMissingFiles(
+                      mFiles,
+                      dsFilledSymbols,
+                      "DeepSeek",
+                      dsInvestDir,
+                      owner,
+                      repo,
+                      defaultBranch,
+                    );
+                    if (realCount === 0) {
+                      console.log(
+                        "[ORCHESTRATOR] DeepSeek: No new context files. Done.",
+                      );
+                      dsDone = true;
+                    }
+                  } else {
+                    console.log(
+                      `[ORCHESTRATOR] DeepSeek: Status ${data.status}. Done.`,
+                    );
+                    dsDone = true;
+                  }
+                } else {
+                  console.warn(
+                    "[ORCHESTRATOR] DeepSeek: No JSON in response. Marking done.",
+                  );
+                  dsDone = true;
+                }
+              }
+            } catch (err: any) {
+              console.error(
+                "[ORCHESTRATOR] DeepSeek parse error:",
+                err.message,
+              );
+            }
+          }
+
+          if (!qwenDone) {
+            try {
+              if (!qwenRaw) {
+                console.warn(
+                  "[ORCHESTRATOR] Qwen raw response is empty. Retrying next turn...",
+                );
+              } else {
+                const cleaned = qwenRaw.replace(/```json|```/g, "").trim();
+                const s = cleaned.indexOf("{");
+                const e = cleaned.lastIndexOf("}");
+                if (s !== -1 && e > s) {
+                  const data = JSON.parse(cleaned.slice(s, e + 1));
+                  if (data.status === "NEED_MORE_CONTEXT") {
+                    const mFiles = data.missing_files || data.missing_symbols;
+                    const realCount = await fillMissingFiles(
+                      mFiles,
+                      qwenFilledSymbols,
+                      "Qwen",
+                      qwenInvestDir,
+                      owner,
+                      repo,
+                      defaultBranch,
+                    );
+                    if (realCount === 0) {
+                      console.log(
+                        "[ORCHESTRATOR] Qwen: No new context files. Done.",
+                      );
+                      qwenDone = true;
+                    }
+                  } else {
+                    console.log(
+                      `[ORCHESTRATOR] Qwen: Status ${data.status}. Done.`,
+                    );
+                    qwenDone = true;
+                  }
+                } else {
+                  console.warn(
+                    "[ORCHESTRATOR] Qwen: No JSON in response. Marking done.",
+                  );
+                  qwenDone = true;
+                }
+              }
+            } catch (err: any) {
+              console.error("[ORCHESTRATOR] Qwen parse error:", err.message);
+            }
+          }
+          dsAttempt++;
+        }
+
+        console.log(
+          `[ORCHESTRATOR] Loop finished after ${dsAttempt} turns. DS: ${dsDone}, Qwen: ${qwenDone}`,
+        );
+
+        // Close orchestration tabs before final synthesis
+        await Promise.allSettled([deepPage.close(), qwenPage.close()]);
+
+        // ── Step 6: Final Synthesis ───────────────────────────────────────────
+
+        const checkInvalid = (raw: string) => {
+          if (!raw) return false;
+          try {
+            const cleaned = raw.replace(/```json|```/g, "").trim();
+            const s = cleaned.indexOf("{");
+            const e = cleaned.lastIndexOf("}");
+            if (s !== -1 && e > s) {
+              const data = JSON.parse(cleaned.slice(s, e + 1));
+              return data.status === "INVALID_QUESTION";
+            }
+          } catch {}
+          return false;
+        };
+
+        if (checkInvalid(dsRaw) && checkInvalid(qwenRaw)) {
+          console.log(
+            "[ORCHESTRATOR] Both agents returned INVALID_QUESTION. Aborting synthesis.",
+          );
+          activeJobs.set(taskId, {
+            status: "done",
+            result: `Both investigation agents evaluated your query and determined it is an INVALID_QUESTION.\n\n### DeepSeek:\n${dsRaw}\n\n### Qwen:\n${qwenRaw}`,
+            answerSource: "final",
+          });
+          return;
+        }
+
+        const combinedResult = [
+          "// DEEPSEEK RESPONSE",
+          dsRaw || "// [No response]",
+          "",
+          "// QWEN RESPONSE",
+          qwenRaw || "// [No response]",
+        ].join("\n");
+
+        const combinedPath = path.join(outDir, "combined_responses.txt");
+        fs.writeFileSync(combinedPath, combinedResult, "utf-8");
+
+        setStatus("Synthesizing final answer with Gemini...");
+        const geminiPage =
+          context.pages().find((p) => p.url().includes("gemini.google.com")) ||
+          (await context.newPage());
+
+        const synthesisFiles = [combinedPath];
+
+        const finalResult = await askGemini(
+          geminiPage,
+          getGeminiSynthesisPrompt({ synthesisPrompt: query }),
+          synthesisFiles,
+          (msg) => setStatus(`[Gemini] ${msg}`),
+        );
+
+        activeJobs.set(taskId, {
+          status: "done",
+          result: finalResult,
+          answerSource: "final",
+        });
       } catch (err: any) {
+        console.error("[PROCESS-JOB] Error:", err);
         activeJobs.set(taskId, { status: "error", error: err.message });
       }
     };

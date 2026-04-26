@@ -59,7 +59,7 @@ export async function askDeepseek(
 
     // graph.json is excluded — 68k+ lines for Postgres, irrelevant for function-level fixes.
     // Dependency info is already embedded in context.js via // --- Source: ... --- headers.
-    const rootMetadata = ["00_Root_Manifest_Annotated.txt", "symbols.json"];
+    const rootMetadata = ["00_Root_Manifest.txt", "symbols.json"];
 
     // ── Determine query-relevant symbols from the already-written context.js ─
     // This lets us filter symbols.json to only entries that are actually in scope.
@@ -153,38 +153,11 @@ export async function askDeepseek(
           `[Deepseek] Staged Metadata: ${fileName} (from ${metadataBase})`,
         );
       } else {
-        // If annotated manifest not found, try raw manifest as fallback
-        if (fileName === "00_Root_Manifest_Annotated.txt") {
-          const fallback = path.join(metadataBase, "00_Root_Manifest.txt");
-          if (fs.existsSync(fallback)) {
-            const content = fs.readFileSync(fallback, "utf-8");
-            const tmpPath = path.join(
-              sessionDir,
-              "00_Root_Manifest_Annotated.txt",
-            );
-            fs.writeFileSync(tmpPath, content, "utf-8");
-            allTmpPaths.push(tmpPath);
-            console.log(
-              `[Deepseek] Staged Metadata: 00_Root_Manifest.txt as fallback (from ${metadataBase})`,
-            );
-          } else {
-            console.error(
-              `[Deepseek] CRITICAL: Neither annotated nor raw manifest found in ${metadataBase}`,
-            );
-          }
-        } else {
-          console.error(
-            `[Deepseek] CRITICAL: ${fileName} NOT FOUND at ${filePath}`,
-          );
-        }
+        console.error(
+          `[Deepseek] CRITICAL: ${fileName} NOT FOUND at ${filePath}`,
+        );
       }
     }
-
-    // ── 4. Stage Session Manifest ────────────────────────────────────────────
-    const manifestTmpPath = path.join(sessionDir, "manifest.txt");
-    fs.writeFileSync(manifestTmpPath, manifestContent, "utf-8");
-    allTmpPaths.push(manifestTmpPath);
-    console.log(`[Deepseek] Staged Session Manifest → manifest.txt`);
   }
 
   // ── 5. Single Atomic Upload ──────────────────────────────────────────────
@@ -222,66 +195,95 @@ async function uploadFilesToDeepseek(
 ): Promise<void> {
   if (filePaths.length === 0) return;
 
-  const attachSelectors = [
-    'button[aria-label*="attach" i]',
-    'button[aria-label*="upload" i]',
-    'button[aria-label*="file" i]',
-    'label[for*="file" i]',
-    'button[data-testid*="attach" i]',
-    'button svg[data-icon="paperclip"]',
-  ];
+  const attemptUpload = async () => {
+    // Upload files sequentially (1-by-1) to avoid freezing DeepSeek's document parser queue
+    for (const file of filePaths) {
+      const attachSelectors = [
+        'button[aria-label*="attach" i]',
+        'button[aria-label*="upload" i]',
+        'button[aria-label*="file" i]',
+        'label[for*="file" i]',
+        'button[data-testid*="attach" i]',
+        'button svg[data-icon="paperclip"]',
+      ];
 
-  let fileInput = await page.$('input[type="file"]');
+      let fileInput = await page.$('input[type="file"]');
 
-  if (!fileInput) {
-    for (const sel of attachSelectors) {
-      try {
-        const btn = await page.$(sel);
-        if (btn) {
-          await btn.click();
-          await page.waitForTimeout(500);
-          fileInput = await page.$('input[type="file"]');
-          if (fileInput) break;
+      if (!fileInput) {
+        for (const sel of attachSelectors) {
+          try {
+            const btn = await page.$(sel);
+            if (btn) {
+              await btn.click();
+              await page.waitForTimeout(500);
+              fileInput = await page.$('input[type="file"]');
+              if (fileInput) break;
+            }
+          } catch {}
         }
-      } catch {}
-    }
-  }
-
-  if (!fileInput) {
-    fileInput = (await page.evaluateHandle(() => {
-      const inputs = Array.from(
-        document.querySelectorAll('input[type="file"]'),
-      );
-      const el = inputs[0] as HTMLInputElement | undefined;
-      if (el) {
-        el.style.display = "block";
-        el.style.opacity = "1";
-        el.style.position = "fixed";
-        el.style.top = "0";
-        el.style.left = "0";
-        el.style.zIndex = "99999";
       }
-      return el ?? null;
-    })) as any;
-  }
 
-  if (!fileInput) {
-    throw new Error(
-      "Could not find a file input on DeepSeek. Context will not be attached.",
-    );
-  }
+      if (!fileInput) {
+        fileInput = (await page.evaluateHandle(() => {
+          const inputs = Array.from(
+            document.querySelectorAll('input[type="file"]'),
+          );
+          const el = inputs[0] as HTMLInputElement | undefined;
+          if (el) {
+            el.style.display = "block";
+            el.style.opacity = "1";
+            el.style.position = "fixed";
+            el.style.top = "0";
+            el.style.left = "0";
+            el.style.zIndex = "99999";
+          }
+          return el ?? null;
+        })) as any;
+      }
 
-  // Pass all paths at once — Playwright handles multi-file upload atomically
-  await fileInput.setInputFiles(filePaths);
+      if (!fileInput) {
+        throw new Error("Could not find a file input on DeepSeek.");
+      }
+
+      // Upload one file at a time
+      await fileInput.setInputFiles([file]);
+
+      // Give the UI a moment to insert the file chip
+      await page.waitForTimeout(1000);
+
+      // Proper Checker: Look specifically for indicator text on file items
+      await page.waitForFunction(() => {
+        const fileChips = Array.from(
+          document.querySelectorAll('[class*="file"], [class*="upload"], [class*="attach"]')
+        );
+        for (const chip of fileChips) {
+          const text = (chip as HTMLElement).innerText?.toLowerCase() || "";
+          if (
+            text.includes("pending") ||
+            text.includes("parsing") ||
+            text.includes("uploading") ||
+            text.includes("loading")
+          ) {
+            return false;
+          }
+        }
+        
+        // Also ensure no active global spinner
+        return !document.querySelector('[class*="uploading"], [class*="spinner"], .ds-loading');
+      }, { timeout: 60000 }).catch(() => {
+        // Assume partial success if it timed out and keep iterating
+      });
+      
+      await page.waitForTimeout(1000);
+    }
+  };
 
   try {
-    await page.waitForSelector(
-      '[class*="upload"], [class*="attach"], [class*="file-preview"], [aria-label*="uploaded" i]',
-      { timeout: 20000 },
+    await attemptUpload();
+  } catch (err: any) {
+    console.warn(
+      `[Deepseek] Upload attempt timed out. Continuing assuming partial success...`,
     );
-    await page.waitForTimeout(2000);
-  } catch {
-    await page.waitForTimeout(3000);
   }
 }
 
@@ -291,33 +293,52 @@ async function typeAndSubmit(page: Page, message: string): Promise<void> {
   const inputSelector = '#chat-input, textarea, [contenteditable="true"]';
   await page.waitForSelector(inputSelector, { timeout: 30000 });
 
-  const tagName = await page.$eval(inputSelector, (el) =>
-    el.tagName.toLowerCase(),
-  );
+  const inputLocator = page.locator(inputSelector).first();
 
-  if (tagName === "textarea") {
-    await page.fill(inputSelector, message);
-  } else {
-    await page.click(inputSelector);
-    await page.keyboard.press("Control+a");
-    await page.keyboard.press("Delete");
-    await page.waitForTimeout(100);
+  // Ensure the input area is clear and we are focused
+  await inputLocator.click();
+
+  try {
+    // Locator.fill supports contenteditable in Playwright
+    await inputLocator.fill(message);
+  } catch {
+    // Fallback if fill fails for some reason
     await page.evaluate((text) => {
       const el = document.querySelector(
         '#chat-input, textarea, [contenteditable="true"]',
       ) as HTMLElement;
       if (el) {
-        el.focus();
-        if (el.getAttribute("contenteditable") !== null) {
-          el.innerText = text;
-          el.dispatchEvent(new Event("input", { bubbles: true }));
-        }
+        el.innerText = text;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
       }
     }, message);
   }
 
-  await page.waitForTimeout(400);
-  await page.keyboard.press("Enter");
+  // Deepseek can block submission if uploading isn't technically complete
+  await page.waitForTimeout(1000);
+
+  // Try to find the send button and click it, fallback to Enter
+  const sendSelectors = [
+    'div.ds-icon-button[role="button"]:not([aria-disabled="true"])',
+    'button[aria-label*="send" i]',
+    'div[role="button"][style*="cursor: pointer"] svg',
+  ];
+
+  let clicked = false;
+  for (const sel of sendSelectors) {
+    try {
+      const btn = page.locator(sel).last();
+      if (await btn.isVisible()) {
+        await btn.click({ timeout: 2000, force: true });
+        clicked = true;
+        break;
+      }
+    } catch {}
+  }
+
+  if (!clicked) {
+    await page.keyboard.press("Enter");
+  }
 }
 
 // ─── Response polling ─────────────────────────────────────────────────────────

@@ -624,10 +624,17 @@ export async function automateNotebookLM(
   onStatus?.("Waiting for AI to respond...");
   const startTime = Date.now();
   let lastSeenLength = 0;
+  let lastActivityTime = Date.now();
   let stableCount = 0;
   const STABLE_POLLS_NEEDED = 2;
 
   while (Date.now() - startTime < 300000) {
+    if (Date.now() - lastActivityTime > 40000) {
+      console.log("[NotebookLM] Stuck for 40s without response. Re-sending sub-question...");
+      await page.fill(inputSelector, subQuestion);
+      await page.keyboard.press("Enter");
+      lastActivityTime = Date.now();
+    }
     const candidate = await page.evaluate<{
       text: string;
       isGenerating: boolean;
@@ -680,6 +687,10 @@ export async function automateNotebookLM(
       }
 
       const currentLength = rawText.length;
+      if (currentLength > lastSeenLength || candidate.isGenerating) {
+        lastActivityTime = Date.now();
+      }
+
       if (currentLength === lastSeenLength && !candidate.isGenerating) {
         stableCount++;
         if (stableCount >= STABLE_POLLS_NEEDED) {
@@ -759,3 +770,34 @@ export async function automateNotebookLM(
 
   throw new Error("Analysis timeout (5m)");
 }
+
+export async function automateSubQuestion(
+  page: Page,
+  notebookName: string,
+  prompt: string,
+  filePaths: string[] = [],
+): Promise<string[]> {
+  try {
+    const response = await automateNotebookLM(
+      page,
+      filePaths,
+      prompt,
+      notebookName,
+    );
+    console.log(`[NotebookLM] Raw response for "${notebookName}":\n${response}`);
+    const cleaned = response.replace(/```json|```/g, "").trim();
+    const s = cleaned.indexOf("[");
+    const e = cleaned.lastIndexOf("]");
+    if (s !== -1 && e > s) {
+      const result = JSON.parse(cleaned.slice(s, e + 1));
+      console.log(`[NotebookLM] Extracted ${result.length} files from "${notebookName}"`);
+      return result;
+    }
+    console.warn(`[NotebookLM] No JSON array found in response for "${notebookName}"`);
+    return [];
+  } catch (err: any) {
+    console.error(`[NotebookLM] Error during execution for "${notebookName}":`, err.message);
+    return [];
+  }
+}
+
