@@ -17,17 +17,17 @@ const MarkdownRenderer = ({ content }: { content: string }) => (
         <p className="mb-2 last:mb-0 leading-relaxed">{children}</p>
       ),
       h1: ({ children }) => (
-        <h1 className="font-bold text-[11px] text-slate-100 mt-3 mb-1 border-b border-slate-700 pb-1">
+        <h1 className="font-bold text-sm text-slate-100 mt-3 mb-1 border-b border-slate-700 pb-1">
           {children}
         </h1>
       ),
       h2: ({ children }) => (
-        <h2 className="font-bold text-[11px] text-slate-100 mt-3 mb-1">
+        <h2 className="font-bold text-[13px] text-slate-100 mt-3 mb-1">
           {children}
         </h2>
       ),
       h3: ({ children }) => (
-        <h3 className="font-semibold text-[10px] text-slate-200 mt-2 mb-1">
+        <h3 className="font-semibold text-xs text-slate-200 mt-2 mb-1">
           {children}
         </h3>
       ),
@@ -46,12 +46,12 @@ const MarkdownRenderer = ({ content }: { content: string }) => (
       ),
       code: ({ inline, children }: any) =>
         inline ? (
-          <code className="bg-slate-800 text-blue-300 px-1 py-0.5 rounded text-[9px] font-mono">
+          <code className="bg-slate-800 text-blue-300 px-1 py-0.5 rounded text-[11px] font-mono">
             {children}
           </code>
         ) : (
           <pre className="bg-slate-800/80 border border-slate-700 rounded p-2 mt-1 mb-2 overflow-x-auto">
-            <code className="text-[9px] text-blue-200 whitespace-pre font-mono">
+            <code className="text-[11px] text-blue-200 whitespace-pre font-mono">
               {children}
             </code>
           </pre>
@@ -274,15 +274,15 @@ const AiChat = ({ repoData }: AiChatProps) => {
   const repoName = repoCtx?.meta.name ?? repoData.metadata.name;
 
   return (
-    <div className="w-72 shrink-0 flex flex-col bg-gray-900 border border-gray-700 rounded-xl overflow-hidden h-full shadow-2xl">
+    <div className="w-[400px] shrink-0 flex flex-col bg-gray-900 border border-gray-700 rounded-xl overflow-hidden h-full shadow-2xl">
       <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between bg-gray-950/50">
         <div className="flex items-center gap-1.5">
           <Cpu size={12} className="text-blue-500" />
-          <span className="text-[9px] font-mono font-bold text-gray-400 uppercase tracking-widest pt-0.5">
+          <span className="text-[11px] font-mono font-bold text-gray-400 uppercase tracking-widest pt-0.5">
             AI Agent
           </span>
         </div>
-        <span className="flex items-center gap-1 text-[10px] font-mono text-slate-400 truncate max-w-[130px] border border-gray-700 py-0.5 px-2 rounded-full">
+        <span className="flex items-center gap-1 text-[11px] font-mono text-slate-400 truncate max-w-[180px] border border-gray-700 py-0.5 px-2 rounded-full">
           <Github size={11} className="shrink-0 text-purple-400" />
           {repoName}
         </span>
@@ -290,7 +290,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
 
       <div className="flex-1 overflow-y-auto p-3 space-y-3">
         {messages.length === 0 && (
-          <p className="text-[10px] font-mono text-slate-600 text-center mt-6 leading-relaxed">
+          <p className="text-xs font-mono text-slate-600 text-center mt-6 leading-relaxed">
             Ask anything about this repo.
           </p>
         )}
@@ -301,7 +301,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
             className={`flex flex-col ${msg.role === "user" ? "items-end" : "items-start"}`}
           >
             <div
-              className={`max-w-[92%] p-2.5 rounded-lg text-[10px] font-mono leading-relaxed overflow-auto ${
+              className={`max-w-[95%] p-3 rounded-lg text-xs leading-relaxed overflow-auto ${
                 msg.role === "user"
                   ? "bg-blue-600/10 border border-blue-500/20 text-blue-100 whitespace-pre-wrap"
                   : "bg-slate-900/50 border border-slate-800 text-slate-300"
@@ -316,7 +316,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
                           size={10}
                           className="animate-spin text-blue-500/70 shrink-0"
                         />
-                        <span className="text-[9px] animate-pulse truncate">
+                        <span className="text-[11px] animate-pulse truncate">
                           {currentStatus || "Init Architect..."}
                         </span>
                       </div>
@@ -340,7 +340,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
                               size={10}
                               className="animate-spin text-blue-500/70 shrink-0"
                             />
-                            <span className="text-[9px] animate-pulse truncate">
+                            <span className="text-[11px] animate-pulse truncate">
                               {currentStatus || "Generating..."}
                             </span>
                           </div>
@@ -387,7 +387,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
             onChange={(e) => setInput(e.target.value)}
             disabled={isLoading}
             placeholder={isLoading ? "Generating..." : "Ask about this repo..."}
-            className="w-full bg-gray-950 border border-gray-700 text-[10px] font-mono text-slate-300 pl-3 pr-8 py-2 rounded-lg outline-none focus:border-blue-500/40 transition-all disabled:opacity-50"
+            className="w-full bg-gray-950 border border-gray-700 text-xs font-mono text-slate-300 pl-3 pr-8 py-2.5 rounded-lg outline-none focus:border-blue-500/40 transition-all disabled:opacity-50"
           />
           {isLoading ? (
             <button

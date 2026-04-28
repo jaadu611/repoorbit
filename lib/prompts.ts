@@ -331,11 +331,18 @@ Once ready, respond ONLY with:
   ]
 }
 
-OR, if the query is a generic question (e.g. "What is this repo about?", "Explain the architecture") that doesn't require deep code investigation or a specific fix, respond ONLY with:
+OR, if the query is a generic question (e.g. "What is this repo about?", "Explain the architecture") that doesn't require a specific bug fix or new feature implementation, respond with:
 {
   "status": "GENERIC",
-  "reason": "Brief explanation why this is a generic question"
+  "reason": "Brief explanation why this is a generic question",
+  "notebooks": [
+    {
+      "name": "notebook_03",
+      "sub_question": "A detailed question to extract a comprehensive textual explanation relevant to the main query from the source files of this notebook"
+    }
+  ]
 }
+Select the notebooks most likely to shed light on the generic question (e.g. entry points, architecture, core logic, configuration). Write sub-questions that ask for explanations, overviews, and data flows — not file lists.
 
 ### RULES
 - Use as many notebooks as necessary to ensure high-fidelity coverage and deep understanding of the problem space. Do not be limited by count if the repository complexity warrants it.
@@ -365,4 +372,20 @@ export function getNotebookSubQuestionPrompt(subQuestion: string): string {
 Sub-Question: ${subQuestion}
 
 REQUIRED OUTPUT FORMAT: Return ONLY a JSON array of specific file paths (string[]) from this notebook that are relevant to the sub-question. No explanation. No markdown fences. Example: ["dir/file1.go", "dir/file2.go"]`;
+}
+
+export function getGenericNotebookPrompt(subQuestion: string): string {
+  return `You are a specialist code analyst answering a high-level question about this codebase.
+Your answer must be based exclusively on the source files available in this notebook.
+
+### SUB-QUESTION
+${subQuestion}
+
+### RESPONSE RULES
+1. Answer in clear, structured prose — do NOT return a JSON array of file paths.
+2. Be specific: reference actual function names, file paths, data flows, and patterns found in the sources.
+3. Use markdown headers if the sub-question has multiple aspects.
+4. Aim for depth: explain the "why" and "how", not just the "what".
+5. If the notebook files do not contain enough information, explicitly state what is missing.
+6. Do not speculate beyond what the source files show.`;
 }

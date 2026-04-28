@@ -2,12 +2,12 @@ import { buildMasterContext } from "@/lib/contextBuilder";
 import path from "path";
 import fs from "fs";
 import { execSync } from "child_process";
-import { analyzeFile, fetchFileContents } from "@/lib/github";
+import { analyzeFile } from "@/lib/github";
 import {
   automateNotebookLM,
   automateSubQuestion,
 } from "@/lib/notebooklmAutomator";
-import { automateChatGPT, askChatGPTCoder } from "@/lib/chatgptAutomator";
+import { automateChatGPT } from "@/lib/chatgptAutomator";
 import { getOrCreateContext } from "@/lib/browser";
 import { askDeepseek } from "@/lib/deepseekAutomator";
 import { askQwen } from "@/lib/qwenAutomator";
@@ -19,19 +19,13 @@ import {
   getGeminiPlannerPrompt,
   getNotebookSubQuestionPrompt,
   getNotebookSystemInstruction,
+  getGenericNotebookPrompt,
 } from "@/lib/prompts";
 import { NextResponse } from "next/server";
 import { Page, BrowserContext } from "playwright";
-import {
-  JobStatus,
-  NotebookPlan,
-  RepoLanguage,
-  FinalPhaseResult,
-  MissingContextResult,
-} from "@/lib/types";
+import { JobStatus } from "@/lib/types";
 
 export const CONTEXT_DIR_PATH = "/tmp/notebooklm_sources";
-export const NOTEBOOKLM_URL = "https://notebooklm.google.com/";
 
 const GLOBAL_JOBS_KEY = Symbol.for("repoorbit.playwright.jobs");
 export const activeJobs: Map<string, JobStatus> =
@@ -77,7 +71,6 @@ async function fetchFile(
       const endIdx = end > 0 ? Math.min(lines.length - 1, end - 1) : lines.length - 1;
 
       const slice = lines.slice(startIdx, endIdx + 1);
-      
       // If they asked for a range, we give them what they asked for (up to 1500 lines)
       const MAX_RANGE_LIMIT = 1500;
       if (slice.length > MAX_RANGE_LIMIT) {
@@ -153,17 +146,6 @@ async function fillMissingFiles(
   return count;
 }
 
-function getStatusMessage(job: JobStatus): string {
-  const turn = job.turn === 0 ? "Initial" : `Turn ${job.turn}`;
-  if (job.status === "running") {
-    return `Agent is working (${turn}, step: ${job.step || "investigating"})...`;
-  }
-  if (job.status === "completed") {
-    return "Investigation complete. Synthesizing fix...";
-  }
-  return job.status || "Processing...";
-}
-
 function fileFingerprint(filePath: string): string {
   try {
     const content = fs.readFileSync(filePath, "utf-8");
@@ -171,28 +153,6 @@ function fileFingerprint(filePath: string): string {
   } catch {
     return `missing:${filePath}`;
   }
-}
-
-function filterNewFiles(
-  files: string[],
-  seenHashes: Map<string, string>,
-  modelName: string,
-): string[] {
-  const newFiles: string[] = [];
-  for (const f of files) {
-    if (!fs.existsSync(f)) continue;
-    const fname = path.basename(f);
-    const fp = fileFingerprint(f);
-    if (seenHashes.get(fname) === fp) {
-      console.log(
-        `[ORCHESTRATOR] ${modelName}: skipping already-uploaded "${fname}"`,
-      );
-      continue;
-    }
-    seenHashes.set(fname, fp);
-    newFiles.push(f);
-  }
-  return newFiles;
 }
 
 function prepareTurnDir(
@@ -318,10 +278,17 @@ async function runModelPlanner(
       const e = cleaned.lastIndexOf("}");
       if (s === -1) throw new Error("No JSON object found");
       plan = JSON.parse(cleaned.slice(s, e + 1));
-    } catch {
+    } catch (parseErr: any) {
+      console.warn(
+        `[${modelName} Planner] JSON parse FAILED (attempt ${attempts}): ${parseErr.message}`,
+      );
+      console.warn(
+        `[${modelName} Planner] Raw response (first 500 chars): ${response.substring(0, 500)}`,
+      );
       return { status: "FAILED", raw: response };
     }
 
+    console.log(`[${modelName} Planner] Parsed plan status: ${plan.status}`);
     if (plan.status === "READY" || plan.status === "GENERIC") return plan;
 
     if (plan.status === "NEED_FILE" && Array.isArray(plan.files)) {
@@ -343,12 +310,14 @@ async function runModelPlanner(
       attempts++;
       continue;
     }
+    console.warn(`[${modelName} Planner] Unhandled plan status "${plan.status}". Returning as-is.`);
     return plan;
   }
+  console.warn(`[${modelName} Planner] Exhausted all attempts without a final plan.`);
   return { status: "FAILED" };
 }
 
-async function runTriplePlanner(
+async function runDualPlanner(
   context: BrowserContext,
   query: string,
   manifestContent: string,
@@ -358,28 +327,14 @@ async function runTriplePlanner(
   outDir: string,
   onStatus: (msg: string) => void,
 ): Promise<any> {
-  const pages = await Promise.all([
-    context.newPage(), // Gemini
-    context.newPage(), // DeepSeek
-    context.newPage(), // Qwen
+  const [deepPage, qwenPage] = await Promise.all([
+    context.newPage(),
+    context.newPage(),
   ]);
 
-  const [geminiPage, deepPage, qwenPage] = pages;
+  onStatus("Dual-model planning initiated (DeepSeek + Qwen)...");
 
-  onStatus("Triple-model planning initiated (Gemini + DeepSeek + Qwen)...");
-
-  const results = await Promise.all([
-    runModelPlanner(
-      "Gemini",
-      geminiPage,
-      query,
-      manifestContent,
-      repoUrl,
-      defaultBranch,
-      plannerFiles,
-      outDir,
-      onStatus,
-    ),
+  const [dPlan, qPlan] = await Promise.all([
     runModelPlanner(
       "DeepSeek",
       deepPage,
@@ -404,33 +359,109 @@ async function runTriplePlanner(
     ),
   ]);
 
-  const [gPlan, dPlan, qPlan] = results;
+  console.log(
+    `[Dual Planner] Results — DeepSeek: ${dPlan.status}, Qwen: ${qPlan.status}`,
+  );
 
-  // Close non-Gemini planner tabs to save resources
+  // Close planner tabs to save resources
   await Promise.allSettled([deepPage.close(), qwenPage.close()]);
 
-  // If all failed, return failed
-  if (
-    gPlan.status === "FAILED" &&
-    dPlan.status === "FAILED" &&
-    qPlan.status === "FAILED"
-  ) {
+  // If both failed, return failed
+  if (dPlan.status === "FAILED" && qPlan.status === "FAILED") {
     return { status: "FAILED" };
   }
 
-  onStatus("Synthesizing unified plan with Gemini...");
-  const synthPrompt = `Synthesize these 3 investigation plans into a SINGLE, EXHAUSTIVE, and COMPREHENSIVE master plan.
+  // GENERIC routing: GENERIC wins when it has at least as many votes as READY
+  const plans = [dPlan, qPlan];
+  const genericVotes = plans.filter((p) => p.status === "GENERIC").length;
+  const readyVotes = plans.filter((p) => p.status === "READY").length;
+  if (genericVotes > 0 && genericVotes >= readyVotes) {
+    const genericReason = plans.find((p) => p.status === "GENERIC")?.reason;
+    onStatus(
+      `Generic question confirmed (${genericVotes}G vs ${readyVotes}R). Synthesizing notebook queries...`,
+    );
+
+    const allGenericNotebooks = plans
+      .filter((p) => Array.isArray(p.notebooks))
+      .flatMap((p) => p.notebooks as any[]);
+
+    if (allGenericNotebooks.length === 0) {
+      return { status: "GENERIC", reason: genericReason, notebooks: [] };
+    }
+
+    // Use Gemini ONLY for synthesis — open page on demand
+    const geminiPage =
+      context.pages().find((p) => p.url().includes("gemini.google.com")) ||
+      (await context.newPage());
+
+    const genericSynthPrompt = `You are merging notebook investigation queries for a high-level codebase question.
+Merge and deduplicate the following notebook sub-questions into a final list.
+Each notebook must appear ONLY ONCE with a single comprehensive, merged sub-question.
+
+### INPUT (from multiple planner agents):
+${JSON.stringify(allGenericNotebooks, null, 2)}
+
+Return ONLY valid JSON:
+{"status": "GENERIC", "notebooks": [{"name": "notebook_name", "sub_question": "merged question"}]}
+No explanation. No markdown.`;
+
+    const genericSynthResponse = await askGemini(
+      geminiPage,
+      genericSynthPrompt,
+      [],
+      (msg) => onStatus(`[Generic Synthesis] ${msg}`),
+    );
+    try {
+      const cleaned = genericSynthResponse.replace(/```json|```/g, "").trim();
+      const s = cleaned.indexOf("{");
+      const e = cleaned.lastIndexOf("}");
+      const parsed = JSON.parse(cleaned.slice(s, e + 1));
+      return {
+        status: "GENERIC",
+        reason: genericReason,
+        notebooks: parsed.notebooks || [],
+      };
+    } catch {
+      return {
+        status: "GENERIC",
+        reason: genericReason,
+        notebooks: allGenericNotebooks,
+      };
+    }
+  }
+
+  // Only feed READY plans into the synthesizer
+  const readyPlans: Record<string, any> = {};
+  if (dPlan.status === "READY") readyPlans["DEEPSEEK"] = dPlan;
+  if (qPlan.status === "READY") readyPlans["QWEN"] = qPlan;
+
+  // If only one planner returned READY, skip synthesis and use it directly
+  const readyEntries = Object.entries(readyPlans);
+  if (readyEntries.length === 1) {
+    onStatus(`Using ${readyEntries[0][0]}'s plan directly (only 1 READY).`);
+    return readyEntries[0][1];
+  }
+
+  // Both READY — synthesize with Gemini
+  const geminiPage =
+    context.pages().find((p) => p.url().includes("gemini.google.com")) ||
+    (await context.newPage());
+
+  const planEntries = readyEntries
+    .map(([name, plan]) => `${name}: ${JSON.stringify(plan)}`)
+    .join("\n");
+
+  onStatus(`Synthesizing unified plan with Gemini (${readyEntries.length}/2 READY plans)...`);
+  const synthPrompt = `Synthesize these investigation plans into a SINGLE, EXHAUSTIVE, and COMPREHENSIVE master plan.
 
 PRIORITY: MAXIMIZE COVERAGE
-1. MISSION: It is better to include an extra notebook than to miss the bug. If any agent (GEMINI, DEEPSEEK, or QWEN) identifies a specific notebook or logic area (e.g. storage, networking, specific integrations), INCLUDE IT in the final plan.
-2. DO NOT be overly selective. Combine the unique insights from all three planners.
+1. MISSION: It is better to include an extra notebook than to miss the bug. If any agent identifies a specific notebook or logic area, INCLUDE IT in the final plan.
+2. DO NOT be overly selective. Combine the unique insights from all planners.
 3. MERGE DUPLICATES: Each notebook name must appear ONLY ONCE in your JSON. If multiple models suggested the same notebook, merge their sub-questions into a single, highly detailed, multi-part investigation query for that notebook.
 4. VALIDATION: Return ONLY a valid JSON object with {"status": "READY", "notebooks": [...]}.
 
 ### DRAFT PLANS:
-GEMINI: ${JSON.stringify(gPlan)}
-DEEPSEEK: ${JSON.stringify(dPlan)}
-QWEN: ${JSON.stringify(qPlan)}
+${planEntries}
 
 Return ONLY JSON. No explanation. No markdown.`;
 
@@ -443,11 +474,11 @@ Return ONLY JSON. No explanation. No markdown.`;
     const e = cleaned.lastIndexOf("}");
     return JSON.parse(cleaned.slice(s, e + 1));
   } catch {
-    return gPlan.status === "READY"
-      ? gPlan
-      : dPlan.status === "READY"
-        ? dPlan
-        : qPlan;
+    return dPlan.status === "READY"
+      ? dPlan
+      : qPlan.status === "READY"
+        ? qPlan
+        : { status: "FAILED" };
   }
 }
 
@@ -511,6 +542,71 @@ async function collectRelevantFiles(
   return Array.from(allFiles);
 }
 
+// ─── Generic question deep analysis via NotebookLM ────────────────────────────
+
+async function collectGenericAnswers(
+  page: Page,
+  notebookPlans: any[],
+  outDir: string,
+  onStatus: (msg: string) => void,
+): Promise<{ sub_question: string; answer: string; notebook: string }[]> {
+  const answers: { sub_question: string; answer: string; notebook: string }[] =
+    [];
+
+  const notebooksPath = path.join(outDir, "notebooks.json");
+  let notebooks: any[] = [];
+  if (fs.existsSync(notebooksPath)) {
+    try {
+      notebooks = JSON.parse(fs.readFileSync(notebooksPath, "utf-8"));
+    } catch (err) {
+      console.error("[Generic] Failed to parse notebooks.json:", err);
+    }
+  }
+
+  for (const plan of notebookPlans) {
+    const plannedName = plan.name;
+    const subQuestion = plan.sub_question;
+
+    const nb = notebooks.find(
+      (n) => n.name === plannedName || n.title === plannedName,
+    );
+    if (!nb) {
+      console.warn(`[Generic] Unknown notebook: ${plannedName}`);
+      continue;
+    }
+
+    onStatus(`Querying notebook "${nb.title}" for deep context...`);
+    console.log(
+      `[GENERIC ORCHESTRATOR] Querying "${nb.title}" with ${nb.localFiles?.length || 0} files...`,
+    );
+
+    try {
+      const answer = await automateNotebookLM(
+        page,
+        nb.localFiles || [],
+        getGenericNotebookPrompt(subQuestion),
+        nb.title,
+        (msg) => onStatus(`[NotebookLM] ${msg}`),
+        false,
+      );
+
+      answers.push({ sub_question: subQuestion, answer, notebook: nb.title });
+      console.log(
+        `[GENERIC ORCHESTRATOR] Got answer from "${nb.title}" (${answer.length} chars)`,
+      );
+    } catch (err: any) {
+      console.error(`[Generic] Error querying "${nb.title}":`, err.message);
+      answers.push({
+        sub_question: subQuestion,
+        answer: `[Error retrieving answer: ${err.message}]`,
+        notebook: nb.title,
+      });
+    }
+  }
+
+  return answers;
+}
+
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const taskId = searchParams.get("taskId");
@@ -523,8 +619,7 @@ export async function GET(req: Request) {
 
 export async function POST(req: Request) {
   try {
-    const { query, repoContext, owner, repo, tree, defaultBranch } =
-      await req.json();
+    const { query, owner, repo, defaultBranch } = await req.json();
     const taskId = Math.random().toString(36).substring(7);
     activeJobs.set(taskId, { status: "pending" });
     const outDir = path.join(CONTEXT_DIR_PATH, owner, repo);
@@ -536,7 +631,7 @@ export async function POST(req: Request) {
 
     const processJob = async () => {
       const manifestPath = path.join(outDir, "00_Root_Manifest.txt");
-      let repoLang: RepoLanguage | undefined;
+
       try {
         const setStatus = (
           msg: string,
@@ -693,12 +788,12 @@ export async function POST(req: Request) {
         const rootManifestContent = fs.readFileSync(manifestPath, "utf-8");
         const readmePath = path.join(outDir, "README.md");
         const notebooksPath = path.join(outDir, "notebooks.json");
-        const symbolsPath = path.join(outDir, "symbols.json");
+
         const plannerFiles = [manifestPath];
         if (fs.existsSync(readmePath)) plannerFiles.push(readmePath);
         if (fs.existsSync(notebooksPath)) plannerFiles.push(notebooksPath);
 
-        const plan = await runTriplePlanner(
+        const plan = await runDualPlanner(
           context,
           query,
           rootManifestContent,
@@ -710,27 +805,46 @@ export async function POST(req: Request) {
         );
 
         if (plan.status === "GENERIC") {
-          setStatus("Generic question detected. Redirecting to ChatGPT...");
-          const readmePath = path.join(outDir, "README.md");
-          const readme = fs.existsSync(readmePath)
-            ? fs.readFileSync(readmePath, "utf-8")
-            : "";
-          const manifest = rootManifestContent.slice(0, 10000);
+          setStatus("Generic question: querying notebooks for deep codebase analysis...");
 
-          const chatGPTPrompt = `You are a Staff Systems Engineer analyzing a repository.
+          // ── Step 2b: Query each relevant notebook for a detailed text answer ───
+          let notebookPage = context
+            .pages()
+            .find((p: any) => p.url()?.includes("notebooklm.google.com"));
+          if (!notebookPage) notebookPage = await context.newPage();
 
-### REPOSITORY CONTEXT
-README Summary:
-${readme.slice(0, 2000)}
+          const genericAnswers = await collectGenericAnswers(
+            notebookPage,
+            plan.notebooks || [],
+            outDir,
+            (msg) => setStatus(msg),
+          );
 
-Root Manifest:
-${manifest}
+          // ── Step 2c: Build a rich synthesis prompt for ChatGPT ───────────────
+          const answersBlock =
+            genericAnswers.length > 0
+              ? genericAnswers
+                  .map(
+                    (a, i) =>
+                      `### Analysis ${i + 1} — ${a.notebook}\n**Sub-Question:** ${a.sub_question}\n\n${a.answer}`,
+                  )
+                  .join("\n\n---\n\n")
+              : "(No notebook analysis available — answering from general knowledge)";
 
-### USER QUERY
+          const chatGPTPrompt = `You are a Staff Systems Engineer synthesizing a comprehensive answer about a codebase.
+
+### MAIN QUESTION
 ${query}
 
-Provide a structured, deeply insightful answer based on the provided context. If the query asks for architecture, explain the high-level flows. If it asks what the repo is for, describe its core value and stack.`;
+### DEEP CODEBASE ANALYSIS
+The following are detailed analyses extracted from specialised notebooks, each targeting a specific aspect of the main question:
 
+${answersBlock}
+
+---
+Synthesize all the insights above into a single, cohesive, well-structured response to the main question. Be comprehensive and precise. Reference specific findings from the analyses above where relevant.`;
+
+          setStatus("Synthesizing final answer with ChatGPT...");
           const chatPage =
             context.pages().find((p) => p.url().includes("chatgpt.com")) ||
             (await context.newPage());
