@@ -25,74 +25,164 @@ const CODE_EXTENSIONS = new Set([
 
 async function uploadFiles(page: Page, filePaths: string[]): Promise<void> {
   const attemptUpload = async () => {
-    const plusBtnSelector =
-      '.message-input-container [class*="attach"], button[aria-label*="Attach" i], .mode-select, button:has(span[class*="plus"])';
-    const plusBtn = await page.waitForSelector(plusBtnSelector, {
-      timeout: 10_000,
+    console.log(`[Qwen] Uploading ${filePaths.length} file(s) as a batch...`);
+
+    const plusBtnSelector = [
+      ".mode-select",
+      '.message-input-container [class*="attach"]',
+      ".qwen-chat-input-attach-btn",
+      'button[aria-label*="Attach" i]',
+      'button:has(svg[data-icon="plus"])',
+      ".message-input-actions button:has(svg)",
+    ].join(", ");
+
+    const btn = await page.waitForSelector(plusBtnSelector, {
+      timeout: 15_000,
     });
+    const ariaLabel = await btn.getAttribute("aria-label");
+    console.log(`[Qwen] Using attach button: ${ariaLabel || "(no label)"}`);
 
     await page.click("textarea.message-input-textarea").catch(() => {});
-    await plusBtn.click({ force: true });
+    await btn.click({ force: true });
     await page.waitForTimeout(1000);
 
+    await page.setViewportSize({ width: 1280, height: 1000 });
+    await page.waitForTimeout(500);
+
     const ITEM_SELS = [
+      '.ant-dropdown-menu-item:has-text("Upload attachment")',
+      '.mode-select-common-item:has-text("Upload attachment")',
       'li:has-text("Upload")',
       '.ant-dropdown-menu-item:has-text("Upload")',
       "text=/Upload/i",
     ];
-    let uploadItem: any = null;
+    let foundSelector = "";
     for (const sel of ITEM_SELS) {
-      uploadItem = await page
-        .waitForSelector(sel, { timeout: 3000 })
+      const visible = await page
+        .waitForSelector(sel, { timeout: 2000 })
         .catch(() => null);
-      if (uploadItem) break;
+      if (visible) {
+        foundSelector = sel;
+        break;
+      }
     }
-    if (!uploadItem) throw new Error("Upload menu item not visible");
+    if (!foundSelector) throw new Error("Upload menu item not visible");
 
     const [fileChooser] = await Promise.all([
-      page.waitForEvent("filechooser", { timeout: 15_000 }),
-      uploadItem.click({ force: true }),
+      page.waitForEvent("filechooser", { timeout: 20_000 }),
+      (async () => {
+        const target = page.locator(foundSelector).first();
+        await target.scrollIntoViewIfNeeded().catch(() => {});
+        await page.waitForTimeout(500);
+        try {
+          await target.click({ force: true, timeout: 5000 });
+        } catch (err: any) {
+          console.warn(
+            `[Qwen] Standard click failed, falling back to evaluate: ${err.message}`,
+          );
+          await page.evaluate((sel) => {
+            const el = document.querySelector(sel) as HTMLElement;
+            if (el) el.click();
+          }, foundSelector);
+        }
+      })(),
     ]);
+
+    // Upload all files in this batch at once
     await fileChooser.setFiles(filePaths);
 
-    await page.waitForFunction(
-      (count) => {
-        const container =
-          document.querySelector(
-            '.message-input-container, .qwen-chat-input-container, [class*="input-container"]',
-          ) || document;
-        const chips = container.querySelectorAll(
-          '.anticon.fileitem-icon, .message-input-file-item, .ant-upload-list-item, [class*="file-item"]',
-        );
-        const isBusy = !!document.querySelector(
-          '.ant-progress-bg, .ant-upload-list-item-uploading, [class*="uploading"], .ant-btn-loading',
-        );
-        return chips.length >= count && !isBusy;
-      },
-      filePaths.length,
-      { timeout: 45_000 },
+    console.log(
+      `[Qwen] Files submitted. Waiting for ${filePaths.length} chips to parse...`,
     );
+
+    // Wait for the exact number of chips to appear AND for all loading indicators to vanish
+    await page
+      .waitForFunction(
+        (expectedCount) => {
+          const container =
+            document.querySelector(
+              '.message-input-container, .qwen-chat-input-container, [class*="input-container"], .qwen-chat-input',
+            ) || document;
+
+          const chips = container.querySelectorAll(
+            '.anticon.fileitem-icon, .message-input-file-item, .ant-upload-list-item, [class*="file-item"], .qwen-chat-input-file-list-item',
+          );
+
+          const hasLoading = !!document.querySelector(
+            '.ant-progress-bg, .ant-upload-list-item-uploading, [class*="uploading"], .ant-btn-loading, [class*="parsing"], .anticon-loading',
+          );
+
+          const allText = container.textContent?.toLowerCase() || "";
+          const isStillParsing =
+            allText.includes("parsing") || allText.includes("loading");
+
+          // We need the number of chips to match AND no busy indicators to be present
+          return (
+            chips.length >= expectedCount && !hasLoading && !isStillParsing
+          );
+        },
+        filePaths.length,
+        { timeout: 150_000 },
+      )
+      .catch((err) => {
+        console.warn(
+          `[Qwen] Warning: Timeout wait for chips/parsing. Found error: ${err.message}. Continuing anyway.`,
+        );
+      });
+
+    await page.waitForTimeout(2000); // Settle time
   };
 
-  try {
-    await attemptUpload();
-  } catch (err: any) {
-    if (err.message.includes("Timeout")) {
-      console.warn(`[Qwen] Warning: Timeout waiting for upload chips. Assuming uploaded and continuing.`);
-    } else {
-      throw err;
+  let lastErr: any;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await attemptUpload();
+      console.log(
+        `[Qwen] Batch upload of ${filePaths.length} file(s) complete.`,
+      );
+      return;
+    } catch (e: any) {
+      lastErr = e;
+      console.warn(
+        `[Qwen] Upload attempt ${attempt} failed: ${e.message}. ${attempt < 3 ? "Retrying without reload..." : ""}`,
+      );
+      if (attempt < 3) {
+        await page.waitForTimeout(3000);
+      }
     }
   }
-
-  console.log(`[Qwen] ${filePaths.length} file(s) confirmed loaded.`);
+  throw lastErr;
 }
 
 // ─── Send ─────────────────────────────────────────────────────────────────────
 
 async function typeAndSend(page: Page, message: string): Promise<void> {
-  const INPUT = "textarea.message-input-textarea";
+  const INPUT =
+    ".message-input-textarea, textarea.message-input-textarea, textarea[placeholder*='message' i], [contenteditable='true']";
+  console.log(`[Qwen] Typing message (${message.slice(0, 50)}...)...`);
   await page.waitForSelector(INPUT, { timeout: 15_000 });
+
+  // Wait for input to be enabled
+  await page
+    .waitForFunction(
+      (sel) => {
+        const el = document.querySelector(sel) as HTMLTextAreaElement;
+        return (
+          el &&
+          !el.disabled &&
+          !el.readOnly &&
+          !el.classList.contains("disabled")
+        );
+      },
+      INPUT,
+      { timeout: 30_000 },
+    )
+    .catch(() =>
+      console.warn("[Qwen] Input field might be disabled, trying anyway..."),
+    );
+
   await page.click(INPUT);
+
   if (message.length <= 50) {
     await page.type(INPUT, message, { delay: 1 });
   } else {
@@ -100,9 +190,24 @@ async function typeAndSend(page: Page, message: string): Promise<void> {
   }
 
   const SEND_SEL =
-    'button.send-button, [class*="send-button"], button[aria-label*="Send" i]';
-  const btn = await page.waitForSelector(SEND_SEL, { timeout: 10_000 });
+    '.send-button, button.send-button, [class*="send-button"], button[aria-label*="Send" i], .qwen-chat-input-send-btn';
+  console.log("[Qwen] Clicking send button...");
+  const btn = await page.waitForSelector(SEND_SEL, {
+    timeout: 10_000,
+    state: "visible",
+  });
   if (!btn) throw new Error("Send button not found");
+
+  // Wait for button to be enabled (not disabled)
+  await page.waitForFunction(
+    (sel) => {
+      const b = document.querySelector(sel) as HTMLButtonElement;
+      return b && !b.disabled && !b.classList.contains("disabled");
+    },
+    SEND_SEL,
+    { timeout: 30_000 },
+  );
+
   await btn.click({ force: true });
   console.log("[Qwen] Message sent.");
 }
@@ -127,11 +232,18 @@ async function waitForReply(
     `[Qwen] Waiting for reply (Qwen answers so far: ${countBefore})...`,
   );
   const deadline = Date.now() + timeoutMs;
+  let lastLog = Date.now();
   while (Date.now() < deadline) {
     const count = await getReplyCount(page);
     if (count > countBefore) {
       console.log(`[Qwen] New reply detected (count: ${count}).`);
       return;
+    }
+    if (Date.now() - lastLog > 30000) {
+      console.log(
+        `[Qwen] Still waiting for reply (detected so far: ${count})...`,
+      );
+      lastLog = Date.now();
     }
     await page.waitForTimeout(500);
   }
@@ -170,31 +282,7 @@ async function extractResponseAtIndex(
     { timeout: 300_000 },
   );
 
-  // Step 3: Stability — 5 consecutive 1.5s polls with no char-count change on the target bubble
-  let last = -1;
-  let stable = 0;
-  const STABLE_NEEDED = 5;
-
-  while (stable < STABLE_NEEDED) {
-    const count = await page.evaluate(
-      ({ sel, idx }: { sel: string; idx: number }) => {
-        const els = document.querySelectorAll(sel);
-        const el = els[idx] as HTMLElement | undefined;
-        return el?.innerText?.length ?? 0;
-      },
-      { sel: REPLY_SEL, idx: targetIndex },
-    );
-
-    if (count === last && count > 0) {
-      stable++;
-    } else {
-      stable = 0;
-      last = count;
-    }
-    await page.waitForTimeout(1500);
-  }
-
-  // Step 4: Final settle pause
+  // Step 3: Settle pause
   await page.waitForTimeout(2000);
 
   // Step 5: Extract text from the specific bubble at targetIndex
@@ -225,7 +313,6 @@ async function extractResponseAtIndex(
 export async function askQwen(
   page: Page,
   query: string,
-  manifestContent: string,
   contextDir: string,
   onStatus?: (msg: string, partial?: string, progress?: number) => void,
   outDir: string = "",
@@ -236,10 +323,7 @@ export async function askQwen(
     origin: "https://chat.qwen.ai",
   });
 
-  const existingPage = context
-    .pages()
-    .find((p: Page) => p.url().includes("chat.qwen.ai"));
-  const qPage = existingPage ?? page;
+  const qPage = page;
 
   if (!qPage.url().includes("chat.qwen.ai")) {
     onStatus?.("Navigating to Qwen AI…");
@@ -247,6 +331,7 @@ export async function askQwen(
       waitUntil: "domcontentloaded",
       timeout: 45_000,
     });
+    await qPage.setViewportSize({ width: 1280, height: 800 });
     await qPage.waitForTimeout(2_000);
   }
 
@@ -291,23 +376,6 @@ export async function askQwen(
       const dst = path.join(sessionDir, "00_Root_Manifest.txt");
       fs.writeFileSync(dst, fs.readFileSync(rootManifest, "utf-8"), "utf-8");
       addFile(dst);
-    }
-
-    const symbolsPath = path.join(metadataBase, "symbols.json");
-    if (fs.existsSync(symbolsPath)) {
-      try {
-        const syms = JSON.parse(fs.readFileSync(symbolsPath, "utf-8"));
-        const lines = Object.entries(syms)
-          .slice(0, 500)
-          .map(([n, d]) => `${n}: ${(d as any).defined_in ?? ""}`);
-        const dst = path.join(sessionDir, "symbols.txt");
-        fs.writeFileSync(
-          dst,
-          lines.join("\n") || "// No symbols found.",
-          "utf-8",
-        );
-        addFile(dst);
-      } catch {}
     }
   }
 

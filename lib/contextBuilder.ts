@@ -2381,7 +2381,7 @@ async function writeNotebookFolder(
     `This notebook is part of a high-precision structural analysis.`,
     `For absolute technical truth regarding symbol definitions, consumers, and call-chains:`,
     `1. Consult 01_Meta.txt for the Global Symbol Index and Authority Roadmap.`,
-    `2. Refer to graph.json and symbols.json for raw structural telemetry.`,
+    `2. Refer to graph.json for raw structural telemetry.` ,
     ``,
     `[RELATIONAL ANCHORS]`,
     `This notebook contains files marked as 'Stateful Callers' or 'Mappers'.`,
@@ -2900,19 +2900,6 @@ export async function buildMasterContext(
     const info = await writeNotebookFolder(batches[i], i, outputDir);
     folderInfos.push(info);
   }
-
-  const symbolsPath = join(outputDir, "symbols.json");
-  const serializedSymbolIndex = Object.fromEntries(
-    Object.entries(_repoorbit_symbol_index).map(([sym, data]) => [
-      sym,
-      { defined_in: data.defined_in, used_by_files: data.used_by_files },
-    ]),
-  );
-  await writeFile(
-    symbolsPath,
-    JSON.stringify(serializedSymbolIndex, null, 2),
-    "utf-8",
-  );
 
   const { rootManifestPath } = await writeRootManifest(
     metaTexts,

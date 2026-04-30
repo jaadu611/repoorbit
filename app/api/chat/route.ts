@@ -1,4 +1,5 @@
 import { buildMasterContext } from "@/lib/contextBuilder";
+import { buildDeepseekContext } from "@/lib/deepseekContextBuilder";
 import path from "path";
 import fs from "fs";
 import { execSync } from "child_process";
@@ -20,6 +21,9 @@ import {
   getNotebookSubQuestionPrompt,
   getNotebookSystemInstruction,
   getGenericNotebookPrompt,
+  getCodeReviewPrompt,
+  getReviewSynthesisPrompt,
+  getCoderRefinementPrompt,
 } from "@/lib/prompts";
 import { NextResponse } from "next/server";
 import { Page, BrowserContext } from "playwright";
@@ -32,10 +36,33 @@ export const activeJobs: Map<string, JobStatus> =
   (global as any)[GLOBAL_JOBS_KEY] || new Map();
 (global as any)[GLOBAL_JOBS_KEY] = activeJobs;
 
-// ─── Constants & Helpers ──────────────────────────────────────────────────
+// ─── Constants & Helpers ──────────────────────────────────────────────────────
 
 const MAX_LINES_PER_FILE = 500;
 const MAX_FILES_PER_TURN = 5;
+
+/**
+ * Persistent chat page handles for the 4 roles.
+ * Stored globally so they survive across hot-reloads in dev.
+ */
+const GLOBAL_PAGES_KEY = Symbol.for("repoorbit.playwright.pages");
+interface PersistentPages {
+  dsCoder: Page | null;
+  qwenCoder: Page | null;
+  dsReviewer: Page | null;
+  qwenReviewer: Page | null;
+  dsSynthesizer: Page | null;
+}
+const persistentPages: PersistentPages = (global as any)[GLOBAL_PAGES_KEY] || {
+  dsCoder: null,
+  qwenCoder: null,
+  dsReviewer: null,
+  qwenReviewer: null,
+  dsSynthesizer: null,
+};
+(global as any)[GLOBAL_PAGES_KEY] = persistentPages;
+
+// ─── fetchFile ────────────────────────────────────────────────────────────────
 
 async function fetchFile(
   outDir: string,
@@ -44,7 +71,7 @@ async function fetchFile(
   branch: string,
   filePath: string,
   lineRange?: [number, number],
-): Promise<string> {
+): Promise<string | null> {
   const safeBranch = branch && branch.trim() ? branch.trim() : "main";
   const url = `https://raw.githubusercontent.com/${owner}/${repo}/${safeBranch}/${filePath}`;
   console.log(`[GITHUB] Fetching: ${url}`);
@@ -53,7 +80,7 @@ async function fetchFile(
     const res = await fetch(url);
     if (!res.ok) {
       console.warn(`[GITHUB] 404/Error: ${url} (Status: ${res.status})`);
-      return `// [NOT FOUND] ${filePath} — HTTP ${res.status}`;
+      return null;
     }
     const text = await res.text();
     const lines = text.split("\n");
@@ -63,20 +90,17 @@ async function fetchFile(
     );
 
     if (lineRange) {
-      let start = lineRange[0];
-      let end = lineRange[1];
-
-      // Interpret 0 as 'beginning' or 'end'
-      const startIdx = start > 0 ? start - 1 : 0;
-      const endIdx = end > 0 ? Math.min(lines.length - 1, end - 1) : lines.length - 1;
-
+      const startIdx = lineRange[0] > 0 ? lineRange[0] - 1 : 0;
+      const endIdx =
+        lineRange[1] > 0
+          ? Math.min(lines.length - 1, lineRange[1] - 1)
+          : lines.length - 1;
       const slice = lines.slice(startIdx, endIdx + 1);
-      // If they asked for a range, we give them what they asked for (up to 1500 lines)
       const MAX_RANGE_LIMIT = 1500;
       if (slice.length > MAX_RANGE_LIMIT) {
         return (
           slice.slice(0, MAX_RANGE_LIMIT).join("\n") +
-          `\n\n// [TRUNCATED] Only first ${MAX_RANGE_LIMIT} lines of the requested range are shown. Ask for the next segment if needed.`
+          `\n\n// [TRUNCATED] Only first ${MAX_RANGE_LIMIT} lines of the requested range are shown.`
         );
       }
       return slice.join("\n");
@@ -95,6 +119,8 @@ async function fetchFile(
   }
 }
 
+// ─── fillMissingFiles ─────────────────────────────────────────────────────────
+
 async function fillMissingFiles(
   missingFiles: any[],
   filledSet: Set<string>,
@@ -103,6 +129,8 @@ async function fillMissingFiles(
   owner: string,
   repo: string,
   branch: string,
+  outDir: string,
+  latestResponsePath?: string,
 ): Promise<number> {
   const filesToFetch = missingFiles.slice(0, MAX_FILES_PER_TURN);
   let count = 0;
@@ -110,24 +138,122 @@ async function fillMissingFiles(
   for (const f of filesToFetch) {
     const filePath = f.path || f.file_path;
     if (!filePath) continue;
+
+    const lowerPath = filePath.toLowerCase();
+    
+    // Special handling for the latest combined response
+    if (lowerPath === "combined_response.txt" && latestResponsePath && fs.existsSync(latestResponsePath)) {
+      console.log(`[ORCHESTRATOR] ${modelName} requesting latest combined response...`);
+      const dst = path.join(modelInvestDir, "combined_response.txt");
+      fs.copyFileSync(latestResponsePath, dst);
+      count++;
+      continue;
+    }
+
+    if (
+      lowerPath.includes("combined_") ||
+      lowerPath.includes("review_") ||
+      lowerPath.includes("symbols.") ||
+      lowerPath.includes("manifest") ||
+      lowerPath.includes("context.js") ||
+      lowerPath.includes("meta.txt")
+    ) {
+      console.warn(
+        `[ORCHESTRATOR] Blocking internal file request: ${filePath}`,
+      );
+      continue;
+    }
+
     const lineRange = Array.isArray(f.line_range) ? f.line_range : undefined;
     const key = `${filePath}|${lineRange?.join(",") || ""}`.toLowerCase();
     if (filledSet.has(key)) continue;
     filledSet.add(key);
 
     console.log(
-      `[ORCHESTRATOR] ${modelName} fetching: ${filePath}${lineRange ? ` lines ${lineRange.join("-")}` : ""}`,
+      `[ORCHESTRATOR] ${modelName} requesting: ${filePath}${lineRange ? ` lines ${lineRange.join("-")}` : ""}`,
     );
+
+    // LOCAL FULFILLMENT
+    const localPaths = [
+      path.join(outDir, filePath),
+      path.join(modelInvestDir, filePath),
+      path.join(path.dirname(outDir), filePath),
+    ];
+    let localContent: string | null = null;
+    for (const p of localPaths) {
+      if (fs.existsSync(p) && fs.statSync(p).isFile()) {
+        localContent = fs.readFileSync(p, "utf-8");
+        break;
+      }
+    }
+
+    if (localContent) {
+      const safeName = filePath.replace(/[^a-zA-Z0-9_-]/g, "_");
+      const extraFileName = `extra_${count.toString().padStart(2, "0")}_${safeName}.txt`;
+      fs.writeFileSync(
+        path.join(modelInvestDir, extraFileName),
+        localContent,
+        "utf-8",
+      );
+      console.log(
+        `[ORCHESTRATOR] ${modelName}: Local fulfillment for ${filePath}`,
+      );
+      count++;
+      continue;
+    }
+
+    // SYMBOL REQUEST
+    if (f.name_hint || f.name) {
+      const symbolPathB = {
+        intent: `Missing symbol: ${f.name_hint || f.name}`,
+        target_symbols: [
+          {
+            name: f.name_hint || f.name,
+            source_file: filePath,
+            role: f.role,
+            type: f.type,
+          },
+        ],
+      };
+      const tempOutDir = path.join(modelInvestDir, `temp_${count}`);
+      fs.mkdirSync(tempOutDir, { recursive: true });
+      ["graph.json", "notebooks.json", "package.json"].forEach(
+        (file) => {
+          const src = path.join(outDir, file);
+          if (fs.existsSync(src))
+            fs.copyFileSync(src, path.join(tempOutDir, file));
+        },
+      );
+
+      buildDeepseekContext(symbolPathB, tempOutDir);
+
+      const nestedDir = path.join(tempOutDir, "deepseek_context");
+      if (fs.existsSync(nestedDir)) {
+        for (const file of fs.readdirSync(nestedDir)) {
+          const src = path.join(nestedDir, file);
+          const dst = path.join(modelInvestDir, `extra_${count}_${file}`);
+          fs.copyFileSync(src, dst);
+        }
+      }
+      fs.rmSync(tempOutDir, { recursive: true, force: true });
+      count++;
+      continue;
+    }
+
     const content = await fetchFile(
-      modelInvestDir
-        .split("/ds_investigation")[0]
-        .split("/qwen_investigation")[0],
+      outDir,
       owner,
       repo,
       branch,
       filePath,
       lineRange as [number, number],
     );
+    if (content === null) {
+      console.warn(
+        `[ORCHESTRATOR] ${modelName}: Skipping ${filePath} (not found).`,
+      );
+      continue;
+    }
 
     const safeName = filePath.replace(/[^a-zA-Z0-9_-]/g, "_");
     const extraFileName = `extra_${count.toString().padStart(2, "0")}_${safeName}.txt`;
@@ -135,16 +261,18 @@ async function fillMissingFiles(
     fs.mkdirSync(modelInvestDir, { recursive: true });
     fs.writeFileSync(extraFilePath, content, "utf-8");
     console.log(
-      `[ORCHESTRATOR] ${modelName}: Saved extra context to ${extraFileName}`,
+      `[ORCHESTRATOR] ${modelName}: Saved extra context → ${extraFileName}`,
     );
     count++;
   }
 
   console.log(
-    `[ORCHESTRATOR] ${modelName}: Total extra files fetched this turn: ${count}`,
+    `[ORCHESTRATOR] ${modelName}: Extra files fetched this turn: ${count}`,
   );
   return count;
 }
+
+// ─── fileFingerprint / prepareTurnDir ────────────────────────────────────────
 
 function fileFingerprint(filePath: string): string {
   try {
@@ -155,54 +283,79 @@ function fileFingerprint(filePath: string): string {
   }
 }
 
+/**
+ * Assembles a temporary upload dir for a single model turn.
+ *
+ * @param outDir         - repo working dir
+ * @param modelPrefix    - "deepseek" | "qwen" etc.
+ * @param attempt        - turn index (0-based)
+ * @param baseContextDir - deepseek_context dir (base context uploaded on attempt 0 ONLY for coders)
+ * @param investDir      - per-model extra-files staging dir
+ * @param seenHashes     - dedup map (mutated in-place)
+ * @param includeBase    - whether to include base context files (only first coder turn)
+ * @param extraFiles     - explicit additional files to include this turn (e.g. combined_review)
+ */
 function prepareTurnDir(
   outDir: string,
   modelPrefix: string,
   attempt: number,
-  dsBaseContextDir: string,
-  modelInvestDir: string,
+  baseContextDir: string,
+  investDir: string,
   seenHashes: Map<string, string>,
-): string {
-  const turnDir = path.join(outDir, `${modelPrefix}_upload_${attempt}`);
+  includeBase: boolean,
+  extraFiles: string[] = [],
+): string | null {
+  const turnDir = path.join(
+    outDir,
+    `${modelPrefix}_upload_${attempt}_${Date.now()}`,
+  );
+  const filesToCopy: { src: string; dstName: string }[] = [];
+
+  // 1. Base context — only when explicitly requested (first coder turn)
+  if (includeBase && fs.existsSync(baseContextDir)) {
+    for (const f of fs.readdirSync(baseContextDir)) {
+      if (f === "gap_filler.txt") continue;
+      filesToCopy.push({ src: path.join(baseContextDir, f), dstName: f });
+    }
+  }
+
+  // 2. Explicit extra files for this turn (e.g. combined_review_N.txt)
+  for (const src of extraFiles) {
+    if (!fs.existsSync(src)) continue;
+    const dstName = path.basename(src);
+    filesToCopy.push({ src, dstName });
+  }
+
+  // 3. Any new files in the investigation dir (NEED_MORE_CONTEXT fulfillment)
+  if (fs.existsSync(investDir)) {
+    for (const f of fs.readdirSync(investDir)) {
+      const src = path.join(investDir, f);
+      if (!fs.statSync(src).isFile()) continue;
+      const fingerprint = fileFingerprint(src);
+      if (seenHashes.get(f) === fingerprint) continue;
+      filesToCopy.push({ src, dstName: f });
+    }
+  }
+
+  if (filesToCopy.length === 0) return null;
+
   if (fs.existsSync(turnDir))
     fs.rmSync(turnDir, { recursive: true, force: true });
   fs.mkdirSync(turnDir, { recursive: true });
 
-  let newFilesCount = 0;
-
-  // 1. Base Context: ONLY on first turn (attempt 0)
-  if (attempt === 0 && fs.existsSync(dsBaseContextDir)) {
-    for (const f of fs.readdirSync(dsBaseContextDir)) {
-      if (f === "gap_filler.txt") continue;
-      const src = path.join(dsBaseContextDir, f);
-      const dst = path.join(turnDir, f);
-      const fingerprint = fileFingerprint(src);
-      fs.copyFileSync(src, dst);
-      seenHashes.set(f, fingerprint);
-      newFilesCount++;
-    }
-  }
-
-  // 2. Extra Context: ONLY new files that haven't been uploaded yet
-  if (fs.existsSync(modelInvestDir)) {
-    for (const f of fs.readdirSync(modelInvestDir)) {
-      const src = path.join(modelInvestDir, f);
-      const fingerprint = fileFingerprint(src);
-      const existing = seenHashes.get(f);
-
-      if (existing === fingerprint) continue;
-
-      fs.copyFileSync(src, path.join(turnDir, f));
-      seenHashes.set(f, fingerprint);
-      newFilesCount++;
-    }
+  for (const item of filesToCopy) {
+    const dst = path.join(turnDir, item.dstName);
+    fs.copyFileSync(item.src, dst);
+    seenHashes.set(item.dstName, fileFingerprint(item.src));
   }
 
   console.log(
-    `[ORCHESTRATOR] ${modelPrefix} turn ${attempt}: prepared ${newFilesCount} NEW files in ${turnDir}`,
+    `[ORCHESTRATOR] ${modelPrefix} turn ${attempt}: ${filesToCopy.length} files in upload dir`,
   );
   return turnDir;
 }
+
+// ─── runModelPlanner ──────────────────────────────────────────────────────────
 
 async function runModelPlanner(
   modelName: string,
@@ -216,59 +369,85 @@ async function runModelPlanner(
   onStatus: (msg: string) => void,
 ): Promise<any> {
   let attempts = 0;
-  let history = "";
-  const initialPrompt = getGeminiPlannerPrompt(query);
-  history = initialPrompt;
+  let history = getGeminiPlannerPrompt(query);
 
   const parts = repoUrl.split("/");
   const owner = parts[parts.length - 2];
   const repo = parts[parts.length - 1];
 
   let currentFiles = [...plannerFiles];
+  const uploadedHashes = new Map<string, string>();
+
+  // Staging dir for extra files
+  const modelContextDir = path.join(
+    outDir,
+    `planner_context_${modelName.toLowerCase()}`,
+  );
+  if (!fs.existsSync(modelContextDir))
+    fs.mkdirSync(modelContextDir, { recursive: true });
 
   while (attempts < 3) {
+    // 1. Identify and stage new files for this turn
+    const newFilesToUpload: string[] = [];
+    for (const f of currentFiles) {
+      if (!fs.existsSync(f)) continue;
+      const name = path.basename(f);
+      const hash = fileFingerprint(f);
+      if (uploadedHashes.get(name) !== hash) {
+        newFilesToUpload.push(f);
+        uploadedHashes.set(name, hash);
+      }
+    }
+
+    let turnUploadDir: string | null = null;
+    if (newFilesToUpload.length > 0) {
+      const turnDir = path.join(
+        outDir,
+        `upload_${modelName.toLowerCase()}_plan_${attempts}_${Date.now()}`,
+      );
+      fs.mkdirSync(turnDir, { recursive: true });
+      for (const f of newFilesToUpload) {
+        fs.copyFileSync(f, path.join(turnDir, path.basename(f)));
+      }
+      turnUploadDir = turnDir;
+    }
+
     let response = "";
-    if (modelName === "Gemini") {
-      response = await askGemini(
-        page,
-        history,
-        attempts === 0 ? currentFiles : [],
-        (msg) => onStatus(`[Gemini Planner] ${msg}`),
-      );
-    } else if (modelName === "DeepSeek") {
-      const planContextDir = path.join(outDir, "planner_context_ds");
-      if (attempts === 0) {
-        fs.mkdirSync(planContextDir, { recursive: true });
-        currentFiles.forEach((f) =>
-          fs.copyFileSync(f, path.join(planContextDir, path.basename(f))),
+    try {
+      if (modelName === "Gemini") {
+        response = await askGemini(
+          page,
+          history,
+          newFilesToUpload,
+          (msg) => onStatus(`[Gemini Planner] ${msg}`),
+        );
+      } else if (modelName === "DeepSeek") {
+        response = await askDeepseek(
+          page,
+          history,
+          manifestContent,
+          turnUploadDir || "",
+          (msg) => onStatus(`[DeepSeek Planner] ${msg}`),
+          outDir,
+          attempts === 0,
+        );
+      } else if (modelName === "Qwen") {
+        response = await askQwen(
+          page,
+          history,
+          turnUploadDir || "",
+          (msg) => onStatus(`[Qwen Planner] ${msg}`),
+          outDir,
+          attempts === 0,
         );
       }
-      response = await askDeepseek(
-        page,
-        history,
-        manifestContent,
-        attempts === 0 ? planContextDir : "",
-        (msg) => onStatus(`[DeepSeek Planner] ${msg}`),
-        outDir,
-        attempts === 0,
-      );
-    } else if (modelName === "Qwen") {
-      const planContextDir = path.join(outDir, "planner_context_qwen");
-      if (attempts === 0) {
-        fs.mkdirSync(planContextDir, { recursive: true });
-        currentFiles.forEach((f) =>
-          fs.copyFileSync(f, path.join(planContextDir, path.basename(f))),
-        );
+    } finally {
+      // Clean up the turn-specific upload dir
+      if (turnUploadDir && fs.existsSync(turnUploadDir)) {
+        try {
+          fs.rmSync(turnUploadDir, { recursive: true, force: true });
+        } catch {}
       }
-      response = await askQwen(
-        page,
-        history,
-        manifestContent,
-        attempts === 0 ? planContextDir : "",
-        (msg) => onStatus(`[Qwen Planner] ${msg}`),
-        outDir,
-        attempts === 0,
-      );
     }
 
     let plan: any;
@@ -282,18 +461,14 @@ async function runModelPlanner(
       console.warn(
         `[${modelName} Planner] JSON parse FAILED (attempt ${attempts}): ${parseErr.message}`,
       );
-      console.warn(
-        `[${modelName} Planner] Raw response (first 500 chars): ${response.substring(0, 500)}`,
-      );
       return { status: "FAILED", raw: response };
     }
 
-    console.log(`[${modelName} Planner] Parsed plan status: ${plan.status}`);
     if (plan.status === "READY" || plan.status === "GENERIC") return plan;
 
     if (plan.status === "NEED_FILE" && Array.isArray(plan.files)) {
       onStatus(`[${modelName} Planner] Fetching requested files...`);
-      const results = [];
+      let fetchedCount = 0;
       for (const f of plan.files.slice(0, 5)) {
         const content = await fetchFile(
           outDir,
@@ -302,20 +477,42 @@ async function runModelPlanner(
           defaultBranch,
           f.path,
         );
-        results.push(`${f.path}:\n${content}`);
+        if (content) {
+          const safeName = f.path.replace(/[^a-zA-Z0-9_-]/g, "_");
+          const extraPath = path.join(modelContextDir, `extra_${safeName}.txt`);
+          fs.writeFileSync(extraPath, content, "utf-8");
+          currentFiles.push(extraPath);
+          fetchedCount++;
+        }
       }
 
-      history += "\n\n" + response;
-      history += "\n\n" + results.join("\n\n");
+      if (fetchedCount === 0) {
+        history +=
+          "\n\n" +
+          response +
+          "\n\n[System: None of the requested files could be found. Please proceed with the information you have.]";
+      } else {
+        history +=
+          "\n\n" +
+          response +
+          "\n\n[System: I have uploaded the requested context files. Please continue your analysis.]";
+      }
+
       attempts++;
       continue;
     }
-    console.warn(`[${modelName} Planner] Unhandled plan status "${plan.status}". Returning as-is.`);
+
+    console.warn(
+      `[${modelName} Planner] Unhandled plan status "${plan.status}".`,
+    );
     return plan;
   }
-  console.warn(`[${modelName} Planner] Exhausted all attempts without a final plan.`);
+
+  console.warn(`[${modelName} Planner] Exhausted all attempts.`);
   return { status: "FAILED" };
 }
+
+// ─── runDualPlanner ───────────────────────────────────────────────────────────
 
 async function runDualPlanner(
   context: BrowserContext,
@@ -360,21 +557,17 @@ async function runDualPlanner(
   ]);
 
   console.log(
-    `[Dual Planner] Results — DeepSeek: ${dPlan.status}, Qwen: ${qPlan.status}`,
+    `[Dual Planner] DeepSeek: ${dPlan.status}, Qwen: ${qPlan.status}`,
   );
-
-  // Close planner tabs to save resources
   await Promise.allSettled([deepPage.close(), qwenPage.close()]);
 
-  // If both failed, return failed
-  if (dPlan.status === "FAILED" && qPlan.status === "FAILED") {
+  if (dPlan.status === "FAILED" && qPlan.status === "FAILED")
     return { status: "FAILED" };
-  }
 
-  // GENERIC routing: GENERIC wins when it has at least as many votes as READY
   const plans = [dPlan, qPlan];
   const genericVotes = plans.filter((p) => p.status === "GENERIC").length;
   const readyVotes = plans.filter((p) => p.status === "READY").length;
+
   if (genericVotes > 0 && genericVotes >= readyVotes) {
     const genericReason = plans.find((p) => p.status === "GENERIC")?.reason;
     onStatus(
@@ -385,11 +578,9 @@ async function runDualPlanner(
       .filter((p) => Array.isArray(p.notebooks))
       .flatMap((p) => p.notebooks as any[]);
 
-    if (allGenericNotebooks.length === 0) {
+    if (allGenericNotebooks.length === 0)
       return { status: "GENERIC", reason: genericReason, notebooks: [] };
-    }
 
-    // Use Gemini ONLY for synthesis — open page on demand
     const geminiPage =
       context.pages().find((p) => p.url().includes("gemini.google.com")) ||
       (await context.newPage());
@@ -430,19 +621,16 @@ No explanation. No markdown.`;
     }
   }
 
-  // Only feed READY plans into the synthesizer
   const readyPlans: Record<string, any> = {};
   if (dPlan.status === "READY") readyPlans["DEEPSEEK"] = dPlan;
   if (qPlan.status === "READY") readyPlans["QWEN"] = qPlan;
 
-  // If only one planner returned READY, skip synthesis and use it directly
   const readyEntries = Object.entries(readyPlans);
   if (readyEntries.length === 1) {
     onStatus(`Using ${readyEntries[0][0]}'s plan directly (only 1 READY).`);
     return readyEntries[0][1];
   }
 
-  // Both READY — synthesize with Gemini
   const geminiPage =
     context.pages().find((p) => p.url().includes("gemini.google.com")) ||
     (await context.newPage());
@@ -450,15 +638,16 @@ No explanation. No markdown.`;
   const planEntries = readyEntries
     .map(([name, plan]) => `${name}: ${JSON.stringify(plan)}`)
     .join("\n");
+  onStatus(
+    `Synthesizing unified plan with Gemini (${readyEntries.length}/2 READY plans)...`,
+  );
 
-  onStatus(`Synthesizing unified plan with Gemini (${readyEntries.length}/2 READY plans)...`);
   const synthPrompt = `Synthesize these investigation plans into a SINGLE, EXHAUSTIVE, and COMPREHENSIVE master plan.
 
 PRIORITY: MAXIMIZE COVERAGE
-1. MISSION: It is better to include an extra notebook than to miss the bug. If any agent identifies a specific notebook or logic area, INCLUDE IT in the final plan.
-2. DO NOT be overly selective. Combine the unique insights from all planners.
-3. MERGE DUPLICATES: Each notebook name must appear ONLY ONCE in your JSON. If multiple models suggested the same notebook, merge their sub-questions into a single, highly detailed, multi-part investigation query for that notebook.
-4. VALIDATION: Return ONLY a valid JSON object with {"status": "READY", "notebooks": [...]}.
+1. Include every notebook any agent identified.
+2. Merge duplicates — each notebook name appears ONLY ONCE with a merged sub-question.
+3. Return ONLY valid JSON: {"status": "READY", "notebooks": [...]}
 
 ### DRAFT PLANS:
 ${planEntries}
@@ -482,6 +671,8 @@ Return ONLY JSON. No explanation. No markdown.`;
   }
 }
 
+// ─── collectRelevantFiles ─────────────────────────────────────────────────────
+
 async function collectRelevantFiles(
   page: Page,
   query: string,
@@ -489,60 +680,46 @@ async function collectRelevantFiles(
   outDir: string,
 ): Promise<string[]> {
   const allFiles = new Set<string>();
-
   const notebooksPath = path.join(outDir, "notebooks.json");
   let notebooks: any[] = [];
   if (fs.existsSync(notebooksPath)) {
     try {
       notebooks = JSON.parse(fs.readFileSync(notebooksPath, "utf-8"));
-    } catch (err) {
-      console.error("[NotebookLM] Failed to parse notebooks.json:", err);
-    }
+    } catch {}
   }
 
   for (const plan of notebookPlans) {
-    const plannedName = plan.name;
-    const subQuestion = plan.sub_question;
-
     const nb = notebooks.find(
-      (n) => n.name === plannedName || n.title === plannedName,
+      (n) => n.name === plan.name || n.title === plan.name,
     );
     if (!nb) {
-      console.warn(
-        `[NotebookLM] Planner requested unknown notebook: ${plannedName}`,
-      );
+      console.warn(`[NotebookLM] Unknown notebook: ${plan.name}`);
       continue;
     }
-
     console.log(
-      `[ORCHESTRATOR] Querying NotebookLM: "${nb.title}" with ${nb.localFiles?.length || 0} files...`,
+      `[ORCHESTRATOR] Querying NotebookLM: "${nb.title}" (${nb.localFiles?.length || 0} files)`,
     );
     const files = await automateSubQuestion(
       page,
       nb.title,
-      getNotebookSubQuestionPrompt(subQuestion),
+      getNotebookSubQuestionPrompt(plan.sub_question),
       nb.localFiles,
     );
-
     if (Array.isArray(files)) {
-      console.log(
-        `[ORCHESTRATOR] NotebookLM "${nb.title}" returned ${files.length} files.`,
-      );
       files.forEach((f) => {
-        if (f !== "notebook_instructions.txt" && f !== "00_manifest.txt") {
+        if (f !== "notebook_instructions.txt" && f !== "00_manifest.txt")
           allFiles.add(f);
-        }
       });
     }
   }
 
   console.log(
-    `[ORCHESTRATOR] Total unique context files gathered from NotebookLM: ${allFiles.size}`,
+    `[ORCHESTRATOR] Total context files from NotebookLM: ${allFiles.size}`,
   );
   return Array.from(allFiles);
 }
 
-// ─── Generic question deep analysis via NotebookLM ────────────────────────────
+// ─── collectGenericAnswers ────────────────────────────────────────────────────
 
 async function collectGenericAnswers(
   page: Page,
@@ -552,60 +729,49 @@ async function collectGenericAnswers(
 ): Promise<{ sub_question: string; answer: string; notebook: string }[]> {
   const answers: { sub_question: string; answer: string; notebook: string }[] =
     [];
-
   const notebooksPath = path.join(outDir, "notebooks.json");
   let notebooks: any[] = [];
   if (fs.existsSync(notebooksPath)) {
     try {
       notebooks = JSON.parse(fs.readFileSync(notebooksPath, "utf-8"));
-    } catch (err) {
-      console.error("[Generic] Failed to parse notebooks.json:", err);
-    }
+    } catch {}
   }
 
   for (const plan of notebookPlans) {
-    const plannedName = plan.name;
-    const subQuestion = plan.sub_question;
-
     const nb = notebooks.find(
-      (n) => n.name === plannedName || n.title === plannedName,
+      (n) => n.name === plan.name || n.title === plan.name,
     );
     if (!nb) {
-      console.warn(`[Generic] Unknown notebook: ${plannedName}`);
+      console.warn(`[Generic] Unknown notebook: ${plan.name}`);
       continue;
     }
-
     onStatus(`Querying notebook "${nb.title}" for deep context...`);
-    console.log(
-      `[GENERIC ORCHESTRATOR] Querying "${nb.title}" with ${nb.localFiles?.length || 0} files...`,
-    );
-
     try {
       const answer = await automateNotebookLM(
         page,
         nb.localFiles || [],
-        getGenericNotebookPrompt(subQuestion),
+        getGenericNotebookPrompt(plan.sub_question),
         nb.title,
         (msg) => onStatus(`[NotebookLM] ${msg}`),
         false,
       );
-
-      answers.push({ sub_question: subQuestion, answer, notebook: nb.title });
-      console.log(
-        `[GENERIC ORCHESTRATOR] Got answer from "${nb.title}" (${answer.length} chars)`,
-      );
-    } catch (err: any) {
-      console.error(`[Generic] Error querying "${nb.title}":`, err.message);
       answers.push({
-        sub_question: subQuestion,
-        answer: `[Error retrieving answer: ${err.message}]`,
+        sub_question: plan.sub_question,
+        answer,
+        notebook: nb.title,
+      });
+    } catch (err: any) {
+      answers.push({
+        sub_question: plan.sub_question,
+        answer: `[Error: ${err.message}]`,
         notebook: nb.title,
       });
     }
   }
-
   return answers;
 }
+
+// ─── GET handler ──────────────────────────────────────────────────────────────
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
@@ -622,11 +788,12 @@ export async function POST(req: Request) {
     const { query, owner, repo, defaultBranch } = await req.json();
     const taskId = Math.random().toString(36).substring(7);
     activeJobs.set(taskId, { status: "pending" });
+
     const outDir = path.join(CONTEXT_DIR_PATH, owner, repo);
     const insightsPath = path.join(outDir, "phase2_insights.txt");
     const queryPromptPath = path.join(outDir, "QUERY_PROMPT.txt");
-    [insightsPath, queryPromptPath].forEach((file) => {
-      if (fs.existsSync(file)) fs.unlinkSync(file);
+    [insightsPath, queryPromptPath].forEach((f) => {
+      if (fs.existsSync(f)) fs.unlinkSync(f);
     });
 
     const processJob = async () => {
@@ -659,7 +826,6 @@ export async function POST(req: Request) {
               { stdio: "pipe" },
             );
           } catch (cloneErr: any) {
-            console.error("[CLONE] git clone failed:", cloneErr.message);
             activeJobs.set(taskId, {
               status: "error",
               error: `git clone failed: ${cloneErr.message}`,
@@ -751,12 +917,11 @@ export async function POST(req: Request) {
           walkRepo(tmpRepoDir);
           console.log(`[CLONE] Collected ${filesMetadata.length} files`);
 
-          setStatus("Building master context via Central Builder...");
+          setStatus("Building master context...");
           const miniRepoContext = {
             meta: { fullName: `${owner}/${repo}`, owner, name: repo },
             stats: { extFrequency: {} },
           };
-
           const fileSet = new Set<string>(filesMetadata.map((f) => f.path));
           const importGraph: any = {};
           for (const f of filesMetadata) {
@@ -766,29 +931,49 @@ export async function POST(req: Request) {
               imported_by: [],
             };
           }
-
           await buildMasterContext(
             outDir,
             filesMetadata,
             importGraph,
             miniRepoContext,
             query,
-            undefined, // expertPlan
-            true, // dumpAll
+            undefined,
+            true,
           );
-
-          // Cleanup raw clone
           fs.rmSync(tmpRepoDir, { recursive: true, force: true });
           setStatus("Context built. Starting planning...");
         }
 
-        // ── Step 2: Intelligent Triple-Model Planning ────────────────────────
+        // ── Step 2: Open 4 persistent chat pages ─────────────────────────────
         const context = await getOrCreateContext();
+
+        if (!persistentPages.dsCoder || persistentPages.dsCoder.isClosed())
+          persistentPages.dsCoder = await context.newPage();
+        if (!persistentPages.qwenCoder || persistentPages.qwenCoder.isClosed())
+          persistentPages.qwenCoder = await context.newPage();
+        if (
+          !persistentPages.dsReviewer ||
+          persistentPages.dsReviewer.isClosed()
+        )
+          persistentPages.dsReviewer = await context.newPage();
+        if (
+          !persistentPages.qwenReviewer ||
+          persistentPages.qwenReviewer.isClosed()
+        )
+          persistentPages.qwenReviewer = await context.newPage();
+        if (
+          !persistentPages.dsSynthesizer ||
+          persistentPages.dsSynthesizer.isClosed()
+        )
+          persistentPages.dsSynthesizer = await context.newPage();
+
+        console.log("[ORCHESTRATOR] 4 persistent chat pages ready.");
+
+        // ── Step 3: Dual-model planning ───────────────────────────────────────
         const repoUrl = `https://github.com/${owner}/${repo}`;
         const rootManifestContent = fs.readFileSync(manifestPath, "utf-8");
         const readmePath = path.join(outDir, "README.md");
         const notebooksPath = path.join(outDir, "notebooks.json");
-
         const plannerFiles = [manifestPath];
         if (fs.existsSync(readmePath)) plannerFiles.push(readmePath);
         if (fs.existsSync(notebooksPath)) plannerFiles.push(notebooksPath);
@@ -804,10 +989,11 @@ export async function POST(req: Request) {
           (msg) => setStatus(msg),
         );
 
+        // ── GENERIC question path ─────────────────────────────────────────────
         if (plan.status === "GENERIC") {
-          setStatus("Generic question: querying notebooks for deep codebase analysis...");
-
-          // ── Step 2b: Query each relevant notebook for a detailed text answer ───
+          setStatus(
+            "Generic question: querying notebooks for deep codebase analysis...",
+          );
           let notebookPage = context
             .pages()
             .find((p: any) => p.url()?.includes("notebooklm.google.com"));
@@ -820,7 +1006,6 @@ export async function POST(req: Request) {
             (msg) => setStatus(msg),
           );
 
-          // ── Step 2c: Build a rich synthesis prompt for ChatGPT ───────────────
           const answersBlock =
             genericAnswers.length > 0
               ? genericAnswers
@@ -837,12 +1022,10 @@ export async function POST(req: Request) {
 ${query}
 
 ### DEEP CODEBASE ANALYSIS
-The following are detailed analyses extracted from specialised notebooks, each targeting a specific aspect of the main question:
-
 ${answersBlock}
 
 ---
-Synthesize all the insights above into a single, cohesive, well-structured response to the main question. Be comprehensive and precise. Reference specific findings from the analyses above where relevant.`;
+Synthesize all the insights above into a single, cohesive, well-structured response to the main question.`;
 
           setStatus("Synthesizing final answer with ChatGPT...");
           const chatPage =
@@ -853,7 +1036,6 @@ Synthesize all the insights above into a single, cohesive, well-structured respo
             chatGPTPrompt,
             (msg) => setStatus(`[ChatGPT] ${msg}`),
           );
-
           activeJobs.set(taskId, {
             status: "done",
             result: genericResult,
@@ -865,19 +1047,17 @@ Synthesize all the insights above into a single, cohesive, well-structured respo
         if (plan.status === "FAILED") {
           activeJobs.set(taskId, {
             status: "error",
-            error:
-              "Gemini planner failed to generate a valid investigation plan.",
+            error: "Planner failed to generate a valid investigation plan.",
           });
           return;
         }
 
-        // ── Step 3: Collect relevant files via NotebookLM ────────────────────
+        // ── Step 4: Collect relevant files via NotebookLM ─────────────────────
         setStatus("NotebookLM is gathering evidence...");
         let notebookPage = context
           .pages()
           .find((p: any) => p.url()?.includes("notebooklm.google.com"));
         if (!notebookPage) notebookPage = await context.newPage();
-
         const contextFiles = await collectRelevantFiles(
           notebookPage,
           query,
@@ -885,318 +1065,40 @@ Synthesize all the insights above into a single, cohesive, well-structured respo
           outDir,
         );
 
-        // ── Step 4: Final Synthesis Setup ─────────────────────────────────────
-        setStatus("Building precise code context for model orchestration...");
+        // ── Step 5: Build precise code context ───────────────────────────────
+        setStatus("Building precise code context...");
         const dsBaseContextDir = path.join(outDir, "deepseek_context");
-        if (fs.existsSync(dsBaseContextDir))
-          fs.rmSync(dsBaseContextDir, { recursive: true, force: true });
-        fs.mkdirSync(dsBaseContextDir, { recursive: true });
-
-        // Fetch the collected files (individual files for upload)
-        for (let i = 0; i < contextFiles.length; i++) {
-          const filePath = contextFiles[i];
-          const content = await fetchFile(
-            outDir,
-            owner,
-            repo,
-            defaultBranch,
-            filePath,
-          );
-          const safeName = filePath.replace(/[^a-zA-Z0-9_-]/g, "_");
-          fs.writeFileSync(
-            path.join(
-              dsBaseContextDir,
-              `file_${i.toString().padStart(2, "0")}_${safeName}.js`,
-            ),
-            content,
-            "utf-8",
-          );
-        }
-
-        // ── Step 5: Model Orchestration Loop ──────────────────────────────────
-        const dsPromptString = getDeepseekCodingPrompt({
-          userQuery: query,
-          mode: "FIX",
-        });
-
-        let deepPage = context
-          .pages()
-          .find((p: any) => p.url()?.includes("chat.deepseek.com"));
-        if (!deepPage) deepPage = await context.newPage();
-        let qwenPage = context
-          .pages()
-          .find((p: any) => p.url()?.includes("chat.qwen.ai"));
-        if (!qwenPage) qwenPage = await context.newPage();
-
-        let dsDone = false;
-        let qwenDone = false;
-        let dsRaw = "";
-        let qwenRaw = "";
-        const dsFilledSymbols = new Set<string>();
-        const qwenFilledSymbols = new Set<string>();
-        const dsUploadedHashes = new Map<string, string>();
-        const qwenUploadedHashes = new Map<string, string>();
-
-        const dsInvestDir = path.join(outDir, "ds_investigation");
-        const qwenInvestDir = path.join(outDir, "qwen_investigation");
-        fs.mkdirSync(dsInvestDir, { recursive: true });
-        fs.mkdirSync(qwenInvestDir, { recursive: true });
-
-        let dsAttempt = 0;
-        while (!dsDone || !qwenDone) {
-          if (dsAttempt > 50) {
-            console.warn("[ORCHESTRATOR] Safety break: reached 50 turns.");
-            break;
-          }
-
-          const dsTurnDir = dsDone
-            ? ""
-            : prepareTurnDir(
-                outDir,
-                "ds",
-                dsAttempt,
-                dsBaseContextDir,
-                dsInvestDir,
-                dsUploadedHashes,
-              );
-          const qwenTurnDir = qwenDone
-            ? ""
-            : prepareTurnDir(
-                outDir,
-                "qwen",
-                dsAttempt,
-                dsBaseContextDir,
-                qwenInvestDir,
-                qwenUploadedHashes,
-              );
-
-          const dsNewFilesCount = dsDone ? 0 : fs.readdirSync(dsTurnDir).length;
-          const qwenNewFilesCount = qwenDone
-            ? 0
-            : fs.readdirSync(qwenTurnDir).length;
-
-          console.log(
-            `[ORCHESTRATOR] Starting Turn ${dsAttempt} in parallel...`,
-          );
-          setStatus(
-            `Turn ${dsAttempt} [DS: ${dsDone ? "✓" : "pending"}, Qwen: ${qwenDone ? "✓" : "pending"}]`,
-          );
-
-          const turnPrompt =
-            dsAttempt === 0
-              ? dsPromptString
-              : "Here are the files you requested. Please continue with your investigation.";
-
-          // Parallel Execution with allSettled — both models run concurrently
-          const [dsRes, qwenRes] = await Promise.allSettled([
-            !dsDone && (dsAttempt === 0 || dsNewFilesCount > 0)
-              ? askDeepseek(
-                  deepPage!,
-                  turnPrompt,
-                  rootManifestContent,
-                  dsTurnDir,
-                  (msg, partial, prog) =>
-                    setStatus(`[Deepseek] ${msg}`, partial, prog),
-                  outDir,
-                  dsAttempt === 0,
-                )
-              : Promise.resolve(dsRaw),
-            !qwenDone && (dsAttempt === 0 || qwenNewFilesCount > 0)
-              ? askQwen(
-                  qwenPage!,
-                  turnPrompt,
-                  rootManifestContent,
-                  qwenTurnDir,
-                  (msg, partial, prog) =>
-                    setStatus(`[Qwen] ${msg}`, partial, prog),
-                  outDir,
-                  dsAttempt === 0,
-                )
-              : Promise.resolve(qwenRaw),
-          ]);
-
-          if (dsRes.status === "fulfilled") {
-            // ONLY update dsRaw if we actually made a call!
-            // If dsRes was bypassed, it resolved with the existing dsRaw anyway.
-            if (!dsDone && (dsAttempt === 0 || dsNewFilesCount > 0)) {
-               dsRaw = dsRes.value;
-            }
-          } else {
-            console.warn("[ORCHESTRATOR] DeepSeek error:", dsRes.reason);
-            dsDone = true; // Abort DS if it errored to escape loop
-          }
-          if (qwenRes.status === "fulfilled") {
-            if (!qwenDone && (dsAttempt === 0 || qwenNewFilesCount > 0)) {
-               qwenRaw = qwenRes.value;
-            }
-          } else {
-            console.warn("[ORCHESTRATOR] Qwen error:", qwenRes.reason);
-            qwenDone = true;
-          }
-
-          if (!dsDone) {
-            try {
-              if (!dsRaw) {
-                console.warn(
-                  "[ORCHESTRATOR] DeepSeek raw response is empty. Retrying next turn...",
-                );
-              } else {
-                const cleaned = dsRaw.replace(/```json|```/g, "").trim();
-                const s = cleaned.indexOf("{");
-                const e = cleaned.lastIndexOf("}");
-                if (s !== -1 && e > s) {
-                  const data = JSON.parse(cleaned.slice(s, e + 1));
-                  if (data.status === "NEED_MORE_CONTEXT") {
-                    const mFiles = data.missing_files || data.missing_symbols;
-                    const realCount = await fillMissingFiles(
-                      mFiles,
-                      dsFilledSymbols,
-                      "DeepSeek",
-                      dsInvestDir,
-                      owner,
-                      repo,
-                      defaultBranch,
-                    );
-                    if (realCount === 0) {
-                      console.log(
-                        "[ORCHESTRATOR] DeepSeek: No new context files. Done.",
-                      );
-                      dsDone = true;
-                    }
-                  } else {
-                    console.log(
-                      `[ORCHESTRATOR] DeepSeek: Status ${data.status}. Done.`,
-                    );
-                    dsDone = true;
-                  }
-                } else {
-                  console.warn(
-                    "[ORCHESTRATOR] DeepSeek: No JSON in response. Marking done.",
-                  );
-                  dsDone = true;
-                }
-              }
-            } catch (err: any) {
-              console.error(
-                "[ORCHESTRATOR] DeepSeek parse error:",
-                err.message,
-              );
-            }
-          }
-
-          if (!qwenDone) {
-            try {
-              if (!qwenRaw) {
-                console.warn(
-                  "[ORCHESTRATOR] Qwen raw response is empty. Retrying next turn...",
-                );
-              } else {
-                const cleaned = qwenRaw.replace(/```json|```/g, "").trim();
-                const s = cleaned.indexOf("{");
-                const e = cleaned.lastIndexOf("}");
-                if (s !== -1 && e > s) {
-                  const data = JSON.parse(cleaned.slice(s, e + 1));
-                  if (data.status === "NEED_MORE_CONTEXT") {
-                    const mFiles = data.missing_files || data.missing_symbols;
-                    const realCount = await fillMissingFiles(
-                      mFiles,
-                      qwenFilledSymbols,
-                      "Qwen",
-                      qwenInvestDir,
-                      owner,
-                      repo,
-                      defaultBranch,
-                    );
-                    if (realCount === 0) {
-                      console.log(
-                        "[ORCHESTRATOR] Qwen: No new context files. Done.",
-                      );
-                      qwenDone = true;
-                    }
-                  } else {
-                    console.log(
-                      `[ORCHESTRATOR] Qwen: Status ${data.status}. Done.`,
-                    );
-                    qwenDone = true;
-                  }
-                } else {
-                  console.warn(
-                    "[ORCHESTRATOR] Qwen: No JSON in response. Marking done.",
-                  );
-                  qwenDone = true;
-                }
-              }
-            } catch (err: any) {
-              console.error("[ORCHESTRATOR] Qwen parse error:", err.message);
-            }
-          }
-          dsAttempt++;
-        }
-
-        console.log(
-          `[ORCHESTRATOR] Loop finished after ${dsAttempt} turns. DS: ${dsDone}, Qwen: ${qwenDone}`,
-        );
-
-        // Close orchestration tabs before final synthesis
-        await Promise.allSettled([deepPage.close(), qwenPage.close()]);
-
-        // ── Step 6: Final Synthesis ───────────────────────────────────────────
-
-        const checkInvalid = (raw: string) => {
-          if (!raw) return false;
-          try {
-            const cleaned = raw.replace(/```json|```/g, "").trim();
-            const s = cleaned.indexOf("{");
-            const e = cleaned.lastIndexOf("}");
-            if (s !== -1 && e > s) {
-              const data = JSON.parse(cleaned.slice(s, e + 1));
-              return data.status === "INVALID_QUESTION";
-            }
-          } catch {}
-          return false;
+        const initialPathBJson = {
+          intent: query,
+          context_files: contextFiles,
+          target_symbols: [],
         };
+        const contextResult = buildDeepseekContext(initialPathBJson, outDir);
+        fs.writeFileSync(
+          path.join(dsBaseContextDir, "context.js"),
+          contextResult.contextText,
+          "utf-8",
+        );
+        console.log(`[ORCHESTRATOR] Built base context in ${dsBaseContextDir}`);
 
-        if (checkInvalid(dsRaw) && checkInvalid(qwenRaw)) {
-          console.log(
-            "[ORCHESTRATOR] Both agents returned INVALID_QUESTION. Aborting synthesis.",
-          );
-          activeJobs.set(taskId, {
-            status: "done",
-            result: `Both investigation agents evaluated your query and determined it is an INVALID_QUESTION.\n\n### DeepSeek:\n${dsRaw}\n\n### Qwen:\n${qwenRaw}`,
-            answerSource: "final",
-          });
-          return;
-        }
-
-        const combinedResult = [
-          "// DEEPSEEK RESPONSE",
-          dsRaw || "// [No response]",
-          "",
-          "// QWEN RESPONSE",
-          qwenRaw || "// [No response]",
-        ].join("\n");
-
-        const combinedPath = path.join(outDir, "combined_responses.txt");
-        fs.writeFileSync(combinedPath, combinedResult, "utf-8");
-
-        setStatus("Synthesizing final answer with Gemini...");
-        const geminiPage =
-          context.pages().find((p) => p.url().includes("gemini.google.com")) ||
-          (await context.newPage());
-
-        const synthesisFiles = [combinedPath];
-
-        const finalResult = await askGemini(
-          geminiPage,
-          getGeminiSynthesisPrompt({ synthesisPrompt: query }),
-          synthesisFiles,
-          (msg) => setStatus(`[Gemini] ${msg}`),
+        // ── Step 6: Run the coder–reviewer loop ───────────────────────────────
+        setStatus("Starting coder–reviewer loop...");
+        const finalAnswer = await runCoderReviewerLoop(
+          query,
+          owner,
+          repo,
+          defaultBranch,
+          outDir,
+          dsBaseContextDir,
+          rootManifestContent,
+          context,
+          (msg) => setStatus(msg),
         );
 
         activeJobs.set(taskId, {
           status: "done",
-          result: finalResult,
-          answerSource: "final",
+          result: finalAnswer,
+          answerSource: "reviewed",
         });
       } catch (err: any) {
         console.error("[PROCESS-JOB] Error:", err);
@@ -1213,4 +1115,530 @@ Synthesize all the insights above into a single, cohesive, well-structured respo
       { status: 500 },
     );
   }
+}
+
+// ─── runSingleModelTurn ───────────────────────────────────────────────────────
+/**
+ * Sends one message to a model page (DeepSeek or Qwen) and handles
+ * NEED_MORE_CONTEXT loops internally, returning the final response string.
+ *
+ * @param role        - identifies which persistent page to use (dsCoder etc.)
+ * @param page        - the persistent Playwright Page for this chat
+ * @param prompt      - text prompt to send
+ * @param uploadDir   - optional dir of files to upload with this message (null = no upload)
+ * @param investDir   - staging dir for NEED_MORE_CONTEXT fulfillment
+ * @param filledSet   - dedup set for extra-file fetches
+ * @param outDir      - repo working dir
+ * @param owner/repo/branch - for GitHub fetches
+ * @param manifestContent - root manifest (passed to askDeepseek / askQwen)
+ * @param onStatus    - status callback
+ */
+async function runSingleModelTurn(
+  role: "DeepSeek" | "Qwen",
+  page: Page,
+  prompt: string,
+  uploadDir: string | null,
+  investDir: string,
+  filledSet: Set<string>,
+  outDir: string,
+  owner: string,
+  repo: string,
+  branch: string,
+  manifestContent: string,
+  onStatus: (msg: string) => void,
+  latestResponsePath?: string,
+): Promise<string> {
+  let done = false;
+  let attempt = 0;
+  let raw = "";
+  // seenHashes is LOCAL to this turn invocation — upload dir is passed explicitly
+  const uploadedHashes = new Map<string, string>();
+
+  while (!done && attempt < 20) {
+    // On the very first sub-turn use the provided uploadDir; subsequent sub-turns
+    // only upload new extra files produced by NEED_MORE_CONTEXT fulfillment.
+    let effectiveUploadDir: string | null = null;
+
+    if (attempt === 0 && uploadDir) {
+      effectiveUploadDir = uploadDir;
+      // Mark all files in uploadDir as seen so they're not re-uploaded
+      if (fs.existsSync(uploadDir)) {
+        for (const f of fs.readdirSync(uploadDir)) {
+          const src = path.join(uploadDir, f);
+          if (fs.statSync(src).isFile())
+            uploadedHashes.set(f, fileFingerprint(src));
+        }
+      }
+    } else {
+      // Build a dir of ONLY new extra files (if any)
+      const extraTurnDir = path.join(
+        outDir,
+        `${role.toLowerCase()}_extra_${attempt}_${Date.now()}`,
+      );
+      const newFiles: { src: string; dstName: string }[] = [];
+      if (fs.existsSync(investDir)) {
+        for (const f of fs.readdirSync(investDir)) {
+          const src = path.join(investDir, f);
+          if (!fs.statSync(src).isFile()) continue;
+          const fp = fileFingerprint(src);
+          if (uploadedHashes.get(f) === fp) continue;
+          newFiles.push({ src, dstName: f });
+        }
+      }
+      if (newFiles.length > 0) {
+        fs.mkdirSync(extraTurnDir, { recursive: true });
+        for (const item of newFiles) {
+          fs.copyFileSync(item.src, path.join(extraTurnDir, item.dstName));
+          uploadedHashes.set(item.dstName, fileFingerprint(item.src));
+        }
+        effectiveUploadDir = extraTurnDir;
+      }
+    }
+
+    const turnPrompt =
+      attempt === 0
+        ? prompt
+        : "Here are the additional context files you requested. Please continue.";
+
+    onStatus(`[${role}] Sub-turn ${attempt}...`);
+
+    try {
+      if (role === "DeepSeek") {
+        raw = await askDeepseek(
+          page,
+          turnPrompt,
+          manifestContent,
+          effectiveUploadDir || "",
+          (msg) => onStatus(`[${role}] ${msg}`),
+          outDir,
+          attempt === 0,
+        );
+      } else {
+        raw = await askQwen(
+          page,
+          turnPrompt,
+          effectiveUploadDir || "",
+          (msg) => onStatus(`[${role}] ${msg}`),
+          outDir,
+          attempt === 0,
+        );
+      }
+    } catch (err: any) {
+      onStatus(
+        `[${role}] CRITICAL: Sub-turn ${attempt} failed: ${err.message}`,
+      );
+      done = true;
+      break;
+    } finally {
+      // Clean up ephemeral extra dirs (not the main uploadDir which caller manages)
+      if (
+        attempt > 0 &&
+        effectiveUploadDir &&
+        fs.existsSync(effectiveUploadDir)
+      ) {
+        try {
+          fs.rmSync(effectiveUploadDir, { recursive: true, force: true });
+        } catch {}
+      }
+    }
+
+    // Parse response to check for NEED_MORE_CONTEXT
+    try {
+      const cleaned = raw.replace(/```json|```/g, "").trim();
+      const s = cleaned.indexOf("{");
+      const e = cleaned.lastIndexOf("}");
+      if (s !== -1 && e > s) {
+        const data = JSON.parse(cleaned.slice(s, e + 1));
+        if (data.status === "NEED_MORE_CONTEXT") {
+          const mFiles = data.missing_files || data.missing_symbols || [];
+          const fetched = await fillMissingFiles(
+            mFiles,
+            filledSet,
+            role,
+            investDir,
+            owner,
+            repo,
+            branch,
+            outDir,
+            latestResponsePath,
+          );
+          if (fetched === 0) {
+            onStatus(`[${role}] No new files fetched. Finishing.`);
+            done = true;
+          }
+        } else {
+          done = true;
+        }
+      } else {
+        done = true;
+      }
+    } catch {
+      done = true;
+    }
+
+    attempt++;
+  }
+
+  return raw;
+}
+
+// ─── runCoderReviewerLoop ─────────────────────────────────────────────────────
+/**
+ * The main coder–reviewer iteration loop.
+ *
+ * Flow per iteration:
+ *   1. Both coders run in parallel  → Gemini combines → combined_response_N.txt
+ *   2. Both reviewers run in parallel → Gemini combines → combined_review_N.txt
+ *   3. If HAS_ISSUES=NO  → return final Gemini synthesis
+ *   4. If HAS_ISSUES=YES → feed combined_review_N.txt back to coders → go to 1
+ *
+ * Base context (context.js + manifest) is uploaded ONLY on the very first coder turn.
+ * Reviewers receive combined_response_N.txt on their FIRST review turn (files already in chat thereafter).
+ */
+export async function runCoderReviewerLoop(
+  query: string,
+  owner: string,
+  repo: string,
+  defaultBranch: string,
+  outDir: string,
+  dsBaseContextDir: string,
+  rootManifestContent: string,
+  context: BrowserContext,
+  onStatus: (msg: string) => void,
+): Promise<string> {
+  const MAX_ROUNDS = 10;
+
+  // ── Investment dirs (for NEED_MORE_CONTEXT extra file staging) ────────────
+  const dsCoderInvestDir = path.join(outDir, "invest_ds_coder");
+  const qwenCoderInvestDir = path.join(outDir, "invest_qwen_coder");
+  const dsReviewInvestDir = path.join(outDir, "invest_ds_reviewer");
+  const qwenReviewInvestDir = path.join(outDir, "invest_qwen_reviewer");
+  [
+    dsCoderInvestDir,
+    qwenCoderInvestDir,
+    dsReviewInvestDir,
+    qwenReviewInvestDir,
+  ].forEach((d) => fs.mkdirSync(d, { recursive: true }));
+
+  // ── Dedup sets per role ───────────────────────────────────────────────────
+  const dsCoderFilled = new Set<string>();
+  const qwenCoderFilled = new Set<string>();
+  const dsReviewFilled = new Set<string>();
+  const qwenReviewFilled = new Set<string>();
+
+  // ── Helper: DeepSeek combine helper ────────────────────────────────────────
+  const deepseekCombine = async (
+    systemPrompt: string,
+    filesToAttach: string[],
+    stepLabel: string,
+    latestReview?: string,
+  ): Promise<string> => {
+    onStatus(`[DeepSeek] ${stepLabel}...`);
+    // Create a temporary directory for synthesis files
+    const synthDir = path.join(outDir, `synth_${Date.now()}`);
+    fs.mkdirSync(synthDir, { recursive: true });
+    for (const f of filesToAttach) {
+      fs.copyFileSync(f, path.join(synthDir, path.basename(f)));
+    }
+
+    if (latestReview) {
+      fs.writeFileSync(path.join(synthDir, "latest_review.txt"), latestReview, "utf-8");
+    }
+
+    const res = await askDeepseek(
+      persistentPages.dsSynthesizer!,
+      systemPrompt,
+      "", // No manifest needed for synthesis
+      synthDir,
+      (msg) => onStatus(`[DeepSeek ${stepLabel}] ${msg}`),
+      outDir,
+      false, // isFirstTurn = false to skip manifest/metadata upload
+    );
+    try {
+      fs.rmSync(synthDir, { recursive: true, force: true });
+    } catch {}
+    return res;
+  };
+
+  // Track whether each role has already uploaded files (so we know first-turn vs follow-up)
+  let coderFirstTurn = true; // first CODER turn ever (upload base context)
+  let reviewerFirstTurn = true; // first REVIEWER turn ever (upload combined_response)
+
+  let activeResponsePath = ""; // path to current combined_response_N.txt
+  let finalSynthesis = "";
+
+  for (let round = 0; round < MAX_ROUNDS; round++) {
+    onStatus(`=== Round ${round} ===`);
+
+    // ────────────────────────────────────────────────────────────────────────
+    // CODER PHASE
+    // ────────────────────────────────────────────────────────────────────────
+    const coderPrompt =
+      round === 0
+        ? getDeepseekCodingPrompt({ userQuery: query, mode: "FIX" })
+        : getCoderRefinementPrompt({
+            userQuery: query,
+            owner,
+            repo,
+            defaultBranch,
+            hasLatestResponse: !!activeResponsePath,
+          });
+
+    // Build coder upload dir
+    let coderUploadDir: string | null = null;
+    if (coderFirstTurn) {
+      // First coder turn: upload entire base context
+      coderUploadDir = path.join(outDir, "coder_upload_round0");
+      if (fs.existsSync(coderUploadDir))
+        fs.rmSync(coderUploadDir, { recursive: true, force: true });
+      fs.mkdirSync(coderUploadDir, { recursive: true });
+      for (const f of fs.readdirSync(dsBaseContextDir)) {
+        if (f === "gap_filler.txt") continue;
+        fs.copyFileSync(
+          path.join(dsBaseContextDir, f),
+          path.join(coderUploadDir, f),
+        );
+      }
+    } else {
+      // Subsequent coder turns: upload ONLY the latest combined_review
+      const reviewPath = path.join(outDir, `combined_review_${round - 1}.txt`);
+      if (fs.existsSync(reviewPath)) {
+        coderUploadDir = path.join(outDir, `coder_upload_round${round}`);
+        if (fs.existsSync(coderUploadDir))
+          fs.rmSync(coderUploadDir, { recursive: true, force: true });
+        fs.mkdirSync(coderUploadDir, { recursive: true });
+        fs.copyFileSync(
+          reviewPath,
+          path.join(coderUploadDir, path.basename(reviewPath)),
+        );
+      }
+    }
+
+    onStatus(`Round ${round}: Running both coders in parallel...`);
+    const [dsCoderRaw, qwenCoderRaw] = await Promise.all([
+      runSingleModelTurn(
+        "DeepSeek",
+        persistentPages.dsCoder!,
+        coderPrompt,
+        coderUploadDir,
+        dsCoderInvestDir,
+        dsCoderFilled,
+        outDir,
+        owner,
+        repo,
+        defaultBranch,
+        rootManifestContent,
+        onStatus,
+        activeResponsePath,
+      ),
+      runSingleModelTurn(
+        "Qwen",
+        persistentPages.qwenCoder!,
+        coderPrompt,
+        coderUploadDir,
+        qwenCoderInvestDir,
+        qwenCoderFilled,
+        outDir,
+        owner,
+        repo,
+        defaultBranch,
+        rootManifestContent,
+        onStatus,
+        activeResponsePath,
+      ),
+    ]);
+    coderFirstTurn = false;
+
+    // Cleanup coder upload dir
+    if (coderUploadDir && fs.existsSync(coderUploadDir)) {
+      try {
+        fs.rmSync(coderUploadDir, { recursive: true, force: true });
+      } catch {}
+    }
+
+    // Save raw coder outputs
+    const rawCoderBlock = [
+      `// CODER_A (DeepSeek) — Round ${round}`,
+      dsCoderRaw || "// [No response]",
+      "",
+      `// CODER_B (Qwen) — Round ${round}`,
+      qwenCoderRaw || "// [No response]",
+    ].join("\n");
+
+    const rawCoderPath = path.join(
+      outDir,
+      `combined_response_raw_${round}.txt`,
+    );
+    fs.writeFileSync(rawCoderPath, rawCoderBlock, "utf-8");
+
+    // DeepSeek synthesises coder outputs → combined_response_N.txt
+    const coderSynthesis = await deepseekCombine(
+      getGeminiSynthesisPrompt({
+        synthesisPrompt: query,
+        latestReview: round > 0 ? finalSynthesis : undefined,
+      }),
+      [rawCoderPath],
+      `Synthesizing coder outputs (round ${round})`,
+      round > 0 ? finalSynthesis : undefined,
+    );
+
+    activeResponsePath = path.join(outDir, `combined_response_${round}.txt`);
+    fs.writeFileSync(activeResponsePath, coderSynthesis, "utf-8");
+    
+    // Save a full debug version containing raw coder outputs + synthesis
+    const debugResponsePath = path.join(outDir, `combined_response_debug_${round}.txt`);
+    fs.writeFileSync(
+      debugResponsePath,
+      [
+        rawCoderBlock,
+        "=".repeat(60) + "\n",
+        `// DEEPSEEK SYNTHESIS — ROUND ${round}`,
+        "=".repeat(60) + "\n\n",
+        coderSynthesis,
+      ].join("\n"),
+      "utf-8",
+    );
+    onStatus(`combined_response_${round}.txt (clean synthesis) and debug log written.`);
+
+    // Surface intermediate answer to user
+    activeJobs.forEach((job, id) => {
+      if (
+        job.statusText?.includes("coder") ||
+        job.statusText?.includes("Round")
+      ) {
+        activeJobs.set(id, {
+          ...job,
+          result: coderSynthesis,
+          answerSource: "initial",
+        });
+      }
+    });
+
+    // ────────────────────────────────────────────────────────────────────────
+    // REVIEWER PHASE
+    // ────────────────────────────────────────────────────────────────────────
+    const reviewerPrompt = getCodeReviewPrompt({
+      userQuery: query,
+      owner,
+      repo,
+      defaultBranch,
+    });
+
+    // Build reviewer upload dir — always send the latest combined_response
+    const reviewerUploadDir = path.join(
+      outDir,
+      `reviewer_upload_round${round}`,
+    );
+    if (fs.existsSync(reviewerUploadDir))
+      fs.rmSync(reviewerUploadDir, { recursive: true, force: true });
+    fs.mkdirSync(reviewerUploadDir, { recursive: true });
+    fs.copyFileSync(
+      activeResponsePath,
+      path.join(reviewerUploadDir, path.basename(activeResponsePath)),
+    );
+
+    onStatus(`Round ${round}: Running both reviewers in parallel...`);
+    const [dsReviewRaw, qwenReviewRaw] = await Promise.all([
+      runSingleModelTurn(
+        "DeepSeek",
+        persistentPages.dsReviewer!,
+        reviewerPrompt,
+        reviewerUploadDir,
+        dsReviewInvestDir,
+        dsReviewFilled,
+        outDir,
+        owner,
+        repo,
+        defaultBranch,
+        rootManifestContent,
+        onStatus,
+        activeResponsePath,
+      ),
+      runSingleModelTurn(
+        "Qwen",
+        persistentPages.qwenReviewer!,
+        reviewerPrompt,
+        reviewerUploadDir,
+        qwenReviewInvestDir,
+        qwenReviewFilled,
+        outDir,
+        owner,
+        repo,
+        defaultBranch,
+        rootManifestContent,
+        onStatus,
+        activeResponsePath,
+      ),
+    ]);
+    reviewerFirstTurn = false;
+
+    // Cleanup reviewer upload dir
+    if (fs.existsSync(reviewerUploadDir)) {
+      try {
+        fs.rmSync(reviewerUploadDir, { recursive: true, force: true });
+      } catch {}
+    }
+
+    // Save raw review outputs
+    const rawReviewBlock = [
+      `// REVIEWER_A (DeepSeek) — Round ${round}`,
+      dsReviewRaw || "// [No response]",
+      "",
+      `// REVIEWER_B (Qwen) — Round ${round}`,
+      qwenReviewRaw || "// [No response]",
+    ].join("\n");
+
+    const rawReviewPath = path.join(outDir, `combined_review_raw_${round}.txt`);
+    fs.writeFileSync(rawReviewPath, rawReviewBlock, "utf-8");
+
+    // DeepSeek synthesises reviewer outputs → combined_review_N.txt
+    const reviewSynthesis = await deepseekCombine(
+      getReviewSynthesisPrompt(),
+      [rawReviewPath],
+      `Synthesizing reviewer outputs (round ${round})`,
+    );
+
+    const combinedReviewPath = path.join(
+      outDir,
+      `combined_review_${round}.txt`,
+    );
+    fs.writeFileSync(
+      combinedReviewPath,
+      [
+        rawReviewBlock,
+        "=".repeat(60) + "\n",
+        `// DEEPSEEK REVIEW SYNTHESIS — ROUND ${round}`,
+        "=".repeat(60) + "\n\n",
+        reviewSynthesis,
+      ].join("\n"),
+      "utf-8",
+    );
+    onStatus(`combined_review_${round}.txt written.`);
+
+    finalSynthesis = reviewSynthesis;
+
+    // Check if reviewers are satisfied
+    const hasIssues = /HAS_ISSUES:\s*YES/i.test(reviewSynthesis);
+    onStatus(`Round ${round} verdict — HAS_ISSUES: ${hasIssues}`);
+
+    if (!hasIssues) {
+      onStatus(
+        `Round ${round}: Reviewers satisfied. Loop complete after ${round + 1} round(s).`,
+      );
+      break;
+    }
+
+    if (round + 1 >= MAX_ROUNDS) {
+      onStatus("Max rounds reached. Returning best available answer.");
+      break;
+    }
+
+
+    onStatus(
+      `Round ${round}: Issues found — coders will refine in round ${round + 1}.`,
+    );
+    // Loop continues; next iteration coderFirstTurn=false so coders get combined_review
+  }
+
+  return finalSynthesis;
 }

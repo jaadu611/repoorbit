@@ -41,8 +41,8 @@ const SPLIT_LINE_THRESHOLD = 80;
 // before it in the source file (to get require/import and module-level config)
 // and N lines after it (to get module.exports and sibling wiring). These are
 // emitted as labelled sections so the model sees the full calling context.
-const SURROUNDING_LINES_BEFORE = 40; // enough to capture require() at top of file
-const SURROUNDING_LINES_AFTER = 20; // enough to capture module.exports below fn
+const SURROUNDING_LINES_BEFORE = 100; // Increased to capture more context
+const SURROUNDING_LINES_AFTER = 50;  // Increased to capture more context
 
 // ---------------------------------------------------------------------------
 // DEPENDENCY MANIFEST CO-EXTRACTION
@@ -69,6 +69,40 @@ const DEPENDENCY_MANIFEST_NAMES = [
   "build.gradle",
   "pom.xml",
 ];
+
+/**
+ * Extracts the "header" of a file (imports, requires, top-level comments).
+ * This ensures the model always sees what modules are in scope.
+ */
+function extractFileHeader(code: string, maxLines = 100): string {
+  const lines = code.split("\n");
+  const headerLines: string[] = [];
+  
+  // Basic heuristic: stop at the first line that doesn't look like an import,
+  // require, comment, or whitespace.
+  const importRegex = /^(import|require|const\s+\w+\s*=\s*require|from\s+['"]|@import|use\s+|mod\s+|#include|package\s+)/;
+  const commentRegex = /^(\/|\*|#|--)/;
+  const whitespaceRegex = /^\s*$/;
+
+  for (let i = 0; i < Math.min(lines.length, maxLines); i++) {
+    const line = lines[i].trim();
+    if (line === "" || importRegex.test(line) || commentRegex.test(line) || whitespaceRegex.test(line)) {
+      headerLines.push(lines[i]);
+    } else {
+      // If we hit real code, we might want to include it if it's very early, 
+      // but let's be conservative to avoid noise. 
+      // Actually, let's just take the first N lines anyway if it's really the top of the file.
+      break;
+    }
+  }
+
+  if (headerLines.length === 0 && lines.length > 0) {
+    // If our heuristic failed but there's content, just take the first 20 lines
+    return lines.slice(0, 20).join("\n") + "\n// [... header heuristic ended ...]\n";
+  }
+
+  return headerLines.join("\n");
+}
 
 /**
  * Walks up from `startDir` toward `repoRoot` root looking for a dependency
@@ -220,10 +254,21 @@ export function buildDeepseekContext(
     }
   }
 
+  // Load graph.json if it exists
+  const graphPath = path.join(outDir, "graph.json");
+  let importGraph: Record<string, { imports: string[]; imported_by: string[] }> = {};
+  if (fs.existsSync(graphPath)) {
+    try {
+      importGraph = JSON.parse(fs.readFileSync(graphPath, "utf-8"));
+    } catch (err) {
+      console.warn("[buildDeepseekContext] Could not load graph.json:", err);
+    }
+  }
+
   const extractedBlocks: string[] = [];
   const processedPairs = new Set<string>(); // `${fullPath}|${hint}`
 
-  const repoRoot = path.dirname(outDir);
+  const repoRoot = outDir;
 
   // =========================================================================
   // SECTION 1: Mission Metadata Header
@@ -243,7 +288,6 @@ export function buildDeepseekContext(
   // =========================================================================
   // SECTION 6: Symbol & File Resolution
   // =========================================================================
-  const symbolsPath = path.join(outDir, "symbols.json");
   // The notebook files stored in outDir are the repository source ground truth
   const notebooksMetaPath = path.join(outDir, "notebooks.json");
   const notebooksDir = outDir; // notebook_01, notebook_02, ... live here
@@ -321,22 +365,7 @@ export function buildDeepseekContext(
       }
     }
   }
-
-  // ------------------------------------------------------------------
-  // Load symbol index
-  // ------------------------------------------------------------------
-  let symbolIndex: Record<
-    string,
-    { defined_in: string; used_by_files: string }
-  > = {};
-
-  try {
-    if (fs.existsSync(symbolsPath)) {
-      symbolIndex = JSON.parse(fs.readFileSync(symbolsPath, "utf-8"));
-    }
-  } catch (err) {
-    console.warn("Could not load symbols index:", err);
-  }
+  const symbolIndex: Record<string, any> = {};
 
   // =========================================================================
   // SECTION 5 (NEW): Dependency Manifest Co-Extraction
@@ -361,6 +390,14 @@ export function buildDeepseekContext(
       `// =============================================================================`,
     );
     extractedBlocks.push(content);
+
+    // Root package.json is extra important — force include it if we are at root
+    const rootPackageJson = path.join(repoRoot, "package.json");
+    if (fs.existsSync(rootPackageJson) && rel !== "package.json") {
+       const rootContent = fs.readFileSync(rootPackageJson, "utf-8");
+       extractedBlocks.push(`\n// --- Root package.json (forced) ---`);
+       extractedBlocks.push(rootContent);
+    }
 
     const mfn: string = rel.replace(/[^a-zA-Z0-9_-]/g, "_");
     const manifestFileName = `dep_manifest_${mfn}.txt`;
@@ -567,15 +604,23 @@ export function buildDeepseekContext(
       );
 
       let snippet: string;
+      const fileHeader = extractFileHeader(code).trim();
+      let nodeContext = "";
+      const nodeInfo = importGraph[relPath];
+      if (nodeInfo) {
+        if (nodeInfo.imports.length > 0) nodeContext += `// [DEPENDENCIES] Imports: ${nodeInfo.imports.join(", ")}\n`;
+        if (nodeInfo.imported_by.length > 0) nodeContext += `// [CONSUMERS] Used by: ${nodeInfo.imported_by.join(", ")}\n`;
+        if (nodeContext) nodeContext += "\n";
+      }
+
       if (hitLines.length > 0) {
         const centre = hitLines[0];
-        // Use the larger of 150 or SURROUNDING_LINES_BEFORE so require()
-        // statements at the top of the file are always captured.
+        // Use larger windows for fallback too
         const from = Math.max(
           0,
-          centre - Math.max(150, SURROUNDING_LINES_BEFORE),
+          centre - Math.max(200, SURROUNDING_LINES_BEFORE),
         );
-        const to = Math.min(lines.length - 1, centre + 150);
+        const to = Math.min(lines.length - 1, centre + 200);
         snippet =
           (from > 0 ? `// [truncated ${from} lines before...]\n` : "") +
           lines.slice(from, to + 1).join("\n") +
@@ -583,7 +628,7 @@ export function buildDeepseekContext(
             ? `\n// [...truncated ${lines.length - to - 1} lines after]`
             : "");
       } else {
-        const CAP = 200;
+        const CAP = 300;
         snippet =
           lines.slice(0, CAP).join("\n") +
           (lines.length > CAP
@@ -591,12 +636,23 @@ export function buildDeepseekContext(
             : "");
       }
 
+      // Prepend header and dependency info to the fallback snippet
+      const finalSnippet = [
+        `// Source: ${relPath}`,
+        `// Symbol: ${hint} (windowed fallback)`,
+        ``,
+        fileHeader ? `// --- File Header (Imports/Setup) ---\n${fileHeader}\n` : "",
+        nodeContext,
+        `// --- Content Window ---`,
+        snippet,
+      ].filter(Boolean).join("\n");
+
       const safeName = hint.replace(/[^a-zA-Z0-9_-]/g, "_");
       const splitFileName = `${safeName}.js`;
       const splitFilePath = path.join(contextDir, splitFileName);
       fs.writeFileSync(
         splitFilePath,
-        `// Source: ${relPath}\n// Symbol: ${hint} (windowed fallback)\n\n${snippet}`,
+        finalSnippet,
         "utf-8",
       );
       extractedBlocks.push(
@@ -628,6 +684,7 @@ export function buildDeepseekContext(
 
       let prefixText = "";
       let suffixText = "";
+      const fileHeader = extractFileHeader(code).trim();
 
       if (blockCharStart >= 0) {
         const surrounding = extractSurroundingContext(
@@ -639,6 +696,25 @@ export function buildDeepseekContext(
         suffixText = surrounding.suffix.trim();
       }
 
+      // If the fileHeader is not already in the prefixText, prepend it
+      // to ensure the model sees the imports.
+      let fullBlockContext = "";
+      if (fileHeader && !prefixText.includes(fileHeader.substring(0, 50))) {
+        fullBlockContext += `// --- File Header (Imports/Setup) ---\n${fileHeader}\n\n`;
+      }
+
+      // Add dependency info from graph.json if available
+      const nodeInfo = importGraph[relPath];
+      if (nodeInfo) {
+        if (nodeInfo.imports.length > 0) {
+          fullBlockContext += `// [DEPENDENCIES] This file imports: ${nodeInfo.imports.join(", ")}\n`;
+        }
+        if (nodeInfo.imported_by.length > 0) {
+          fullBlockContext += `// [CONSUMERS] This file is used by: ${nodeInfo.imported_by.join(", ")}\n`;
+        }
+        fullBlockContext += "\n";
+      }
+
       if (lineCount > SPLIT_LINE_THRESHOLD) {
         const safeName = hint.replace(/[^a-zA-Z0-9_-]/g, "_");
         const splitFileName = `${safeName}.js`;
@@ -647,10 +723,11 @@ export function buildDeepseekContext(
         // Write prefix + body + suffix into the split file so it is
         // fully self-contained: the model sees require() stmts, the
         // function, and the module.exports line all in one file.
-        const fullContent = [
+        const fullContentItems = [
           `// Source: ${relPath}`,
           `// Symbol: ${hint}`,
           ``,
+          fullBlockContext,
           prefixText
             ? `// --- Module context before ${hint} (require/imports/module-level config) ---\n${prefixText}\n`
             : "",
@@ -659,7 +736,9 @@ export function buildDeepseekContext(
           suffixText
             ? `\n// --- Module context after ${hint} (exports/wiring) ---\n${suffixText}`
             : "",
-        ]
+        ];
+
+        const fullContent = fullContentItems
           .filter((s) => s !== "")
           .join("\n");
 
@@ -668,7 +747,10 @@ export function buildDeepseekContext(
           `// --- See: ${splitFileName} (${lineCount} lines, split to keep context readable) ---`,
         );
       } else {
-        // Inline: emit prefix → body → suffix with clear section labels
+        // Inline: emit header/deps → prefix → body → suffix with clear section labels
+        if (fullBlockContext) {
+          extractedBlocks.push(fullBlockContext);
+        }
         if (prefixText) {
           extractedBlocks.push(
             `// --- Module context before ${hint} (require/imports/module-level config) ---`,
@@ -781,7 +863,7 @@ interface CandidateFile {
 
 function resolveCandidateFiles(
   hint: string,
-  symbolIndex: Record<string, { defined_in: string; used_by_files: string }>,
+  symbolIndex: Record<string, any>,
   contextFiles: string[],
   notebooksLookup: Array<{ name: string; files: string[]; localFiles: string[] }>,
   repoRoot: string,

@@ -593,7 +593,7 @@ export interface JobStatus {
   error?: string;
   statusText?: string;
   progress?: number;
-  answerSource?: "planner" | "final" | "chatgpt";
+  answerSource?: "planner" | "final" | "chatgpt" | "initial" | "reviewed";
 }
 
 export interface LightFileMetadata {

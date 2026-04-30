@@ -59,94 +59,13 @@ export async function askDeepseek(
 
     // graph.json is excluded — 68k+ lines for Postgres, irrelevant for function-level fixes.
     // Dependency info is already embedded in context.js via // --- Source: ... --- headers.
-    const rootMetadata = ["00_Root_Manifest.txt", "symbols.json"];
-
-    // ── Determine query-relevant symbols from the already-written context.js ─
-    // This lets us filter symbols.json to only entries that are actually in scope.
-    const contextJsPath = path.join(outDir, "deepseek_context", "context.js");
-    const querySymbols = new Set<string>();
-    if (fs.existsSync(contextJsPath)) {
-      try {
-        const ctxText = fs.readFileSync(contextJsPath, "utf-8");
-        // Extract symbol names from comment headers: "// --- Symbol: "foo" | ..."
-        for (const m of ctxText.matchAll(/\/\/ --- Symbol: "([^"]+)"/g)) {
-          if (m[1]) querySymbols.add(m[1].toLowerCase());
-        }
-        // Also extract source file names to pull their symbols
-        for (const m of ctxText.matchAll(
-          /\/\/ --- (?:Raw )?Source: ([^\s]+) ---/g,
-        )) {
-          if (m[1])
-            querySymbols.add(m[1].toLowerCase().replace(/\.[^.]+$/, ""));
-        }
-      } catch {}
-    }
+    const rootMetadata = ["00_Root_Manifest.txt"];
 
     for (const fileName of rootMetadata) {
       const filePath = path.join(metadataBase, fileName);
       if (fs.existsSync(filePath)) {
-        let content = fs.readFileSync(filePath, "utf-8");
-
-        // --- SYMBOLS.JSON: Filter to query-relevant entries only ---
-        if (fileName === "symbols.json") {
-          try {
-            const syms = JSON.parse(content);
-            const filtered: string[] = [];
-            const MAX_SYMBOLS = 500;
-
-            for (const [name, data] of Object.entries(syms) as [
-              string,
-              any,
-            ][]) {
-              if (filtered.length >= MAX_SYMBOLS) break;
-
-              const pathStr = (data.defined_in || "") as string;
-
-              // Always skip noise paths
-              if (
-                pathStr.includes("/test/") ||
-                pathStr.includes("/tests/") ||
-                pathStr.includes("/expected/") ||
-                pathStr.includes("/doc/") ||
-                pathStr.endsWith(".out") ||
-                pathStr.endsWith(".sgml") ||
-                pathStr.endsWith(".txt")
-              )
-                continue;
-
-              // Always skip numeric names
-              if (/^\d+$/.test(name)) continue;
-
-              // If we know the query symbols — only include relevant ones
-              if (querySymbols.size > 0) {
-                const lowerName = name.toLowerCase();
-                const lowerPath = pathStr.toLowerCase().replace(/\.[^.]+$/, "");
-                const isRelevant =
-                  querySymbols.has(lowerName) ||
-                  [...querySymbols].some(
-                    (qs) => lowerPath.includes(qs) || lowerName.includes(qs),
-                  );
-                if (!isRelevant) continue;
-              }
-
-              filtered.push(`${name}: ${pathStr}`);
-            }
-
-            if (filtered.length === 0) {
-              filtered.push("// No query-relevant symbols found in this turn.");
-            }
-            content = filtered.join("\n");
-            console.log(
-              `[Deepseek] Filtered symbols.json to ${filtered.length} query-relevant entries (query symbols: ${[...querySymbols].join(", ") || "all"})`,
-            );
-          } catch (e) {
-            console.warn(`[Deepseek] Failed to filter symbols.json: ${e}`);
-          }
-        }
-
-        const fileNameToUpload =
-          fileName === "symbols.json" ? "symbols.txt" : fileName;
-        const tmpPath = path.join(sessionDir, fileNameToUpload);
+        const content = fs.readFileSync(filePath, "utf-8");
+        const tmpPath = path.join(sessionDir, fileName);
         fs.writeFileSync(tmpPath, content, "utf-8");
         allTmpPaths.push(tmpPath);
         console.log(
@@ -196,8 +115,10 @@ async function uploadFilesToDeepseek(
   if (filePaths.length === 0) return;
 
   const attemptUpload = async () => {
-    // Upload files sequentially (1-by-1) to avoid freezing DeepSeek's document parser queue
+    // Stage 1: Attempt the sequential upload
     for (const file of filePaths) {
+      console.log(`[Deepseek] Uploading file 1-by-1: ${path.basename(file)}...`);
+      
       const attachSelectors = [
         'button[aria-label*="attach" i]',
         'button[aria-label*="upload" i]',
@@ -208,13 +129,12 @@ async function uploadFilesToDeepseek(
       ];
 
       let fileInput = await page.$('input[type="file"]');
-
       if (!fileInput) {
         for (const sel of attachSelectors) {
           try {
-            const btn = await page.$(sel);
-            if (btn) {
-              await btn.click();
+            const exists = await page.waitForSelector(sel, { timeout: 1000 }).catch(() => null);
+            if (exists) {
+              await page.click(sel, { force: true });
               await page.waitForTimeout(500);
               fileInput = await page.$('input[type="file"]');
               if (fileInput) break;
@@ -224,7 +144,7 @@ async function uploadFilesToDeepseek(
       }
 
       if (!fileInput) {
-        fileInput = (await page.evaluateHandle(() => {
+        const handle = await page.evaluateHandle(() => {
           const inputs = Array.from(
             document.querySelectorAll('input[type="file"]'),
           );
@@ -238,41 +158,37 @@ async function uploadFilesToDeepseek(
             el.style.zIndex = "99999";
           }
           return el ?? null;
-        })) as any;
+        });
+        fileInput = handle.asElement();
       }
 
-      if (!fileInput) {
-        throw new Error("Could not find a file input on DeepSeek.");
-      }
-
-      // Upload one file at a time
+      if (!fileInput) throw new Error("Could not find a file input on DeepSeek.");
       await fileInput.setInputFiles([file]);
-
-      // Give the UI a moment to insert the file chip
       await page.waitForTimeout(1000);
 
-      // Proper Checker: Look specifically for indicator text on file items
-      await page.waitForFunction(() => {
-        const fileChips = Array.from(
-          document.querySelectorAll('[class*="file"], [class*="upload"], [class*="attach"]')
-        );
-        for (const chip of fileChips) {
-          const text = (chip as HTMLElement).innerText?.toLowerCase() || "";
-          if (
-            text.includes("pending") ||
-            text.includes("parsing") ||
-            text.includes("uploading") ||
-            text.includes("loading")
-          ) {
-            return false;
+      // Wait for the parsing chip to clear
+      try {
+        await page.waitForFunction(() => {
+          const fileChips = Array.from(
+            document.querySelectorAll('[class*="file"], [class*="upload"], [class*="attach"]')
+          );
+          for (const chip of fileChips) {
+            const text = (chip as HTMLElement).innerText?.toLowerCase() || "";
+            if (
+              text.includes("pending") ||
+              text.includes("parsing") ||
+              text.includes("uploading") ||
+              text.includes("loading")
+            ) {
+              return false;
+            }
           }
-        }
-        
-        // Also ensure no active global spinner
-        return !document.querySelector('[class*="uploading"], [class*="spinner"], .ds-loading');
-      }, { timeout: 60000 }).catch(() => {
-        // Assume partial success if it timed out and keep iterating
-      });
+          return !document.querySelector('[class*="uploading"], [class*="spinner"], .ds-loading');
+        }, { timeout: 45_000 });
+      } catch (err) {
+        console.warn(`[Deepseek] Parsing stalled for ${path.basename(file)}. Reloading page...`);
+        throw new Error("RELOAD_SIGNAL");
+      }
       
       await page.waitForTimeout(1000);
     }
@@ -281,9 +197,13 @@ async function uploadFilesToDeepseek(
   try {
     await attemptUpload();
   } catch (err: any) {
-    console.warn(
-      `[Deepseek] Upload attempt timed out. Continuing assuming partial success...`,
-    );
+    if (err.message === "RELOAD_SIGNAL") {
+      console.log("[Deepseek] Triggering page reload and restarting upload...");
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForTimeout(5000);
+      return uploadFilesToDeepseek(page, filePaths); // Retry from start
+    }
+    console.error(`[Deepseek] CRITICAL: Upload sequence failed: ${err.message}`);
   }
 }
 
@@ -373,8 +293,13 @@ async function waitForDeepseekCompletion(
           );
         }) ||
         document.querySelector(
-          '.ds-loading, [class*="loading"], [class*="generating"], [class*="spinner"]',
+          '.ds-loading, [class*="loading"], [class*="generating"], .ds-icon-stop'
         ) !== null;
+
+      // New: Check for indicators that it IS finished
+      const isDone = document.querySelector(
+        'button[aria-label*="Regenerate" i], .ds-icon-regenerate, [class*="regenerate"], .ds-icon-copy'
+      ) !== null;
 
       const selectors = [
         '[data-message-author-role="assistant"]',
@@ -396,7 +321,8 @@ async function waitForDeepseekCompletion(
       if (!lastBubble) return null;
       const text = lastBubble.innerText?.trim() ?? "";
       if (!text) return null;
-      return { text, isGenerating };
+      
+      return { text, isGenerating: isGenerating && !isDone };
     });
 
     if (candidate && candidate.text.length > 0) {

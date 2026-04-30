@@ -14,7 +14,7 @@ Your job is to study the existing patterns and implement the missing mechanism.
 
 ### CONTEXT & SELF-SUFFICIENCY
 - CONTEXT REQUEST: If you need to see the context of any file (especially for missing local imports), you can ask for it via the status: "NEED_MORE_CONTEXT" protocol below.
-- SELF-SUFFICIENCY: Prioritize searching for and understanding the files you already have before asking for more. Use the symbols index and call sites provided to infer behavior where possible.
+- SELF-SUFFICIENCY: Prioritize searching for and understanding the files you already have before asking for more. Use the provided context and call sites to infer behavior where possible.
 - GROUND TRUTH URL: Any file in this repository can be accessed via: https://raw.githubusercontent.com/[owner]/[repo]/main/[path]. If you absolutely cannot resolve a symbol or logic flow with provided context, request the file via path.
 - NO HALLUCINATION: If context is missing, ASK FOR IT. Do NOT hallucinate code, file paths, or system behavior. Working without necessary context is strictly forbidden.
 
@@ -98,12 +98,27 @@ tests and provide feedback until the implementation is bulletproof.
 
 ---
 
-### OUTPUT FORMAT
+### OUTPUT FORMAT — STRICT: CHANGED PARTS ONLY
 
-- Output ONLY the new and modified functions.
-- Complete function bodies — no truncation.
-- One header line per function: // path/to/file.go — reason for adding/changing.
+⚠ DO NOT output entire files. You will only output the specific functions, types,
+or blocks that are new or modified. Outputting an entire file is strictly forbidden
+and will corrupt the downstream merge step.
+
+Structure your output as follows:
+
+// path/to/file.go — reason for adding/changing this block
+// ── BEGIN CHANGE ────────────────────────────────────────
+[your new or modified function / type / block here — complete body, no truncation]
+// ── END CHANGE ──────────────────────────────────────────
+
+RULES:
+- One BEGIN/END block per changed unit (function, type, const block, etc.).
+- Multiple changed units in the same file each get their own BEGIN/END block.
+- The header line above each block MUST include the file path and reason.
+- Complete function bodies inside each block — no "..." or truncation.
 - No explanations outside of code comments.
+- No surrounding file content, package declarations, or import blocks unless
+  the imports themselves are the change.
 `;
   }
 
@@ -113,7 +128,7 @@ You are fixing a production bug in a real codebase. You have been given the exac
 
 ### CONTEXT & SELF-SUFFICIENCY
 - CONTEXT REQUEST: If you need to see the context of any file (especially for missing local imports), you can ask for it via the status: "NEED_MORE_CONTEXT" protocol below.
-- SELF-SUFFICIENCY: Prioritize searching for and understanding the files you already have before asking for more. Use the symbols index and call sites provided to infer behavior where possible.
+- SELF-SUFFICIENCY: Prioritize searching for and understanding the files you already have before asking for more. Use the provided context and call sites to infer behavior where possible.
 - GROUND TRUTH URL: Any file in this repository can be accessed via: https://raw.githubusercontent.com/[owner]/[repo]/main/[path]. If you absolutely cannot resolve a symbol or logic flow with provided context, request the file via path.
 - NO HALLUCINATION: If context is missing, ASK FOR IT. Do NOT hallucinate code, file paths, or system behavior. Working without necessary context is strictly forbidden.
 
@@ -207,83 +222,124 @@ Before providing your final output, you MUST re-evaluate your proposed code:
 
 ---
 
-### OUTPUT FORMAT
+### OUTPUT FORMAT — STRICT: CHANGED PARTS ONLY
 
-- Output ONLY the modified or added functions.
-- Complete function bodies — no truncation.
-- One header line per function: // lib/filename.js — reason for change.
+⚠ DO NOT output entire files. You will only output the specific functions, types,
+or blocks that are new or modified. Outputting an entire file is strictly forbidden
+and will corrupt the downstream merge step.
+
+Structure your output as follows:
+
+// path/to/file.js — reason for changing this block
+// ── BEGIN CHANGE ────────────────────────────────────────
+[your fixed function / type / block here — complete body, no truncation]
+// ── END CHANGE ──────────────────────────────────────────
+
+RULES:
+- One BEGIN/END block per changed unit (function, type, const block, etc.).
+- Multiple changed units in the same file each get their own BEGIN/END block.
+- The header line above each block MUST include the file path and reason.
+- Complete function bodies inside each block — no "..." or truncation.
 - No explanations outside of code comments.
+- No surrounding file content, package declarations, or import blocks unless
+  the imports themselves are the change.
 `;
 }
 
 export function getGeminiSynthesisPrompt(props: {
   synthesisPrompt: string;
+  latestReview?: string;
 }): string {
-  return `You are a code merger. Your role is NOT to judge which fix is correct — a downstream expert review will handle that. Your role is to faithfully collect and surface EVERY proposed change from BOTH agents so that nothing is lost.
+  let reviewContext = "";
+  if (props.latestReview) {
+    reviewContext = `
+### LATEST REVIEW CONTEXT
+You have been provided with an additional file: \`latest_review.txt\`.
+This file contains feedback from the Lead Architect on the PREVIOUS version of the fix.
+- Use the review to resolve conflicts between CODER_A and CODER_B.
+- If the review explicitly identifies a bug in one proposal, favor the other agent's approach or fix the bug.
+- **CRITICAL**: Do NOT discard any code blocks from either agent unless the review specifically states that the approach is incorrect or should be removed.
+- Your goal is to produce a "Revision 2" that incorporates the best of both agents while strictly following the Architect's advice.
+`;
+  }
 
+  return `You are a code merger and architect. Your role is to faithfully collect and surface EVERY proposed change from BOTH agents so that nothing is lost, while ensuring the combined output addresses any previous review feedback.
+
+Context for this task:
 ${props.synthesisPrompt}
+${reviewContext}
 
 ---
 
 ### CORE DIRECTIVE
-**MERGE ALL. DISCARD NOTHING.**
+**MERGE ALL. DISCARD NOTHING UNLESS INSTRUCTED. ASSUME NOTHING.**
 
-Every function, type, guard, or logic change proposed by DeepSeek or Qwen MUST appear in the output. The output is a complete union of both agent work, not a filtered selection. Evaluation and pruning happen after you — not during.
+Every function, type, guard, or logic change proposed by CODER_A or CODER_B MUST appear in the output — no exceptions, no omissions, no silent pruning. The output is a complete union of both agents' work. If you are uncertain whether something matters, include it.
 
 ### CONTEXT
-You have been given 'combined_responses.txt' containing raw output from two specialist AI agents — **DeepSeek** and **Qwen** — sectioned as:
-- // DEEPSEEK RESPONSE
-- // QWEN RESPONSE
+You have been given an attached file called \`combined_response_raw_N.txt\` containing raw output from two specialist AI agents — **CODER_A** and **CODER_B** — sectioned as:
+- // CODER_A RESPONSE
+- // CODER_B RESPONSE
 
-Each agent independently analyzed the same codebase and produced its own implementation. No agent saw any other's output.
+Open and read the attached file in its entirety before doing anything else. Each agent independently analyzed the same codebase and produced its own implementation. No agent saw any other's output. Each agent's output is structured as one or more labeled change blocks:
+
+// path/to/file — reason
+// ── BEGIN CHANGE ────────────────────────────────────────
+[function / type / block]
+// ── END CHANGE ──────────────────────────────────────────
+
+Your job is to collect every BEGIN/END block from both agents and merge them by file.
 
 ---
 
 ### STEP 1 — FULL INVENTORY
-Before writing any code, list every distinct function or type definition proposed across both outputs.
-CRITICAL RULE: You may ONLY inventory functions explicitly named verbatim in the agent responses. Do not infer, create, or rename any function not literally present in the input text. For each, note:
-- Which agent(s) touched it
+Before writing any code, list every distinct BEGIN/END change block proposed across both outputs.
+CRITICAL RULE: You may ONLY inventory blocks explicitly present verbatim in the attached file. Do not infer, create, or rename anything not literally present in the input. For each block, note:
+- Which coder(s) (A or B) proposed it
 - Which file it belongs to
-- Whether agents agree or disagree on the implementation
+- The function / type / unit name
+- Whether coders agree or disagree on the implementation
 
-This inventory is your checklist — every item on it MUST appear in the final output.
+This inventory is your checklist — every item on it MUST appear in the final output. After writing the output, re-check this list. If anything is missing, add it before finishing.
 
 ---
 
-### STEP 2 — MERGE RULES (apply to each function in the inventory)
+### STEP 2 — MERGE RULES (apply to each block in the inventory)
 
-**A. AGENTS AGREE (same or equivalent logic):**
-→ Output it once. In a comment above the function write: \`// ✓ Confirmed by [DeepSeek, Qwen]\`
+**A. CODERS AGREE (same or equivalent logic):**
+→ Output the block once. Add above it: \`// ✓ Confirmed by [CODER_A, CODER_B]\`
 
-**B. AGENTS DISAGREE:**
-→ Output BOTH versions, each clearly annotated:
+**B. CODERS DISAGREE:**
+→ Output BOTH versions inside a single block, clearly annotated:
 \`\`\`
-// VERSION_DEEPSEEK:
-[DeepSeek's version]
+// VERSION_CODER_A:
+[CODER_A's version]
 
-// VERSION_QWEN:
-[Qwen's version]
+// VERSION_CODER_B:
+[CODER_B's version]
 
 // — downstream reviewer must pick one
 \`\`\`
 
-**C. ONLY ONE AGENT PROPOSED A CHANGE:**
-→ Include it. Add: \`// ⚠ Proposed by [AgentName] only — include for review\`
+**C. ONLY ONE CODER PROPOSED A CHANGE:**
+→ Include it unconditionally. Add: \`// ⚠ Proposed by [CODER_A/B] only — include for review\`
+→ Do NOT skip single-coder blocks because they seem minor or redundant. They are part of the record.
 
 ---
 
-### STEP 3 — SELF-CHECK
-Before outputting, verify against your Step 1 inventory:
-1. Every item on the inventory list appears in the output. If any is missing, add it now.
-2. No syntax errors from a static read. Fix any visible ones.
-3. Indentation and style match the original codebase.
+### STEP 3 — SELF-CHECK (mandatory before output)
+1. Re-read your Step 1 inventory line by line. Confirm every item appears in the output.
+2. If ANY item is missing, add it now — do not skip it.
+3. Scan for syntax errors visible from a static read. Fix any you find.
+4. Confirm indentation and style match the original codebase.
+5. Confirm no change block was silently omitted or compressed.
 
 ---
 
 ### OUTPUT FORMAT
 1. Detect the programming language of each file and use the correct code block language identifier.
 2. Include the original filename as a header comment at the top of each code block.
-3. Each file is a separate code block.
+3. Each file is a separate code block containing all merged change blocks for that file.
 4. No preamble. No prose outside of the structured comment annotations above.`;
 }
 
@@ -388,4 +444,193 @@ ${subQuestion}
 4. Aim for depth: explain the "why" and "how", not just the "what".
 5. If the notebook files do not contain enough information, explicitly state what is missing.
 6. Do not speculate beyond what the source files show.`;
+}
+
+export function getCodeReviewPrompt(props: {
+  userQuery: string;
+  owner: string;
+  repo: string;
+  defaultBranch: string;
+}): string {
+  return `### ROLE: EXPERT CODE REVIEWER
+
+You are a senior engineer reviewing a proposed fix for the following question:
+
+### ORIGINAL QUESTION
+${props.userQuery}
+
+---
+
+### YOUR TASK
+You have been given a file called \`combined_responses.txt\` (or \`combined_responses.txt\` in the attached files).
+This file contains a proposed code fix produced by AI agents.
+
+**MANDATORY**: Do not guess the state of the repository. You can and SHOULD use the "MISSING CONTEXT PROTOCOL" below to fetch actual source files (interfaces, type definitions, call sites) to provide the most accurate and deep review possible. A high-quality review requires seeing the real code context.
+
+Review the proposed fix **line by line** and determine:
+1. Is the fix **correct**? Does it actually solve the described problem?
+2. Are there **type errors**, **logic bugs**, or **missing edge cases**?
+3. Are there **better alternatives** or necessary **follow-up changes** that were missed?
+4. Does the fix break any existing behavior?
+
+### REVIEW PHILOSOPHY: PROGRESS OVER PERFECTION
+- **Do NOT be overly strict**: If the fix solves the core problem and is stable, approve it even if it isn't "perfect" or "elegant".
+- **Genuin advice**: Give genuine, helpful advice to the coders rather than just pointing out flaws.
+- **Finish, don't get stuck**: Focus on getting the code to a "production-ready" state quickly. Avoid endless nitpicking on style or minor refactors that don't impact correctness.
+- **Lenient on Boilerplate**: The coder is strictly required to output **CHANGED PARTS ONLY**. If they omit imports, package declarations, or surrounding class structures, **DO NOT** flag this as a critical error. Focus only on the logic within the changed blocks. Missing imports will be handled by the merge pipeline.
+- **The 2-Round Rule**: We are working under a strict 10-round limit. If you have flagged the same specific issue for two rounds in a row and the coder still hasn't addressed it, **MOVE ON**. Assume it is a limitation of the current context or a minor discrepancy and focus on approving the overall fix. Do not let the loop stall on a single recurring issue.
+- **Decisive Conflict Resolution**: If CODER_A and CODER_B propose incompatible architectural choices (e.g., different state structures or conflicting utility functions), you **MUST** choose one specific approach. Do not be vague. Explicitly tell the coders: "Use Coder A's nested structure approach and discard the flat-key approach from Coder B." Be the tie-breaker.
+
+---
+
+### MISSING CONTEXT PROTOCOL
+
+If you need to inspect a source file from the repository to verify the fix (e.g. to check an interface, call site, or type definition), respond ONLY with:
+
+{
+  "status": "NEED_MORE_CONTEXT",
+  "missing_files": [
+    {
+      "path": "packages/react-table/src/useTable.ts",
+      "line_range": [0, 0],
+      "reason": "Need to verify the exact TableOptions type signature"
+    }
+  ]
+}
+
+FIELD RULES:
+- "path": exact file path from repo root. Use paths referenced in the proposed fix.
+- "line_range": [startLine, endLine] or [0, 0] for the full file (first 500 lines).
+- Maximum 5 files per request. You are encouraged to request the maximal 5 files if you need broad context.
+- Any file in this repository can be fetched via: https://raw.githubusercontent.com/${props.owner}/${props.repo}/${props.defaultBranch}/[path]
+
+---
+
+### VERDICT FORMAT
+
+Once you have enough context, output your verdict as JSON:
+
+{
+  "status": "REVIEW_COMPLETE",
+  "verdict": "CORRECT" | "INCORRECT" | "PARTIALLY_CORRECT",
+  "issues": [
+    {
+      "severity": "CRITICAL" | "MAJOR" | "MINOR",
+      "location": "file path or function name",
+      "description": "exact description of the issue"
+    }
+  ],
+  "suggestions": [
+    "Suggestion 1",
+    "Suggestion 2"
+  ],
+  "summary": "One paragraph summary of your overall assessment."
+}
+
+If the fix is completely correct, use an empty array for "issues".
+Output ONLY valid JSON. No markdown. No preamble.`;
+}
+
+export function getReviewSynthesisPrompt(): string {
+  return `You are a Lead Software Architect.
+You have been given 'combined_reviews.txt' containing raw feedback from two specialized reviewer agents — **REVIEWER_A** and **REVIEWER_B**.
+Your goal is to synthesize these reviews into a single, high-fidelity report for the developer.
+
+### CRITICAL RULES:
+1. **NEVER mention model names** (e.g., DeepSeek, Qwen) in your output. Refer to them only as "Reviewer A" or "Reviewer B".
+2. **Aggregated Verdict**: At the top of your response, your FIRST line MUST be: \`HAS_ISSUES: YES\` (if ANY reviewer found a bug, incomplete logic, or room for improvement) or \`HAS_ISSUES: NO\` (if BOTH reviewers fully approve and give a "looks good to me" verdict).
+3. **Specific Feedback**: Group feedback by file and function. Clear, actionable points are prioritized.
+4. **Disagreements**: If reviewers disagree, clearly state both perspectives (e.g., "Reviewer A suggests X, while Reviewer B warns about Y").
+5. **Combined Content**: Do not summarize away important detail. If a reviewer provides a specific code snippet fix, keep it.
+
+6. **Pragmatic Synthesis**: If the fix is functionally correct and safe, set \`HAS_ISSUES: NO\` even if there are minor stylistic suggestions remaining. Our goal is to ship the fix efficiently, not to achieve architectural perfection.
+7. **The 2-Round Rule**: If reviewers have been complaining about the same issue for two rounds and the coders haven't fixed it, stop flagging it. Override the reviewers if necessary and set \`HAS_ISSUES: NO\` to allow the process to finish. We value completion over an endless cycle of unaddressed feedback.
+
+No preamble. Start directly with the HAS_ISSUES line.`;
+}
+
+export function getCoderRefinementPrompt(props: {
+  userQuery: string;
+  owner: string;
+  repo: string;
+  defaultBranch: string;
+  hasLatestResponse: boolean;
+}): string {
+  return `### ROLE: EXPERT CODER — REVISION PASS
+
+You previously proposed a fix for the following problem. A team of code reviewers have analyzed your fix and produced a combined review. You must now revise your fix to address all issues they identified.
+
+### ORIGINAL QUESTION
+${props.userQuery}
+
+---
+
+### IMPORTANT: DUAL-CODER CONTEXT
+
+The \`combined_response.txt\` you are given contains the work of **two independent coder agents** (yourself and a peer agent) whose outputs were merged into a single document. When producing your revision:
+
+- **Do NOT remove or regress any correct code contributed by the peer agent** — even if you did not write it
+- Treat the combined response as a joint proposal; your job is to improve the whole, not just your own section
+- If the peer agent's code conflicts with your revision, resolve the conflict in favor of correctness and keep the best of both
+
+---
+
+### YOUR TASK
+
+You have been given the following context:
+- \`combined_reviews.txt\` — the synthesized reviewer feedback (read this carefully)
+- The existing codebase (surgical surgical access via protocol below)
+
+Produce a **revised, complete fix** that:
+1. Addresses all issues from the review
+2. Keeps all parts of the previous fix that were correct — **from both agents**
+3. Does NOT regress any existing behavior
+4. Includes inline comments explaining what changed and why
+
+### MISSING CONTEXT PROTOCOL
+
+If you need to inspect a source file from the repository to verify types, interfaces, or call sites, respond with ONLY this JSON and nothing else:
+
+{
+  "status": "NEED_MORE_CONTEXT",
+  "missing_files": [
+    {
+      "path": "packages/react-table/src/useTable.ts",
+      "line_range": [0, 0],
+      "reason": "Need to verify the exact type signature"
+    }${props.hasLatestResponse ? `,
+    {
+      "path": "combined_response.txt",
+      "reason": "Need to see the latest merged proposal to ensure my refinement is compatible with the peer agent's work."
+    }` : ""}
+  ]
+}
+
+FIELD RULES:
+- "path": exact file path from repo root
+- "line_range": [startLine, endLine] or [0, 0] for full file
+- Max 5 files per request
+- Fetch via: https://raw.githubusercontent.com/${props.owner}/${props.repo}/${props.defaultBranch}/[path]
+
+---
+
+### OUTPUT FORMAT — STRICT: CHANGED PARTS ONLY
+
+⚠ DO NOT output entire files. You will only output the specific functions, types, or blocks that are new or modified. Outputting an entire file is strictly forbidden and will corrupt the downstream merge step.
+
+Structure your output as follows:
+
+// path/to/file.ts — reason for adding/changing this block
+// ── BEGIN CHANGE ────────────────────────────────────────
+[your new or modified function / type / block here — complete body, no truncation]
+// ── END CHANGE ──────────────────────────────────────────
+
+RULES:
+- NO PREAMBLE. Start directly with the code blocks.
+- One BEGIN/END block per changed unit (function, type, const block, etc.).
+- Multiple changed units in the same file each get their own BEGIN/END block.
+- The header line above each block MUST include the file path and reason.
+- Complete function bodies inside each block — no "..." or truncation.
+- No surrounding file content, package declarations, or import blocks unless the imports themselves are the change.
+`;
 }

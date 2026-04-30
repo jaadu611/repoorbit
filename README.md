@@ -29,23 +29,22 @@ graph TD
 
 3.  **🔪 The Surgery (Implementation)**: Feeds surgical code blocks to **DeepSeek**. Unlike generic LLM calls, this phase uses:
     - **Missing Context Protocol**: DeepSeek can respond with `NEED_MORE_CONTEXT` in a structured JSON format to trigger automated multi-turn discovery.
-    - **Query-Aware Symbols**: `symbols.txt` is dynamically filtered to include only the ~500 entries most relevant to the current surgery, maximizing signal-to-noise ratio.
     - **Regex-Based Extraction**: Robust support for C, Go, Rust, and C++ via balanced-brace counting to isolate functions without expensive AST parsing.
 
 ---
 
 ## 🚀 Key Breakthroughs
 
-- **🏗️ Context-Window Efficiency**: By stripping thousands of lines of metadata noise (removed `graph.json`, filtered `symbols.txt`), RepoOrbit achieves up to **90% reduction** in context-window bloat for large repositories.
+- **🏗️ Context-Window Efficiency**: By stripping metadata noise (removed `graph.json`), RepoOrbit achieves a significant reduction in context-window bloat for large repositories.
 - **👑 C/Go/Systems Authority**: Specialized regex extractors isolate function bodies even when Babel/AST parsers fail on systems-level code.
 - **🔄 Multi-Turn Discovery**: An automated loop that fetches missing dependencies while maintaining the original session context, preventing "logic drift" during complex bug fixes.
-- **🌉 Playwright Orchestration**: Automates the ingestion of "Expert Context" via Playwright's CDP integration, enabling seamless interactions with proprietary LLM interfaces.
+- **🌉 Playwright Orchestration**: Automates the ingestion of "Expert Context" via persistent browser sessions, enabling seamless interactions with proprietary LLM interfaces.
 
 ---
 
 ## 🛠️ Tech Stack
 
-- **Automation**: Playwright (CDP-based Browser Orchestration)
+- **Automation**: Playwright (Persistent Chromium Context)
 - **Framework**: Next.js 16 (App Router)
 - **Engine**: Symbol-Aware Extraction + Directory-Scoped Discovery
 - **LLM Pipeline**: 

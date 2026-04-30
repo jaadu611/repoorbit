@@ -42,24 +42,12 @@ export async function automateChatGPT(
     }
 
     if (isFirstTurn && outDir && fs.existsSync(outDir)) {
-      for (const name of ["00_Root_Manifest.txt", "symbols.json"]) {
+      for (const name of ["00_Root_Manifest.txt"]) {
         const p = path.join(outDir, name);
         if (fs.existsSync(p)) {
-          const dstName = name === "symbols.json" ? "symbols.txt" : name;
-          const dst = path.join(sessionDir, dstName);
-          // Skip if already staged
-          if (allTmpPaths.some((x) => path.basename(x) === dstName)) continue;
-
-          let content = fs.readFileSync(p, "utf-8");
-          if (name === "symbols.json") {
-            try {
-              const syms = JSON.parse(content);
-              content = Object.entries(syms)
-                .slice(0, 500)
-                .map(([n, d]) => `${n}: ${(d as any).defined_in ?? ""}`)
-                .join("\n");
-            } catch {}
-          }
+          const dst = path.join(sessionDir, name);
+          if (allTmpPaths.some((x) => path.basename(x) === name)) continue;
+          const content = fs.readFileSync(p, "utf-8");
           fs.writeFileSync(dst, content, "utf-8");
           allTmpPaths.push(dst);
         }
