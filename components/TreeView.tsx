@@ -43,9 +43,9 @@ import {
   TreeNode,
   AnimatingNode,
   AnimatingLink,
-} from "@/lib/types";
+} from "@/lib/core/types";
 import { EXT_GROUPS, hasData, ICON_SVGS } from "@/constants/treeView.constants";
-import { useSelectionStore } from "@/lib/store";
+import { useSelectionStore } from "@/lib/core/store";
 import Link from "next/link";
 
 const ANIM_DURATION = 320;

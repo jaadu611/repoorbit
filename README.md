@@ -1,6 +1,6 @@
 # RepoOrbit: The Systems-Level Developer Exoskeleton
 
-RepoOrbit is a **High-Precision AI Orchestration Pipeline** designed for senior engineers auditing massive, performance-critical codebases (e.g., PostgreSQL, Go Runtime). It solves the "Context Limit" problem through surgical structural mapping and a deterministic multi-turn discovery loop.
+RepoOrbit is a **High-Precision AI Orchestration Pipeline** designed for senior engineers auditing massive, performance-critical codebases. It solves the "Context Limit" problem through surgical structural mapping, a deterministic multi-turn discovery loop, and a specialized disk-level operator engine.
 
 ---
 
@@ -16,41 +16,51 @@ graph TD
     F -->|Multi-Turn Discovery| G[DeepSeek V3 / R1]
     G -->|Context Gap?| H[Missing Context Protocol]
     H -->|Surgical Refill| F
-    G --> I[Verified Implementation Fix]
+    G --> I[Phase 4: Disk Operation]
+    I -->|Gemma 4-31B| J[Local Filesystem Apply]
+    J -->|Gemini 3 Flash| K[Verification & Build]
 ```
 
 ---
 
-## ⚙️ The High-Precision Discovery Loop
+## ⚙️ The Orchestration Pipeline
 
-1.  **🔭 The Scout (Scoring)**: Maps the repository into "Notebook Neighborhoods" and performs keyword-aware relevance scoring. For C/Go repositories, it uses a **Directory Co-location Bonus** to ensure functionally related files (e.g., `src/backend/utils/adt/`) are bundled together for the AI.
+1.  **🔭 The Scout (Scoring)**: Maps the repository into "Notebook Neighborhoods" and performs keyword-aware relevance scoring.
+2.  **⚖️ The Triage (Planning)**: Leverages **NotebookLM** to translate natural language queries into a concrete **Symbol Target List**.
+3.  **🔪 The Surgery (Implementation)**: Feeds surgical code blocks to **DeepSeek** via the **Missing Context Protocol** to resolve dependencies dynamically.
+4.  **💾 The Operator (Disk Engine)**: Uses **Gemma 4-31B** as a strictly constrained disk-level operator to apply changes and run local tests/builds.
+5.  **✅ The Verifier (Flash)**: Uses **Gemini 3 Flash** to review execution reports and handle final architectural edge cases.
 
-2.  **⚖️ The Triage (Planning)**: Leverages **NotebookLM** to analyze the scored neighborhoods and translate natural language queries into a concrete **Symbol Target List** (e.g., "Find the underflow in array_seek").
+---
 
-3.  **🔪 The Surgery (Implementation)**: Feeds surgical code blocks to **DeepSeek**. Unlike generic LLM calls, this phase uses:
-    - **Missing Context Protocol**: DeepSeek can respond with `NEED_MORE_CONTEXT` in a structured JSON format to trigger automated multi-turn discovery.
-    - **Regex-Based Extraction**: Robust support for C, Go, Rust, and C++ via balanced-brace counting to isolate functions without expensive AST parsing.
+## 📁 Library Structure
+
+The codebase is organized into domain-driven modules for maximum maintainability:
+
+- **`lib/automation/`**: Specialist agent adapters (ChatGPT, DeepSeek, Gemini, OpenCode).
+- **`lib/builders/`**: Context assembly and prompt generation engines.
+- **`lib/core/`**: Fundamental types, browser management, and GitHub API integration.
+- **`lib/prompts/`**: Modular prompt engineering layer (Coding, Review, Synthesis, Disk).
 
 ---
 
 ## 🚀 Key Breakthroughs
 
-- **🏗️ Context-Window Efficiency**: By stripping metadata noise (removed `graph.json`), RepoOrbit achieves a significant reduction in context-window bloat for large repositories.
-- **👑 C/Go/Systems Authority**: Specialized regex extractors isolate function bodies even when Babel/AST parsers fail on systems-level code.
-- **🔄 Multi-Turn Discovery**: An automated loop that fetches missing dependencies while maintaining the original session context, preventing "logic drift" during complex bug fixes.
-- **🌉 Playwright Orchestration**: Automates the ingestion of "Expert Context" via persistent browser sessions, enabling seamless interactions with proprietary LLM interfaces.
+- **🏗️ Context-Window Efficiency**: Significant reduction in noise via surgical mapping and removal of metadata bloat.
+- **👑 Multi-Agent Loop**: A robust iteration cycle where coders and reviewers collaborate to produce production-ready fixes.
+- **🔄 Stall Detection**: Automated watchdog timers in the automation loop to detect and recover from silent generator hangs.
+- **🌉 Orchestration Dashboard**: A custom industrial-grade CLI dashboard providing real-time status of the OpenCode cores and Next.js dev server.
 
 ---
 
 ## 🛠️ Tech Stack
 
 - **Automation**: Playwright (Persistent Chromium Context)
-- **Framework**: Next.js 16 (App Router)
-- **Engine**: Symbol-Aware Extraction + Directory-Scoped Discovery
-- **LLM Pipeline**: 
-    - **DeepSeek V3/R1**: Primary reasoning engine for implementation and logic auditing.
-    - **NotebookLM**: Expert architectural triage and planning.
-- **Styling**: Tailwind CSS v4 (Glassmorphism Engineering Aesthetics)
+- **Framework**: Next.js 16 (Turbopack)
+- **Cores**:
+  - **OpenCode**: Gemma 4-31B (Disk Operator) & Gemini 3 Flash (Verifier).
+  - **DeepSeek V3/R1**: Primary reasoning and implementation.
+- **Styling**: Vanilla CSS (Industrial Blue & Green Aesthetics).
 
 ---
 
@@ -62,9 +72,14 @@ npm install
 npm run dev
 ```
 
+> **Tip**: Use `npm run dev -s` for a silent, clean dashboard startup.
+
 **Environment Variables (.env)**:
+
 - `GITHUB_TOKEN`
 - `DEEPSEEK_API_KEY`
+- `NEXT_PUBLIC_GITHUB_TOKEN`
 
 ---
-*Built for engineers who need to see through the noise.*
+
+_Built for engineers who need to see through the noise._

@@ -1,5 +1,5 @@
-import { parseRepoInput, fetchCommitsForPath, fetchFileContent, analyzeFile, parseImports } from "@/lib/github";
-import { CommitDetail } from "@/lib/types";
+import { parseRepoInput, fetchCommitsForPath, fetchFileContent, analyzeFile, parseImports } from "@/lib/core/github";
+import { CommitDetail } from "@/lib/core/types";
 
 export async function GET(req: Request) {
   const url = new URL(req.url);

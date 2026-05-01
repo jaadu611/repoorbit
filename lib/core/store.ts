@@ -6,7 +6,7 @@ import type {
   SelectionStore,
   CommitDetail,
   LightFileMetadata,
-} from "@/lib/types";
+} from "@/lib/core/types";
 
 export const useSelectionStore = create<
   SelectionStore & {

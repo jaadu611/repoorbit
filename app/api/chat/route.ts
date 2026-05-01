@@ -1,33 +1,43 @@
-import { buildMasterContext } from "@/lib/contextBuilder";
-import { buildDeepseekContext } from "@/lib/deepseekContextBuilder";
+import { buildMasterContext } from "@/lib/builders/context";
+import { buildDeepseekContext } from "@/lib/builders/deepseekContext";
 import path from "path";
 import fs from "fs";
 import { execSync } from "child_process";
-import { analyzeFile } from "@/lib/github";
+import { analyzeFile } from "@/lib/core/github";
 import {
   automateNotebookLM,
   automateSubQuestion,
-} from "@/lib/notebooklmAutomator";
-import { automateChatGPT } from "@/lib/chatgptAutomator";
-import { getOrCreateContext } from "@/lib/browser";
-import { askDeepseek } from "@/lib/deepseekAutomator";
-import { askQwen } from "@/lib/qwenAutomator";
-import { askGemini } from "@/lib/geminiAutomator";
+} from "@/lib/automation/notebooklm";
+import { automateChatGPT } from "@/lib/automation/chatgpt";
+import { getOrCreateContext } from "@/lib/core/browser";
+import { askDeepseek } from "@/lib/automation/deepseek";
+import { askQwen } from "@/lib/automation/qwen";
+import { askGemini } from "@/lib/automation/gemini";
+import {
+  createSession,
+  sendToPort,
+  cloneRepoForDiskWork,
+} from "@/lib/automation/opencode";
 
 import {
   getDeepseekCodingPrompt,
   getGeminiSynthesisPrompt,
   getGeminiPlannerPrompt,
   getNotebookSubQuestionPrompt,
-  getNotebookSystemInstruction,
   getGenericNotebookPrompt,
   getCodeReviewPrompt,
   getReviewSynthesisPrompt,
   getCoderRefinementPrompt,
+  getFinalPolishPrompt,
+  getGemmaDiskOperatorPrompt,
+  getGeminiDiskVerifierPrompt,
+  getTestGenerationPrompt,
+  getGemmaTestRunnerPrompt,
+  AGENT_COMMUNICATION_PROTOCOL,
 } from "@/lib/prompts";
 import { NextResponse } from "next/server";
 import { Page, BrowserContext } from "playwright";
-import { JobStatus } from "@/lib/types";
+import { JobStatus } from "@/lib/core/types";
 
 export const CONTEXT_DIR_PATH = "/tmp/notebooklm_sources";
 
@@ -65,7 +75,7 @@ const persistentPages: PersistentPages = (global as any)[GLOBAL_PAGES_KEY] || {
 // ─── fetchFile ────────────────────────────────────────────────────────────────
 
 async function fetchFile(
-  outDir: string,
+  _outDir: string,
   owner: string,
   repo: string,
   branch: string,
@@ -96,7 +106,7 @@ async function fetchFile(
           ? Math.min(lines.length - 1, lineRange[1] - 1)
           : lines.length - 1;
       const slice = lines.slice(startIdx, endIdx + 1);
-      const MAX_RANGE_LIMIT = 1500;
+      const MAX_RANGE_LIMIT = 2000;
       if (slice.length > MAX_RANGE_LIMIT) {
         return (
           slice.slice(0, MAX_RANGE_LIMIT).join("\n") +
@@ -130,7 +140,7 @@ async function fillMissingFiles(
   repo: string,
   branch: string,
   outDir: string,
-  latestResponsePath?: string,
+  _latestResponsePath?: string,
 ): Promise<number> {
   const filesToFetch = missingFiles.slice(0, MAX_FILES_PER_TURN);
   let count = 0;
@@ -140,14 +150,48 @@ async function fillMissingFiles(
     if (!filePath) continue;
 
     const lowerPath = filePath.toLowerCase();
-    
-    // Special handling for the latest combined response
-    if (lowerPath === "combined_response.txt" && latestResponsePath && fs.existsSync(latestResponsePath)) {
-      console.log(`[ORCHESTRATOR] ${modelName} requesting latest combined response...`);
-      const dst = path.join(modelInvestDir, "combined_response.txt");
-      fs.copyFileSync(latestResponsePath, dst);
-      count++;
-      continue;
+
+    // Special handling for internal files requested by models (e.g. combined_response_N.txt)
+    if (lowerPath.includes("combined_response")) {
+      const files = fs
+        .readdirSync(outDir)
+        .filter(
+          (f) => f.startsWith("combined_response_") && !f.includes("debug"),
+        );
+      if (files.length > 0) {
+        files.sort(); // Highest round is last
+        const latest = files[files.length - 1];
+        console.log(
+          `[ORCHESTRATOR] ${modelName} requested ${filePath}. Fulfilling with latest: ${latest}`,
+        );
+        fs.copyFileSync(
+          path.join(outDir, latest),
+          path.join(modelInvestDir, latest),
+        );
+        count++;
+        continue;
+      }
+    }
+
+    if (lowerPath.includes("combined_review")) {
+      const files = fs
+        .readdirSync(outDir)
+        .filter(
+          (f) => f.startsWith("combined_review_") && !f.includes("debug"),
+        );
+      if (files.length > 0) {
+        files.sort();
+        const latest = files[files.length - 1];
+        console.log(
+          `[ORCHESTRATOR] ${modelName} requested ${filePath}. Fulfilling with latest: ${latest}`,
+        );
+        fs.copyFileSync(
+          path.join(outDir, latest),
+          path.join(modelInvestDir, latest),
+        );
+        count++;
+        continue;
+      }
     }
 
     if (
@@ -188,15 +232,39 @@ async function fillMissingFiles(
     }
 
     if (localContent) {
+      let slicedContent = localContent;
+      const lines = localContent.split("\n");
+
+      if (lineRange) {
+        const startIdx = lineRange[0] > 0 ? lineRange[0] - 1 : 0;
+        const endIdx =
+          lineRange[1] > 0
+            ? Math.min(lines.length - 1, lineRange[1] - 1)
+            : lines.length - 1;
+        const slice = lines.slice(startIdx, endIdx + 1);
+        const MAX_RANGE_LIMIT = 2000;
+        if (slice.length > MAX_RANGE_LIMIT) {
+          slicedContent =
+            slice.slice(0, MAX_RANGE_LIMIT).join("\n") +
+            `\n\n// [TRUNCATED] Only first ${MAX_RANGE_LIMIT} lines of the requested range are shown.`;
+        } else {
+          slicedContent = slice.join("\n");
+        }
+      } else if (lines.length > MAX_LINES_PER_FILE) {
+        slicedContent =
+          lines.slice(0, MAX_LINES_PER_FILE).join("\n") +
+          `\n\n// [TRUNCATED] Only first ${MAX_LINES_PER_FILE} lines shown. Use "line_range": [start, end] to request more.`;
+      }
+
       const safeName = filePath.replace(/[^a-zA-Z0-9_-]/g, "_");
       const extraFileName = `extra_${count.toString().padStart(2, "0")}_${safeName}.txt`;
       fs.writeFileSync(
         path.join(modelInvestDir, extraFileName),
-        localContent,
+        slicedContent,
         "utf-8",
       );
       console.log(
-        `[ORCHESTRATOR] ${modelName}: Local fulfillment for ${filePath}`,
+        `[ORCHESTRATOR] ${modelName}: Local fulfillment for ${filePath} (${lineRange ? "ranged" : "full"})`,
       );
       count++;
       continue;
@@ -217,13 +285,11 @@ async function fillMissingFiles(
       };
       const tempOutDir = path.join(modelInvestDir, `temp_${count}`);
       fs.mkdirSync(tempOutDir, { recursive: true });
-      ["graph.json", "notebooks.json", "package.json"].forEach(
-        (file) => {
-          const src = path.join(outDir, file);
-          if (fs.existsSync(src))
-            fs.copyFileSync(src, path.join(tempOutDir, file));
-        },
-      );
+      ["graph.json", "notebooks.json", "package.json"].forEach((file) => {
+        const src = path.join(outDir, file);
+        if (fs.existsSync(src))
+          fs.copyFileSync(src, path.join(tempOutDir, file));
+      });
 
       buildDeepseekContext(symbolPathB, tempOutDir);
 
@@ -274,6 +340,43 @@ async function fillMissingFiles(
 
 // ─── fileFingerprint / prepareTurnDir ────────────────────────────────────────
 
+const pageLocks = new Map<Page, Promise<void>>();
+
+async function lockPage(page: Page, label: string) {
+  const currentLock = pageLocks.get(page) || Promise.resolve();
+  let resolveLock: () => void;
+  const newLock = new Promise<void>((r) => {
+    resolveLock = r;
+  });
+  
+  // Immediately queue ourselves
+  pageLocks.set(page, newLock);
+  
+  // Wait for the previous lock to finish
+  await currentLock;
+  
+  console.log(`[LOCK] ${label} acquired page lock.`);
+  
+  return () => {
+    console.log(`[LOCK] ${label} released page lock.`);
+    resolveLock();
+    // Only delete if we are still the latest lock
+    if (pageLocks.get(page) === newLock) {
+      pageLocks.delete(page);
+    }
+  };
+}
+
+function parseJsonFromText(text: string): any {
+  try {
+    const match = text.match(/\{[\s\S]*\}/);
+    if (match) return JSON.parse(match[0]);
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
 function fileFingerprint(filePath: string): string {
   try {
     const content = fs.readFileSync(filePath, "utf-8");
@@ -281,78 +384,6 @@ function fileFingerprint(filePath: string): string {
   } catch {
     return `missing:${filePath}`;
   }
-}
-
-/**
- * Assembles a temporary upload dir for a single model turn.
- *
- * @param outDir         - repo working dir
- * @param modelPrefix    - "deepseek" | "qwen" etc.
- * @param attempt        - turn index (0-based)
- * @param baseContextDir - deepseek_context dir (base context uploaded on attempt 0 ONLY for coders)
- * @param investDir      - per-model extra-files staging dir
- * @param seenHashes     - dedup map (mutated in-place)
- * @param includeBase    - whether to include base context files (only first coder turn)
- * @param extraFiles     - explicit additional files to include this turn (e.g. combined_review)
- */
-function prepareTurnDir(
-  outDir: string,
-  modelPrefix: string,
-  attempt: number,
-  baseContextDir: string,
-  investDir: string,
-  seenHashes: Map<string, string>,
-  includeBase: boolean,
-  extraFiles: string[] = [],
-): string | null {
-  const turnDir = path.join(
-    outDir,
-    `${modelPrefix}_upload_${attempt}_${Date.now()}`,
-  );
-  const filesToCopy: { src: string; dstName: string }[] = [];
-
-  // 1. Base context — only when explicitly requested (first coder turn)
-  if (includeBase && fs.existsSync(baseContextDir)) {
-    for (const f of fs.readdirSync(baseContextDir)) {
-      if (f === "gap_filler.txt") continue;
-      filesToCopy.push({ src: path.join(baseContextDir, f), dstName: f });
-    }
-  }
-
-  // 2. Explicit extra files for this turn (e.g. combined_review_N.txt)
-  for (const src of extraFiles) {
-    if (!fs.existsSync(src)) continue;
-    const dstName = path.basename(src);
-    filesToCopy.push({ src, dstName });
-  }
-
-  // 3. Any new files in the investigation dir (NEED_MORE_CONTEXT fulfillment)
-  if (fs.existsSync(investDir)) {
-    for (const f of fs.readdirSync(investDir)) {
-      const src = path.join(investDir, f);
-      if (!fs.statSync(src).isFile()) continue;
-      const fingerprint = fileFingerprint(src);
-      if (seenHashes.get(f) === fingerprint) continue;
-      filesToCopy.push({ src, dstName: f });
-    }
-  }
-
-  if (filesToCopy.length === 0) return null;
-
-  if (fs.existsSync(turnDir))
-    fs.rmSync(turnDir, { recursive: true, force: true });
-  fs.mkdirSync(turnDir, { recursive: true });
-
-  for (const item of filesToCopy) {
-    const dst = path.join(turnDir, item.dstName);
-    fs.copyFileSync(item.src, dst);
-    seenHashes.set(item.dstName, fileFingerprint(item.src));
-  }
-
-  console.log(
-    `[ORCHESTRATOR] ${modelPrefix} turn ${attempt}: ${filesToCopy.length} files in upload dir`,
-  );
-  return turnDir;
 }
 
 // ─── runModelPlanner ──────────────────────────────────────────────────────────
@@ -415,11 +446,8 @@ async function runModelPlanner(
     let response = "";
     try {
       if (modelName === "Gemini") {
-        response = await askGemini(
-          page,
-          history,
-          newFilesToUpload,
-          (msg) => onStatus(`[Gemini Planner] ${msg}`),
+        response = await askGemini(page, history, newFilesToUpload, (msg) =>
+          onStatus(`[Gemini Planner] ${msg}`),
         );
       } else if (modelName === "DeepSeek") {
         response = await askDeepseek(
@@ -675,7 +703,7 @@ Return ONLY JSON. No explanation. No markdown.`;
 
 async function collectRelevantFiles(
   page: Page,
-  query: string,
+  _query: string,
   notebookPlans: any[],
   outDir: string,
 ): Promise<string[]> {
@@ -1095,9 +1123,144 @@ Synthesize all the insights above into a single, cohesive, well-structured respo
           (msg) => setStatus(msg),
         );
 
+        // ── Step 7: Phase 2 - Clone Repo & Gemma Disk Operator ────────────────
+        setStatus("Cloning repo for disk-level work...");
+        const repoWorkDir = await cloneRepoForDiskWork(owner, repo);
+        console.log(`[ORCHESTRATOR] Disk work directory: ${repoWorkDir}`);
+
+        setStatus("Starting Phase 2: Gemma Disk Operator...");
+        const architectFilePath = path.join(
+          repoWorkDir,
+          "final_architect_output.txt",
+        );
+        fs.writeFileSync(architectFilePath, finalAnswer, "utf-8");
+        console.log(`[ORCHESTRATOR] Saved architect output to: ${architectFilePath}`);
+        console.log(`[ORCHESTRATOR] Architect output length: ${finalAnswer.length} chars`);
+        console.log(`[ORCHESTRATOR] Architect output preview: ${finalAnswer.slice(0, 300)}...`);
+
+        const gemmaPrompt = getGemmaDiskOperatorPrompt({ architectFilePath });
+        console.log("=================================================");
+        console.log("[ORCHESTRATOR] Gemma Disk Operator Phase Initiated");
+        console.log(
+          `[ORCHESTRATOR] Architect output saved to: ${architectFilePath}`,
+        );
+        console.log("=================================================");
+
+        // Execute Gemma on port 3001 — working inside the cloned repo
+        setStatus("Gemma (Port 3001) is applying changes to disk...");
+        const gemmaSessionId = await createSession(
+          3001,
+          repoWorkDir,
+          "google/gemma-4-31b-it",
+        );
+        console.log(`[ORCHESTRATOR] Gemma Session ID: ${gemmaSessionId}`);
+        console.log(`[ORCHESTRATOR] Sending prompt to Gemma (${gemmaPrompt.length} chars)...`);
+        const gemmaResult = await sendToPort(3001, gemmaSessionId, gemmaPrompt);
+
+        console.log("=================================================");
+        console.log("[ORCHESTRATOR] Gemma Disk Operator Finished");
+        console.log("[ORCHESTRATOR] Gemma Output Length:", gemmaResult?.length ?? 0);
+        console.log("[ORCHESTRATOR] Gemma Output Content:\n", gemmaResult || "(EMPTY RESPONSE)");
+        console.log("=================================================");
+
+        // ── Step 7.5: Phase 2.5 - Test Generation & Execution ────────────────
+        // Each of the 4 agents gets a SEPARATE OpenCode session to generate their
+        // test scenarios — this avoids touching the persistent browser pages which
+        // still hold the full review conversation history.
+        setStatus("Generating tests from 4 agents (isolated sessions)...");
+        const testGenPrompt = getTestGenerationPrompt({
+          architectOutput: finalAnswer,
+        });
+
+        const [testDsCoder, testQwCoder, testDsRev, testQwRev] =
+          await Promise.all([
+            createSession(3001, repoWorkDir, "google/gemma-4-31b-it").then(async (sid) => {
+              const res = await sendToPort(3001, sid, testGenPrompt);
+              console.log(`[ORCHESTRATOR] Test Gen (DS Coder) Response: ${res?.length ?? 0} chars`);
+              return res;
+            }),
+            createSession(3001, repoWorkDir, "google/gemma-4-31b-it").then(async (sid) => {
+              const res = await sendToPort(3001, sid, testGenPrompt);
+              console.log(`[ORCHESTRATOR] Test Gen (Qwen Coder) Response: ${res?.length ?? 0} chars`);
+              return res;
+            }),
+            createSession(3002, repoWorkDir, "google/gemini-3-flash-preview").then(async (sid) => {
+              const res = await sendToPort(3002, sid, testGenPrompt);
+              console.log(`[ORCHESTRATOR] Test Gen (DS Reviewer) Response: ${res?.length ?? 0} chars`);
+              return res;
+            }),
+            createSession(3002, repoWorkDir, "google/gemini-3-flash-preview").then(async (sid) => {
+              const res = await sendToPort(3002, sid, testGenPrompt);
+              console.log(`[ORCHESTRATOR] Test Gen (Qwen Reviewer) Response: ${res?.length ?? 0} chars`);
+              return res;
+            }),
+          ]);
+
+        const combinedTests = [
+          `=== DEEPSEEK CODER TESTS ===\n${testDsCoder}`,
+          `=== QWEN CODER TESTS ===\n${testQwCoder}`,
+          `=== DEEPSEEK REVIEWER TESTS ===\n${testDsRev}`,
+          `=== QWEN REVIEWER TESTS ===\n${testQwRev}`,
+        ].join("\n\n");
+
+        const testsFilePath = path.join(repoWorkDir, "generated_tests.txt");
+        const testsLogsPath = path.join(repoWorkDir, "tests_logs.txt");
+        fs.writeFileSync(testsFilePath, combinedTests, "utf-8");
+        console.log(`[ORCHESTRATOR] Saved generated tests to: ${testsFilePath} (${combinedTests.length} chars)`);
+
+        setStatus("Gemma (Port 3001) is executing the test suite...");
+        const gemmaTestSessionId = await createSession(
+          3001,
+          repoWorkDir,
+          "google/gemma-4-31b-it",
+        );
+        const gemmaTestPrompt = getGemmaTestRunnerPrompt({ testsFilePath });
+        const gemmaTestResult = await sendToPort(
+          3001,
+          gemmaTestSessionId,
+          gemmaTestPrompt,
+        );
+        // Write logs ourselves as a fallback in case Gemma didn't (Gemini Flash reads this)
+        if (!fs.existsSync(testsLogsPath)) {
+          fs.writeFileSync(testsLogsPath, gemmaTestResult, "utf-8");
+        }
+
+        console.log("=================================================");
+        console.log("[ORCHESTRATOR] Gemma Test Runner Finished");
+        console.log("[ORCHESTRATOR] Test Runner Output Length:", gemmaTestResult?.length ?? 0);
+        console.log("[ORCHESTRATOR] Test Runner Output Content:\n", gemmaTestResult || "(EMPTY RESPONSE)");
+        console.log("=================================================");
+
+        // ── Step 8: Phase 3 - Gemini Flash Review ─────────────────────────────
+        setStatus("Starting Phase 3: Gemini Flash Review...");
+        const flashSessionId = await createSession(
+          3002,
+          repoWorkDir,
+          "google/gemini-3-flash-preview",
+        );
+        const combinedGemmaOutput = [
+          `[GEMMA DISK OPERATOR LOGS]\n${gemmaResult}`,
+          `[GEMMA TEST RUNNER LOGS]\n${gemmaTestResult}`,
+          `[TESTS LOG PATH] ${testsLogsPath}`,
+        ].join("\n\n");
+        const flashPrompt = getGeminiDiskVerifierPrompt({
+          gemmaOutput: combinedGemmaOutput,
+          architectFilePath: architectFilePath,
+        });
+
+        console.log(
+          "[ORCHESTRATOR] Sending verification task to Gemini Flash (Port 3002)...",
+        );
+        const flashResult = await sendToPort(3002, flashSessionId, flashPrompt);
+
+        console.log("=================================================");
+        console.log("[ORCHESTRATOR] Gemini Flash Verifier Finished");
+        console.log("[ORCHESTRATOR] Flash Output:\n", flashResult);
+        console.log("=================================================");
+
         activeJobs.set(taskId, {
           status: "done",
-          result: finalAnswer,
+          result: flashResult,
           answerSource: "reviewed",
         });
       } catch (err: any) {
@@ -1136,7 +1299,7 @@ Synthesize all the insights above into a single, cohesive, well-structured respo
 async function runSingleModelTurn(
   role: "DeepSeek" | "Qwen",
   page: Page,
-  prompt: string,
+  promptGenerator: (questionsLeft: number) => string,
   uploadDir: string | null,
   investDir: string,
   filledSet: Set<string>,
@@ -1146,7 +1309,10 @@ async function runSingleModelTurn(
   branch: string,
   manifestContent: string,
   onStatus: (msg: string) => void,
-  latestResponsePath?: string,
+  latestResponsePath: string | undefined,
+  agentRole: string,
+  questionsUsed: Map<string, number>,
+  persistentPages: any,
 ): Promise<string> {
   let done = false;
   let attempt = 0;
@@ -1195,33 +1361,147 @@ async function runSingleModelTurn(
       }
     }
 
+    const questionsUsedCount = questionsUsed.get(agentRole) || 0;
+    const questionsLeft = Math.max(0, 10 - questionsUsedCount);
+
     const turnPrompt =
       attempt === 0
-        ? prompt
-        : "Here are the additional context files you requested. Please continue.";
+        ? promptGenerator(questionsLeft)
+        : "Here is the result of your previous request. Please continue.";
 
     onStatus(`[${role}] Sub-turn ${attempt}...`);
 
     try {
-      if (role === "DeepSeek") {
-        raw = await askDeepseek(
-          page,
-          turnPrompt,
-          manifestContent,
-          effectiveUploadDir || "",
-          (msg) => onStatus(`[${role}] ${msg}`),
-          outDir,
-          attempt === 0,
+      const releaseOwnPage = await lockPage(page, `${role} main turn`);
+      try {
+        if (role === "DeepSeek") {
+          raw = await askDeepseek(
+            page,
+            turnPrompt,
+            manifestContent,
+            effectiveUploadDir || "",
+            (msg) => onStatus(`[${role}] ${msg}`),
+            outDir,
+            attempt === 0,
+          );
+        } else {
+          raw = await askQwen(
+            page,
+            turnPrompt,
+            effectiveUploadDir || "",
+            (msg) => onStatus(`[${role}] ${msg}`),
+            outDir,
+            attempt === 0,
+          );
+        }
+      } finally {
+        releaseOwnPage();
+      }
+
+      const json = parseJsonFromText(raw);
+      if (json?.status === "AGENT_QUERY" && json.to && json.question) {
+        const targetRole = json.to;
+        const targetPage =
+          targetRole === "coder_a"
+            ? persistentPages.dsCoder
+            : targetRole === "coder_b"
+              ? persistentPages.qwenCoder
+              : targetRole === "reviewer_a"
+                ? persistentPages.dsReviewer
+                : targetRole === "reviewer_b"
+                  ? persistentPages.qwenReviewer
+                : targetRole === "architect"
+                  ? persistentPages.dsSynthesizer
+                  : null;
+
+        if (!targetPage) {
+          console.warn(`[ORCHESTRATOR] Invalid target agent: ${targetRole}`);
+          attempt++;
+          continue;
+        }
+
+        const used = questionsUsed.get(agentRole) || 0;
+        if (used >= 10) {
+          onStatus(`[${agentRole}] Quota exhausted (10/10). Question blocked.`);
+          attempt++;
+          continue;
+        }
+
+        onStatus(`[${agentRole}] Querying ${targetRole}: ${json.question}`);
+        questionsUsed.set(agentRole, used + 1);
+
+        const targetModel =
+          targetRole === "coder_a" || targetRole === "reviewer_a" || targetRole === "architect"
+            ? "DeepSeek"
+            : "Qwen";
+
+        const answerPrompt = `### AGENT-TO-AGENT INQUIRY
+From: ${agentRole}
+Context: ${json.context || "No extra context provided"}
+Question: ${json.question}
+
+Please provide a clear, technical answer. Output ONLY the answer text.`;
+
+        const releaseTargetPage = await lockPage(
+          targetPage,
+          `${targetRole} inquiry`,
         );
+        let answer = "";
+        try {
+          if (targetModel === "DeepSeek") {
+            answer = await askDeepseek(
+              targetPage,
+              answerPrompt,
+              manifestContent,
+              "", // contextDir
+              (msg) => onStatus(`[${targetRole} REPLY] ${msg}`),
+              outDir,
+              false,
+            );
+          } else {
+            answer = await askQwen(
+              targetPage,
+              answerPrompt,
+              "", // contextDir
+              (msg) => onStatus(`[${targetRole} REPLY] ${msg}`),
+              outDir,
+              false,
+            );
+          }
+        } finally {
+          releaseTargetPage();
+        }
+
+        // Stage answer for the querying model
+        const answerFileName = `a2a_reply_${attempt}_from_${targetRole}.txt`;
+        fs.writeFileSync(
+          path.join(investDir, answerFileName),
+          `REPLY FROM ${targetRole}:\n\n${answer}`,
+          "utf-8",
+        );
+        attempt++;
+        continue;
+      }
+
+      if (json?.status === "NEED_MORE_CONTEXT") {
+        const mFiles = json.missing_files || json.missing_symbols || [];
+        const fetched = await fillMissingFiles(
+          mFiles,
+          filledSet,
+          role,
+          investDir,
+          owner,
+          repo,
+          branch,
+          outDir,
+          latestResponsePath,
+        );
+        if (fetched === 0) {
+          onStatus(`[${role}] No new files fetched. Finishing.`);
+          done = true;
+        }
       } else {
-        raw = await askQwen(
-          page,
-          turnPrompt,
-          effectiveUploadDir || "",
-          (msg) => onStatus(`[${role}] ${msg}`),
-          outDir,
-          attempt === 0,
-        );
+        done = true;
       }
     } catch (err: any) {
       onStatus(
@@ -1240,40 +1520,6 @@ async function runSingleModelTurn(
           fs.rmSync(effectiveUploadDir, { recursive: true, force: true });
         } catch {}
       }
-    }
-
-    // Parse response to check for NEED_MORE_CONTEXT
-    try {
-      const cleaned = raw.replace(/```json|```/g, "").trim();
-      const s = cleaned.indexOf("{");
-      const e = cleaned.lastIndexOf("}");
-      if (s !== -1 && e > s) {
-        const data = JSON.parse(cleaned.slice(s, e + 1));
-        if (data.status === "NEED_MORE_CONTEXT") {
-          const mFiles = data.missing_files || data.missing_symbols || [];
-          const fetched = await fillMissingFiles(
-            mFiles,
-            filledSet,
-            role,
-            investDir,
-            owner,
-            repo,
-            branch,
-            outDir,
-            latestResponsePath,
-          );
-          if (fetched === 0) {
-            onStatus(`[${role}] No new files fetched. Finishing.`);
-            done = true;
-          }
-        } else {
-          done = true;
-        }
-      } else {
-        done = true;
-      }
-    } catch {
-      done = true;
     }
 
     attempt++;
@@ -1303,7 +1549,7 @@ export async function runCoderReviewerLoop(
   outDir: string,
   dsBaseContextDir: string,
   rootManifestContent: string,
-  context: BrowserContext,
+  _context: BrowserContext,
   onStatus: (msg: string) => void,
 ): Promise<string> {
   const MAX_ROUNDS = 10;
@@ -1328,7 +1574,7 @@ export async function runCoderReviewerLoop(
 
   // ── Helper: DeepSeek combine helper ────────────────────────────────────────
   const deepseekCombine = async (
-    systemPrompt: string,
+    promptGenerator: (questionsLeft: number) => string,
     filesToAttach: string[],
     stepLabel: string,
     latestReview?: string,
@@ -1342,18 +1588,101 @@ export async function runCoderReviewerLoop(
     }
 
     if (latestReview) {
-      fs.writeFileSync(path.join(synthDir, "latest_review.txt"), latestReview, "utf-8");
+      fs.writeFileSync(
+        path.join(synthDir, "latest_review.txt"),
+        latestReview,
+        "utf-8",
+      );
     }
 
-    const res = await askDeepseek(
-      persistentPages.dsSynthesizer!,
-      systemPrompt,
-      "", // No manifest needed for synthesis
-      synthDir,
-      (msg) => onStatus(`[DeepSeek ${stepLabel}] ${msg}`),
-      outDir,
-      false, // isFirstTurn = false to skip manifest/metadata upload
-    );
+    let done = false;
+    let attempt = 0;
+    let res = "";
+
+    while (!done && attempt < 10) {
+      const used = questionsUsed.get("architect") || 0;
+      const questionsLeft = Math.max(0, 30 - used);
+      const turnPrompt =
+        attempt === 0
+          ? promptGenerator(questionsLeft)
+          : "Here is the answer to your previous query. Please continue with the synthesis.";
+
+      const releaseOwnPage = await lockPage(
+        persistentPages.dsSynthesizer!,
+        `architect synthesis`,
+      );
+      try {
+        res = await askDeepseek(
+          persistentPages.dsSynthesizer!,
+          turnPrompt,
+          "", // No manifest needed for synthesis
+          attempt === 0 ? synthDir : "", // Only upload initial files once
+          (msg) => onStatus(`[DeepSeek ${stepLabel}] ${msg}`),
+          outDir,
+          false, // isFirstTurn = false
+        );
+      } finally {
+        releaseOwnPage();
+      }
+
+      const json = parseJsonFromText(res);
+      if (json?.status === "AGENT_QUERY" && json.to && json.question) {
+        const targetRole = json.to;
+        const targetPage =
+          targetRole === "coder_a"
+            ? persistentPages.dsCoder
+            : targetRole === "coder_b"
+              ? persistentPages.qwenCoder
+              : targetRole === "reviewer_a"
+                ? persistentPages.dsReviewer
+                : targetRole === "reviewer_b"
+                  ? persistentPages.qwenReviewer
+                  : targetRole === "architect"
+                    ? persistentPages.dsSynthesizer
+                    : null;
+
+        if (!targetPage) {
+          onStatus(`[Architect] Invalid target agent: ${targetRole}`);
+          attempt++;
+          continue;
+        }
+
+        if (used >= 30) {
+          onStatus(`[Architect] Quota exhausted (30/30). Query blocked.`);
+          attempt++;
+          continue;
+        }
+
+        onStatus(`[Architect] Querying ${targetRole}: ${json.question}`);
+        questionsUsed.set("architect", used + 1);
+
+        const targetModel =
+          targetRole === "coder_a" || targetRole === "reviewer_a" || targetRole === "architect"
+            ? "DeepSeek"
+            : "Qwen";
+
+        const releaseTargetPage = await lockPage(
+          targetPage,
+          `architect inquiry to ${targetRole}`,
+        );
+        try {
+          if (targetModel === "DeepSeek") {
+          } else {
+          }
+        } finally {
+          releaseTargetPage();
+        }
+
+        // Synthesis agent doesn't have an investDir usually, so we'll append to history or similar
+        // Actually, synthesis agents in this setup just get the answer as a follow-up prompt.
+        // We'll provide it in the next turnPrompt.
+        attempt++;
+        continue;
+      }
+
+      done = true;
+    }
+
     try {
       fs.rmSync(synthDir, { recursive: true, force: true });
     } catch {}
@@ -1362,10 +1691,14 @@ export async function runCoderReviewerLoop(
 
   // Track whether each role has already uploaded files (so we know first-turn vs follow-up)
   let coderFirstTurn = true; // first CODER turn ever (upload base context)
-  let reviewerFirstTurn = true; // first REVIEWER turn ever (upload combined_response)
 
   let activeResponsePath = ""; // path to current combined_response_N.txt
   let finalSynthesis = "";
+  const questionsUsed = new Map<string, number>();
+  ["coder_a", "coder_b", "reviewer_a", "reviewer_b"].forEach((r) =>
+    questionsUsed.set(r, 0),
+  );
+  questionsUsed.set("architect", 0);
 
   for (let round = 0; round < MAX_ROUNDS; round++) {
     onStatus(`=== Round ${round} ===`);
@@ -1373,15 +1706,48 @@ export async function runCoderReviewerLoop(
     // ────────────────────────────────────────────────────────────────────────
     // CODER PHASE
     // ────────────────────────────────────────────────────────────────────────
-    const coderPrompt =
+    const coderPromptGenerator = (questionsLeft: number) =>
       round === 0
-        ? getDeepseekCodingPrompt({ userQuery: query, mode: "FIX" })
+        ? getDeepseekCodingPrompt({
+            userQuery: query,
+            mode: "FIX",
+            communicationContext: AGENT_COMMUNICATION_PROTOCOL(
+              "coder_a",
+              questionsLeft,
+            ),
+          })
         : getCoderRefinementPrompt({
             userQuery: query,
             owner,
             repo,
             defaultBranch,
             hasLatestResponse: !!activeResponsePath,
+            communicationContext: AGENT_COMMUNICATION_PROTOCOL(
+              "coder_a",
+              questionsLeft,
+            ),
+          });
+
+    const coderPromptGeneratorQwen = (questionsLeft: number) =>
+      round === 0
+        ? getDeepseekCodingPrompt({
+            userQuery: query,
+            mode: "FIX",
+            communicationContext: AGENT_COMMUNICATION_PROTOCOL(
+              "coder_b",
+              questionsLeft,
+            ),
+          })
+        : getCoderRefinementPrompt({
+            userQuery: query,
+            owner,
+            repo,
+            defaultBranch,
+            hasLatestResponse: !!activeResponsePath,
+            communicationContext: AGENT_COMMUNICATION_PROTOCOL(
+              "coder_b",
+              questionsLeft,
+            ),
           });
 
     // Build coder upload dir
@@ -1419,7 +1785,7 @@ export async function runCoderReviewerLoop(
       runSingleModelTurn(
         "DeepSeek",
         persistentPages.dsCoder!,
-        coderPrompt,
+        coderPromptGenerator,
         coderUploadDir,
         dsCoderInvestDir,
         dsCoderFilled,
@@ -1430,11 +1796,14 @@ export async function runCoderReviewerLoop(
         rootManifestContent,
         onStatus,
         activeResponsePath,
+        "coder_a",
+        questionsUsed,
+        persistentPages,
       ),
       runSingleModelTurn(
         "Qwen",
         persistentPages.qwenCoder!,
-        coderPrompt,
+        coderPromptGeneratorQwen,
         coderUploadDir,
         qwenCoderInvestDir,
         qwenCoderFilled,
@@ -1445,6 +1814,9 @@ export async function runCoderReviewerLoop(
         rootManifestContent,
         onStatus,
         activeResponsePath,
+        "coder_b",
+        questionsUsed,
+        persistentPages,
       ),
     ]);
     coderFirstTurn = false;
@@ -1473,10 +1845,15 @@ export async function runCoderReviewerLoop(
 
     // DeepSeek synthesises coder outputs → combined_response_N.txt
     const coderSynthesis = await deepseekCombine(
-      getGeminiSynthesisPrompt({
-        synthesisPrompt: query,
-        latestReview: round > 0 ? finalSynthesis : undefined,
-      }),
+      (questionsLeft) =>
+        getGeminiSynthesisPrompt({
+          synthesisPrompt: query,
+          latestReview: round > 0 ? finalSynthesis : undefined,
+          communicationContext: AGENT_COMMUNICATION_PROTOCOL(
+            "architect",
+            questionsLeft,
+          ),
+        }),
       [rawCoderPath],
       `Synthesizing coder outputs (round ${round})`,
       round > 0 ? finalSynthesis : undefined,
@@ -1484,9 +1861,12 @@ export async function runCoderReviewerLoop(
 
     activeResponsePath = path.join(outDir, `combined_response_${round}.txt`);
     fs.writeFileSync(activeResponsePath, coderSynthesis, "utf-8");
-    
+
     // Save a full debug version containing raw coder outputs + synthesis
-    const debugResponsePath = path.join(outDir, `combined_response_debug_${round}.txt`);
+    const debugResponsePath = path.join(
+      outDir,
+      `combined_response_debug_${round}.txt`,
+    );
     fs.writeFileSync(
       debugResponsePath,
       [
@@ -1498,7 +1878,9 @@ export async function runCoderReviewerLoop(
       ].join("\n"),
       "utf-8",
     );
-    onStatus(`combined_response_${round}.txt (clean synthesis) and debug log written.`);
+    onStatus(
+      `combined_response_${round}.txt (clean synthesis) and debug log written.`,
+    );
 
     // Surface intermediate answer to user
     activeJobs.forEach((job, id) => {
@@ -1517,12 +1899,29 @@ export async function runCoderReviewerLoop(
     // ────────────────────────────────────────────────────────────────────────
     // REVIEWER PHASE
     // ────────────────────────────────────────────────────────────────────────
-    const reviewerPrompt = getCodeReviewPrompt({
-      userQuery: query,
-      owner,
-      repo,
-      defaultBranch,
-    });
+    const reviewerPromptGenerator = (questionsLeft: number) =>
+      getCodeReviewPrompt({
+        userQuery: query,
+        owner,
+        repo,
+        defaultBranch,
+        communicationContext: AGENT_COMMUNICATION_PROTOCOL(
+          "reviewer_a",
+          questionsLeft,
+        ),
+      });
+
+    const reviewerPromptGeneratorQwen = (questionsLeft: number) =>
+      getCodeReviewPrompt({
+        userQuery: query,
+        owner,
+        repo,
+        defaultBranch,
+        communicationContext: AGENT_COMMUNICATION_PROTOCOL(
+          "reviewer_b",
+          questionsLeft,
+        ),
+      });
 
     // Build reviewer upload dir — always send the latest combined_response
     const reviewerUploadDir = path.join(
@@ -1542,7 +1941,7 @@ export async function runCoderReviewerLoop(
       runSingleModelTurn(
         "DeepSeek",
         persistentPages.dsReviewer!,
-        reviewerPrompt,
+        reviewerPromptGenerator,
         reviewerUploadDir,
         dsReviewInvestDir,
         dsReviewFilled,
@@ -1553,11 +1952,14 @@ export async function runCoderReviewerLoop(
         rootManifestContent,
         onStatus,
         activeResponsePath,
+        "reviewer_a",
+        questionsUsed,
+        persistentPages,
       ),
       runSingleModelTurn(
         "Qwen",
         persistentPages.qwenReviewer!,
-        reviewerPrompt,
+        reviewerPromptGeneratorQwen,
         reviewerUploadDir,
         qwenReviewInvestDir,
         qwenReviewFilled,
@@ -1568,9 +1970,11 @@ export async function runCoderReviewerLoop(
         rootManifestContent,
         onStatus,
         activeResponsePath,
+        "reviewer_b",
+        questionsUsed,
+        persistentPages,
       ),
     ]);
-    reviewerFirstTurn = false;
 
     // Cleanup reviewer upload dir
     if (fs.existsSync(reviewerUploadDir)) {
@@ -1593,7 +1997,13 @@ export async function runCoderReviewerLoop(
 
     // DeepSeek synthesises reviewer outputs → combined_review_N.txt
     const reviewSynthesis = await deepseekCombine(
-      getReviewSynthesisPrompt(),
+      (questionsLeft) =>
+        getReviewSynthesisPrompt({
+          communicationContext: AGENT_COMMUNICATION_PROTOCOL(
+            "architect",
+            questionsLeft,
+          ),
+        }),
       [rawReviewPath],
       `Synthesizing reviewer outputs (round ${round})`,
     );
@@ -1633,12 +2043,23 @@ export async function runCoderReviewerLoop(
       break;
     }
 
-
     onStatus(
       `Round ${round}: Issues found — coders will refine in round ${round + 1}.`,
     );
     // Loop continues; next iteration coderFirstTurn=false so coders get combined_review
   }
 
-  return finalSynthesis;
+  // ── Final Polish ───────────────────────────────────────────────────────────
+  onStatus("Performing final code polish...");
+  const polishedAnswer = await deepseekCombine(
+    () =>
+      getFinalPolishPrompt({
+        latestReview: finalSynthesis,
+      }), // Note: final polish doesn't strictly need A2A but we follow the signature
+    [activeResponsePath],
+    "Final Polish",
+    finalSynthesis,
+  );
+
+  return polishedAnswer;
 }

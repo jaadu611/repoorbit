@@ -96,39 +96,33 @@ async function uploadFiles(page: Page, filePaths: string[]): Promise<void> {
     );
 
     // Wait for the exact number of chips to appear AND for all loading indicators to vanish
-    await page
-      .waitForFunction(
-        (expectedCount) => {
-          const container =
-            document.querySelector(
-              '.message-input-container, .qwen-chat-input-container, [class*="input-container"], .qwen-chat-input',
-            ) || document;
+    await page.waitForFunction(
+      (expectedCount) => {
+        const container =
+          document.querySelector(
+            '.message-input-container, .qwen-chat-input-container, [class*="input-container"], .qwen-chat-input',
+          ) || document;
 
-          const chips = container.querySelectorAll(
-            '.anticon.fileitem-icon, .message-input-file-item, .ant-upload-list-item, [class*="file-item"], .qwen-chat-input-file-list-item',
-          );
-
-          const hasLoading = !!document.querySelector(
-            '.ant-progress-bg, .ant-upload-list-item-uploading, [class*="uploading"], .ant-btn-loading, [class*="parsing"], .anticon-loading',
-          );
-
-          const allText = container.textContent?.toLowerCase() || "";
-          const isStillParsing =
-            allText.includes("parsing") || allText.includes("loading");
-
-          // We need the number of chips to match AND no busy indicators to be present
-          return (
-            chips.length >= expectedCount && !hasLoading && !isStillParsing
-          );
-        },
-        filePaths.length,
-        { timeout: 150_000 },
-      )
-      .catch((err) => {
-        console.warn(
-          `[Qwen] Warning: Timeout wait for chips/parsing. Found error: ${err.message}. Continuing anyway.`,
+        const chips = container.querySelectorAll(
+          '.anticon.fileitem-icon, .message-input-file-item, .ant-upload-list-item, [class*="file-item"], .qwen-chat-input-file-list-item',
         );
-      });
+
+        const hasLoading = !!document.querySelector(
+          '.ant-progress-bg, .ant-upload-list-item-uploading, [class*="uploading"], .ant-btn-loading, [class*="parsing"], .anticon-loading',
+        );
+
+        const allText = container.textContent?.toLowerCase() || "";
+        const isStillParsing =
+          allText.includes("parsing") || allText.includes("loading");
+
+        // We need the number of chips to match AND no busy indicators to be present
+        return (
+          chips.length >= expectedCount && !hasLoading && !isStillParsing
+        );
+      },
+      filePaths.length,
+      { timeout: 150_000 },
+    );
 
     await page.waitForTimeout(2000); // Settle time
   };
@@ -144,10 +138,12 @@ async function uploadFiles(page: Page, filePaths: string[]): Promise<void> {
     } catch (e: any) {
       lastErr = e;
       console.warn(
-        `[Qwen] Upload attempt ${attempt} failed: ${e.message}. ${attempt < 3 ? "Retrying without reload..." : ""}`,
+        `[Qwen] Upload attempt ${attempt} failed: ${e.message}.`,
       );
       if (attempt < 3) {
-        await page.waitForTimeout(3000);
+        console.log(`[Qwen] Reloading page and retrying upload (Attempt ${attempt + 1}/3)...`);
+        await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
+        await page.waitForTimeout(5000); // Settle after reload
       }
     }
   }
@@ -226,26 +222,36 @@ async function getReplyCount(page: Page): Promise<number> {
 async function waitForReply(
   page: Page,
   countBefore: number,
-  timeoutMs = 1_800_000,
+  stallLimitMs: number,
 ): Promise<void> {
   console.log(
     `[Qwen] Waiting for reply (Qwen answers so far: ${countBefore})...`,
   );
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + 1_800_000; // 30 min hard limit
   let lastLog = Date.now();
+  const startTime = Date.now();
+
   while (Date.now() < deadline) {
     const count = await getReplyCount(page);
     if (count > countBefore) {
       console.log(`[Qwen] New reply detected (count: ${count}).`);
       return;
     }
+
+    if (Date.now() - startTime > stallLimitMs) {
+      console.warn(`[Qwen] No reply started after ${stallLimitMs / 1000}s — reloading page.`);
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 45_000 });
+      await page.waitForTimeout(3_000);
+      throw new QwenStallError(`[Qwen] No reply started after ${stallLimitMs / 1000}s.`);
+    }
+
     if (Date.now() - lastLog > 30000) {
       console.log(
         `[Qwen] Still waiting for reply (detected so far: ${count})...`,
       );
       lastLog = Date.now();
     }
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(1000);
   }
   throw new Error("[Qwen] Timed out waiting for reply");
 }
@@ -256,9 +262,17 @@ async function waitForReply(
 // Now we snapshot the reply count BEFORE sending the final message and extract
 // specifically the bubble at that index — guaranteed to be the final answer.
 
+class QwenStallError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "QwenStallError";
+  }
+}
+
 async function extractResponseAtIndex(
   page: Page,
   targetIndex: number,
+  stallLimitMs: number,
 ): Promise<string> {
   // Step 1: Wait for stop button to appear (generation started)
   await page
@@ -273,19 +287,52 @@ async function extractResponseAtIndex(
       // Fast responses may not show stop button — continue
     });
 
-  // Step 2: Wait until generation is fully done
-  await page.waitForFunction(
-    () =>
-      !document.querySelector(
+  // Step 2: Wait until generation is fully done — with a stall watchdog
+  const STALL_LIMIT_MS = stallLimitMs;
+  const GENERATION_TIMEOUT_MS = 300_000;
+  const deadline = Date.now() + GENERATION_TIMEOUT_MS;
+  let lastSeenText = "";
+  let lastChangeAt = Date.now();
+
+  while (Date.now() < deadline) {
+    // Check if generation finished
+    const isGenerating = await page.evaluate(
+      () => !!document.querySelector(
         '.qwen-chat-package-comp-new-action-control-container-stop, .anticon-loading, [class*="stop-generating"]',
       ),
-    { timeout: 300_000 },
-  );
+    );
+
+    // Sample current partial output
+    const currentText = await page.evaluate(
+      ({ sel, idx }: { sel: string; idx: number }) => {
+        const els = document.querySelectorAll(sel);
+        const bubble = els[idx] as HTMLElement | undefined;
+        return bubble?.innerText?.trim() ?? "";
+      },
+      { sel: REPLY_SEL, idx: targetIndex },
+    );
+
+    if (currentText !== lastSeenText) {
+      lastSeenText = currentText;
+      lastChangeAt = Date.now();
+    }
+
+    const stalledMs = Date.now() - lastChangeAt;
+    if (stalledMs >= STALL_LIMIT_MS && isGenerating) {
+      console.warn(`[Qwen] No output change for ${stalledMs / 1000}s — reloading page.`);
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 45_000 });
+      await page.waitForTimeout(3_000);
+      throw new QwenStallError(`[Qwen] Stalled for ${STALL_LIMIT_MS / 1000}s with no new output.`);
+    }
+
+    if (!isGenerating) break;
+    await page.waitForTimeout(2_000);
+  }
 
   // Step 3: Settle pause
   await page.waitForTimeout(2000);
 
-  // Step 5: Extract text from the specific bubble at targetIndex
+  // Step 4: Extract text from the specific bubble at targetIndex
   const text = await page.evaluate(
     ({ sel, idx }: { sel: string; idx: number }) => {
       const els = document.querySelectorAll(sel);
@@ -388,10 +435,23 @@ export async function askQwen(
   }
 
   if (batches.length === 0) {
-    const countBefore = await getReplyCount(qPage);
-    await typeAndSend(qPage, query);
-    await waitForReply(qPage, countBefore);
-    return extractResponseAtIndex(qPage, countBefore); // countBefore = index of the new reply
+    let currentStallLimit = 90_000;
+    while (true) {
+      try {
+        const countBefore = await getReplyCount(qPage);
+        await typeAndSend(qPage, query);
+        await waitForReply(qPage, countBefore, currentStallLimit);
+        return await extractResponseAtIndex(qPage, countBefore, currentStallLimit);
+      } catch (e: any) {
+        if (e instanceof QwenStallError) {
+          console.warn(`[Qwen] Stall detected. Retrying with increased timeout: ${currentStallLimit / 1000 + 30}s.`);
+          currentStallLimit += 30_000;
+          await qPage.waitForTimeout(2_000);
+          continue;
+        }
+        throw e;
+      }
+    }
   }
 
   onStatus?.(
@@ -415,19 +475,32 @@ export async function askQwen(
           : query;
 
       // Snapshot BEFORE sending — this index is exactly where the final answer will land
-      const finalReplyIndex = await getReplyCount(qPage);
-      onStatus?.("Sending final query…");
-      await typeAndSend(qPage, msg);
-      await waitForReply(qPage, finalReplyIndex);
-      return extractResponseAtIndex(qPage, finalReplyIndex);
+      let currentStallLimit = 90_000;
+      while (true) {
+        try {
+          const finalReplyIndex = await getReplyCount(qPage);
+          onStatus?.("Sending final query…");
+          await typeAndSend(qPage, msg);
+          await waitForReply(qPage, finalReplyIndex, currentStallLimit);
+          return await extractResponseAtIndex(qPage, finalReplyIndex, currentStallLimit);
+        } catch (e: any) {
+          if (e instanceof QwenStallError) {
+            console.warn(`[Qwen] Stall detected on final batch. Retrying with increased timeout: ${currentStallLimit / 1000 + 30}s.`);
+            currentStallLimit += 30_000;
+            await qPage.waitForTimeout(2_000);
+            continue;
+          }
+          throw e;
+        }
+      }
     } else {
-      const replyCountBefore = await getReplyCount(qPage);
-      await typeAndSend(
-        qPage,
-        `Context Part ${i + 1}/${batches.length} attached. Wait for the next part. Reply only "Ready".`,
-      );
-      await waitForReply(qPage, replyCountBefore);
-      console.log(`[Qwen] Batch ${i + 1} acknowledged. Settling...`);
+          const replyCountBefore = await getReplyCount(qPage);
+          await typeAndSend(
+            qPage,
+            `Context Part ${i + 1}/${batches.length} attached. Wait for the next part. Reply only "Ready".`,
+          );
+          await waitForReply(qPage, replyCountBefore, 60_000); // Wait 60s for "Ready" acknowledgement
+          console.log(`[Qwen] Batch ${i + 1} acknowledged. Settling...`);
       await qPage.waitForTimeout(5000);
     }
   }

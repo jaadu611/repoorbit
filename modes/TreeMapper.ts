@@ -1,4 +1,4 @@
-import { FileNode } from "@/lib/types";
+import { FileNode } from "@/lib/core/types";
 
 export const transformToTree = (
   flatFiles: any[],

@@ -1,6 +1,6 @@
-import { getRepoData, parseRepoInput } from "@/lib/github";
+import { getRepoData, parseRepoInput } from "@/lib/core/github";
 import { transformToTree } from "@/modes/TreeMapper";
-import type { FileNode, FullRepoData } from "@/lib/types";
+import type { FileNode, FullRepoData } from "@/lib/core/types";
 import WorkspaceLayout from "@/components/WorkspaceLayout";
 
 export default async function Workspace({

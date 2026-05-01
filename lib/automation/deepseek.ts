@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 
-import { NotebookPlan } from "@/lib/types";
+import { NotebookPlan } from "@/lib/core/types";
 
 export async function askDeepseek(
   page: Page,

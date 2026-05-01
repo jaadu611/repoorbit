@@ -14,7 +14,7 @@ const UI_JUNK_LABELS = [
   "share",
 ];
 
-import { NotebookEntry, NotebookPlan } from "@/lib/types";
+import { NotebookEntry, NotebookPlan } from "@/lib/core/types";
 
 export function parseNotebookPlan(raw: string): NotebookPlan {
   let clean = raw.trim();

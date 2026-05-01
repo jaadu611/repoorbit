@@ -19,7 +19,7 @@ import {
   ExpertPlan,
   SymbolExtraction,
   BidirectionalGraph,
-} from "@/lib/types";
+} from "@/lib/core/types";
 
 function detectRepoLanguage(filesMetadata: any[]): RepoLanguage {
   if (!filesMetadata || filesMetadata.length === 0) return "mixed";

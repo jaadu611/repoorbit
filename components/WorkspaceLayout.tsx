@@ -5,7 +5,7 @@ import Link from "next/link";
 import { TreePine, Orbit, Waypoints, Search, Cpu } from "lucide-react";
 import TreeView from "@/components/TreeView";
 import AiChat from "@/components/AiChat";
-import { WorkspaceLayoutProps } from "@/lib/types";
+import { WorkspaceLayoutProps } from "@/lib/core/types";
 
 export default function WorkspaceLayout({
   repoUrl,

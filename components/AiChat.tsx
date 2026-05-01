@@ -2,8 +2,8 @@
 
 import { useState, useRef, useEffect, useCallback } from "react";
 import { Cpu, Send, Loader2, Github, Square, Trash2 } from "lucide-react";
-import { useSelectionStore } from "@/lib/store";
-import { FullRepoData } from "@/lib/types";
+import { useSelectionStore } from "@/lib/core/store";
+import { FullRepoData } from "@/lib/core/types";
 import ReactMarkdown from "react-markdown";
 
 interface AiChatProps {
