@@ -914,11 +914,12 @@ function resolveImportPath(
   return tryResolveExtension(resolved, repoFileSet, lang);
 }
 
-function buildBidirectionalGraph(
+async function buildBidirectionalGraph(
   filesMetadata: any[],
   lang: RepoLanguage,
   aliases: Record<string, string> = {},
-): BidirectionalGraph {
+  onProgress?: (msg: string, progress: number) => void,
+): Promise<BidirectionalGraph> {
   const repoFileSet = new Set<string>(
     filesMetadata.map((f) => f.path as string),
   );
@@ -926,7 +927,9 @@ function buildBidirectionalGraph(
 
   clearSymbolIndex();
 
-  for (const file of filesMetadata) {
+  const total = filesMetadata.length;
+  for (let i = 0; i < total; i++) {
+    const file = filesMetadata[i];
     const filePath = file.path as string;
     if (!graph.imports[filePath]) graph.imports[filePath] = [];
     if (!graph.imported_by[filePath]) graph.imported_by[filePath] = [];
@@ -940,9 +943,15 @@ function buildBidirectionalGraph(
       };
     }
     (file as any).symbolsUsed = used;
+
+    if (i % 500 === 0) {
+      await new Promise((r) => setImmediate(r));
+      onProgress?.(`Indexing symbols (${i}/${total})...`, Math.round((i / total) * 30));
+    }
   }
 
-  for (const file of filesMetadata) {
+  for (let i = 0; i < total; i++) {
+    const file = filesMetadata[i];
     const filePath = file.path as string;
     const used = (file as any).symbolsUsed || [];
     for (const sym of used) {
@@ -958,6 +967,10 @@ function buildBidirectionalGraph(
         }
       }
     }
+    if (i % 1000 === 0) {
+      await new Promise((r) => setImmediate(r));
+      onProgress?.(`Linking symbols (${i}/${total})...`, 30 + Math.round((i / total) * 20));
+    }
   }
 
   const goModulePrefix = extractGoModuleName(filesMetadata);
@@ -967,7 +980,8 @@ function buildBidirectionalGraph(
 
   const importCache = new Map<string, string[]>();
 
-  for (const file of filesMetadata) {
+  for (let i = 0; i < total; i++) {
+    const file = filesMetadata[i];
     const filePath = file.path as string;
     if (importCache.has(filePath)) continue;
     const metadataImports = (file as any).imports as string[] | undefined;
@@ -998,6 +1012,12 @@ function buildBidirectionalGraph(
 
     const deduped = [...new Set(resolvedImports)];
     importCache.set(filePath, deduped);
+
+    if (i % 500 === 0) {
+      await new Promise((r) => setImmediate(r));
+      onProgress?.(`Resolving imports (${i}/${total})...`, 50 + Math.round((i / total) * 40));
+    }
+
     if (!graph.imports[filePath]) graph.imports[filePath] = [];
     graph.imports[filePath].push(...deduped);
 
@@ -2381,7 +2401,7 @@ async function writeNotebookFolder(
     `This notebook is part of a high-precision structural analysis.`,
     `For absolute technical truth regarding symbol definitions, consumers, and call-chains:`,
     `1. Consult 01_Meta.txt for the Global Symbol Index and Authority Roadmap.`,
-    `2. Refer to graph.json for raw structural telemetry.` ,
+    `2. Refer to notebooks.json for raw structural telemetry.` ,
     ``,
     `[RELATIONAL ANCHORS]`,
     `This notebook contains files marked as 'Stateful Callers' or 'Mappers'.`,
@@ -2513,6 +2533,7 @@ export async function buildMasterContext(
   dumpAll = true,
   aliases: Record<string, string> = {},
   kHopDepth: number = 2,
+  onProgress?: (msg: string, progress: number) => void,
 ): Promise<{ content: string; lang: RepoLanguage }> {
   clearKHopCache();
 
@@ -2528,7 +2549,12 @@ export async function buildMasterContext(
       ? buildCIncludeGraph(filesMetadata)
       : ({} as Record<string, string[]>);
 
-  const biGraph = buildBidirectionalGraph(filesMetadata, lang, aliases);
+  const biGraph = await buildBidirectionalGraph(
+    filesMetadata,
+    lang,
+    aliases,
+    onProgress,
+  );
 
   const flatIncoming = Object.fromEntries(
     Object.entries(importGraph).map(([path, data]) => [path, data.imports]),
@@ -2894,12 +2920,16 @@ export async function buildMasterContext(
   const batches = splitSourceBlocksIntoBatches(sourceBlocks, 49);
   const folderInfos = [];
   for (let i = 0; i < batches.length; i++) {
+    const notebookName = `notebook_${String(i + 1).padStart(2, "0")}`;
     console.log(
-      `[BUILD] Writing notebook_${String(i + 1).padStart(2, "0")} with ${batches[i].length} files`,
+      `[BUILD] Writing ${notebookName} with ${batches[i].length} files`,
     );
+    const progress = Math.round((i / batches.length) * 100);
+    onProgress?.(`Creating ${notebookName}...`, progress);
     const info = await writeNotebookFolder(batches[i], i, outputDir);
     folderInfos.push(info);
   }
+  onProgress?.("Notebooks created.", 100);
 
   const { rootManifestPath } = await writeRootManifest(
     metaTexts,
@@ -2913,8 +2943,6 @@ export async function buildMasterContext(
     globalDeps,
   );
 
-  const graphPath = join(outputDir, "graph.json");
-  await writeFile(graphPath, JSON.stringify(finalGraph, null, 2), "utf-8");
 
   const notebooksJson = folderInfos.map((info) => ({
     name: info.name,

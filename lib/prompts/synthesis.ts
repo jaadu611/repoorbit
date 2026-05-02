@@ -179,14 +179,10 @@ ${subQuestion}
 6. Do not speculate beyond what the source files show.`;
 }
 
-export function getFinalPolishPrompt(props: { latestReview: string }): string {
+export function getFinalPolishPrompt(): string {
   return `### ROLE: CHIEF ARCHITECT — FINAL POLISH
 
 You have been acting as the Chief Architect throughout this code review and refinement process. The coders have just completed their final revision to fix the bug, and their work has been verified against the reviewer feedback in our ongoing conversation history.
-
-### CONTEXT
-Below is the final verification feedback from the reviewers:
-${props.latestReview}
 
 ### YOUR TASK
 Since you have seen the entire history of the coders' outputs and the reviewers' feedback in this chat, your job is now to produce the **final, clean, and polished version of the code fix**.

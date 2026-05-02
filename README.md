@@ -1,85 +1,127 @@
-# RepoOrbit: The Systems-Level Developer Exoskeleton
+# RepoOrbit
 
-RepoOrbit is a **High-Precision AI Orchestration Pipeline** designed for senior engineers auditing massive, performance-critical codebases. It solves the "Context Limit" problem through surgical structural mapping, a deterministic multi-turn discovery loop, and a specialized disk-level operator engine.
+## Industrial-Grade AI Orchestration for Massive Codebases
+
+RepoOrbit is a high-precision orchestration pipeline designed for generic codebase inquiries, surgical bug hunting, and automated fixing. It bypasses context-window limitations through structural mapping and deterministic multi-model loops, with upcoming support for automated workflow graph generation.
 
 ---
 
-## 📐 The Engine Architecture
+## Architecture & Data Flow
+
+The following diagram illustrates the multi-model orchestration path, from initial repository ingestion to final verified disk application.
 
 ```mermaid
 graph TD
-    A[GitHub Repo] --> B[Phase 1: The Scout]
-    B -->|Keyword-Aware Scoring| C[Notebook Neighborhoods]
-    C --> D[Phase 2: The Triage]
-    D -->|NotebookLM Analysis| E[Symbol Target List]
-    E --> F[Phase 3: The Surgery]
-    F -->|Multi-Turn Discovery| G[DeepSeek V3 / R1]
-    G -->|Context Gap?| H[Missing Context Protocol]
-    H -->|Surgical Refill| F
-    G --> I[Phase 4: Disk Operation]
-    I -->|Gemma 4-31B| J[Local Filesystem Apply]
-    J -->|Gemini 3 Flash| K[Verification & Build]
+    A[ GitHub Repository ] -->| Structural Analysis | B( GitHub API / Core Logic )
+    B -->| Context Mapping | C[ Notebook Neighborhoods ]
+    
+    C -->| Raw Context | D( Dual Planners: DeepSeek V3 + Qwen 2.5 )
+    D -->| Draft Plans | E[ Gemini 2.5 Flash Plan Merger ]
+    E -->| Unified Investigation Plan | F[ NotebookLM Evidence Engine ]
+    
+    F -->| Precise Code Evidence | G( Parallel Coders: DeepSeek R1 + Qwen 2.5 )
+    G -->| Raw Implementations | H[ DeepSeek Architect Combiner ]
+    
+    H -->| Synthesized Fix | I( Parallel Reviewers: DeepSeek R1 + Qwen 2.5 )
+    I -->| Raw Feedback | J{ DeepSeek Architect Combiner }
+    
+    J -->| HAS_ISSUES: YES | G
+    J -->| HAS_ISSUES: NO | K[ Gemma 4-31B Disk Operator ]
+    
+    K -->| Final Answer & Filesystem Apply | L( Parallel Test Generators: 4-Agent Suite )
+    L -->| Test Scenarios | M[ Gemma Test Runner ]
+    
+    M -->| Execution Logs & Build Output | N[ Gemini 2.5 Flash Verifier ]
+    N -->| Final Report | O[ Production-Ready Audit Fix ]
+
+    style E fill:#f9f,stroke:#333,stroke-width:2px,color:#000
+    style H fill:#f9f,stroke:#333,stroke-width:2px,color:#000
+    style J fill:#f9f,stroke:#333,stroke-width:2px,color:#000
+    style N fill:#f9f,stroke:#333,stroke-width:2px,color:#000
+    style K fill:#bbf,stroke:#333,stroke-width:2px,color:#000
+    style M fill:#bbf,stroke:#333,stroke-width:2px,color:#000
 ```
 
 ---
 
-## ⚙️ The Orchestration Pipeline
+## Core Pipeline
 
-1.  **🔭 The Scout (Scoring)**: Maps the repository into "Notebook Neighborhoods" and performs keyword-aware relevance scoring.
-2.  **⚖️ The Triage (Planning)**: Leverages **NotebookLM** to translate natural language queries into a concrete **Symbol Target List**.
-3.  **🔪 The Surgery (Implementation)**: Feeds surgical code blocks to **DeepSeek** via the **Missing Context Protocol** to resolve dependencies dynamically.
-4.  **💾 The Operator (Disk Engine)**: Uses **Gemma 4-31B** as a strictly constrained disk-level operator to apply changes and run local tests/builds.
-5.  **✅ The Verifier (Flash)**: Uses **Gemini 3 Flash** to review execution reports and handle final architectural edge cases.
-
----
-
-## 📁 Library Structure
-
-The codebase is organized into domain-driven modules for maximum maintainability:
-
-- **`lib/automation/`**: Specialist agent adapters (ChatGPT, DeepSeek, Gemini, OpenCode).
-- **`lib/builders/`**: Context assembly and prompt generation engines.
-- **`lib/core/`**: Fundamental types, browser management, and GitHub API integration.
-- **`lib/prompts/`**: Modular prompt engineering layer (Coding, Review, Synthesis, Disk).
+| Phase | Responsibility | Model Stack |
+| :--- | :--- | :--- |
+| **Scout** | Structural analysis and relevance scoring of neighborhoods. | GitHub API / Core Logic |
+| **Triage** | Dual-model strategy generation and merging. | DeepSeek / Qwen + Gemini Flash |
+| **Evidence** | Extracting precise code evidence from mapped notebooks. | NotebookLM |
+| **Surgery** | Implementation loop with parallel coders and architectural combination. | DeepSeek R1 / Qwen 2.5 |
+| **Testing** | 4-agent parallel test scenario generation and local execution. | DeepSeek / Qwen + Gemma |
+| **Operator** | Constrained filesystem application and test execution. | Gemma 4-31B |
+| **Verifier** | Architectural review and validation of execution logs. | Gemini 2.5 Flash |
 
 ---
 
-## 🚀 Key Breakthroughs
+## Technical Specifications
 
-- **🏗️ Context-Window Efficiency**: Significant reduction in noise via surgical mapping and removal of metadata bloat.
-- **👑 Multi-Agent Loop**: A robust iteration cycle where coders and reviewers collaborate to produce production-ready fixes.
-- **🔄 Stall Detection**: Automated watchdog timers in the automation loop to detect and recover from silent generator hangs.
-- **🌉 Orchestration Dashboard**: A custom industrial-grade CLI dashboard providing real-time status of the OpenCode cores and Next.js dev server.
-
----
-
-## 🛠️ Tech Stack
-
-- **Automation**: Playwright (Persistent Chromium Context)
-- **Framework**: Next.js 16 (Turbopack)
-- **Cores**:
-  - **OpenCode**: Gemma 4-31B (Disk Operator) & Gemini 3 Flash (Verifier).
-  - **DeepSeek V3/R1**: Primary reasoning and implementation.
-- **Styling**: Vanilla CSS (Industrial Blue & Green Aesthetics).
+* **Automation Engine**: Persistent Playwright context utilizing Brave.
+* **Frontend**: Next.js 16 with Turbopack for high-performance dashboarding.
+* **Orchestration**: Custom dashboard providing real-time status of local cores and server state.
+* **Stability**: Integrated stall detection with automated watchdog timers and UI-level recovery.
+* **OpenCode Integration**: Automated UI-level tuning for high-power execution and planning modes.
 
 ---
 
-## 🏁 Quick Start
+## Library Architecture
+
+The codebase follows a domain-driven structure to ensure modularity and ease of maintenance:
+
+* `lib/automation/`: Adapters for DeepSeek, Qwen, Gemini, and OpenCode.
+* `lib/builders/`: Context assembly and dynamic prompt engineering.
+* `lib/core/`: Browser management, GitHub integration, and fundamental types.
+* `lib/prompts/`: Modular system instructions for specialized agent tasks.
+
+---
+
+## Quick Start
+
+### 1. Dependencies
+
+Install the OpenCode local engine globally:
+
+```bash
+npm install -g @google/opencode
+```
+
+Configure your Google AI API key from [AI Studio](https://aistudio.google.com/):
+
+```bash
+opencode config set GOOGLE_API_KEY=<your_key>
+```
+
+### 2. Installation
 
 ```bash
 git clone https://github.com/jaadu/repoorbit
+cd repoorbit
 npm install
-npm run dev
 ```
 
-> **Tip**: Use `npm run dev -s` for a silent, clean dashboard startup.
+### 3. Environment Configuration
 
-**Environment Variables (.env)**:
+Create a `.env` file in the root directory:
 
-- `GITHUB_TOKEN`
-- `DEEPSEEK_API_KEY`
-- `NEXT_PUBLIC_GITHUB_TOKEN`
+```env
+GITHUB_TOKEN=<your_github_pat>
+NEXT_PUBLIC_GITHUB_TOKEN=<your_github_pat>
+```
+
+### 4. Launch
+
+Execute the full orchestration stack:
+
+```bash
+./start.sh
+```
 
 ---
 
-_Built for engineers who need to see through the noise._
+**Note**: RepoOrbit utilizes browser-based automation for DeepSeek and Qwen to minimize API costs and maximize reasoning capabilities. Ensure you are authenticated with these platforms in your primary browser context.
+
+_Engineered for high-fidelity codebase surgery._

@@ -47,8 +47,8 @@ const SURROUNDING_LINES_AFTER = 50;  // Increased to capture more context
 // ---------------------------------------------------------------------------
 // DEPENDENCY MANIFEST CO-EXTRACTION
 // ---------------------------------------------------------------------------
-// package.json (and equivalents) have zero entries in graph.json — they are
-// pure metadata and the dependency graph builder never links them to source
+// package.json (and equivalents) are pure metadata and the dependency 
+// graph builder never links them to source files.
 // files. The context extractor therefore never pulls them in automatically,
 // even when the target function's correctness depends entirely on knowing
 // which version of a third-party library is installed.
@@ -254,172 +254,48 @@ export function buildDeepseekContext(
     }
   }
 
-  // Load graph.json if it exists
-  const graphPath = path.join(outDir, "graph.json");
-  let importGraph: Record<string, { imports: string[]; imported_by: string[] }> = {};
-  if (fs.existsSync(graphPath)) {
-    try {
-      importGraph = JSON.parse(fs.readFileSync(graphPath, "utf-8"));
-    } catch (err) {
-      console.warn("[buildDeepseekContext] Could not load graph.json:", err);
-    }
+  let blockIndex = 0;
+  function writeBlock(name: string, content: string, ext = ".txt") {
+    const idx = String(blockIndex++).padStart(3, "0");
+    const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "_").replace(/_+/g, "_");
+    const fileName = `${idx}_${safeName}${ext}`;
+    const filePath = path.join(contextDir, fileName);
+    fs.writeFileSync(filePath, content, "utf-8");
+    console.log(`[buildDeepseekContext] Wrote block: ${fileName}`);
+    return fileName;
   }
 
-  const extractedBlocks: string[] = [];
-  const processedPairs = new Set<string>(); // `${fullPath}|${hint}`
-
   const repoRoot = outDir;
+  const processedPairs = new Set<string>(); // `${fullPath}|${hint}`
 
   // =========================================================================
   // SECTION 1: Mission Metadata Header
   // =========================================================================
-  extractedBlocks.push(
-    `// =============================================================================`,
-  );
-  extractedBlocks.push(`// MISSION CONTEXT: ${pathBJson.intent || "FIX"}`);
-  extractedBlocks.push(
-    `// =============================================================================\n`,
-  );
-
-  extractedBlocks.push(
-    `// =============================================================================\n`,
+  writeBlock("mission_metadata", 
+    `// =============================================================================\n` +
+    `// MISSION CONTEXT: ${pathBJson.intent || "FIX"}\n` +
+    `// =============================================================================\n`
   );
 
   // =========================================================================
-  // SECTION 6: Symbol & File Resolution
+  // SECTION 5: Dependency Manifest Co-Extraction
   // =========================================================================
-  // The notebook files stored in outDir are the repository source ground truth
-  const notebooksMetaPath = path.join(outDir, "notebooks.json");
-  const notebooksDir = outDir; // notebook_01, notebook_02, ... live here
-
-  // ------------------------------------------------------------------
-  // SECTION 4: Process context_files (from notebooks or direct read)
-  // ------------------------------------------------------------------
-  const cFiles: string[] = Array.isArray(pathBJson.context_files)
-    ? pathBJson.context_files
-    : [];
-
-  if (cFiles.length > 0) {
-    console.log(
-      `[ContentBuilder] Reading ${cFiles.length} context_files from repository sources`,
-    );
-
-    let notebooksLookup: Array<{
-      name: string;
-      files: string[];
-      localFiles: string[];
-    }> = [];
-    try {
-      if (fs.existsSync(notebooksMetaPath)) {
-        notebooksLookup = JSON.parse(
-          fs.readFileSync(notebooksMetaPath, "utf-8"),
-        );
-      }
-    } catch {}
-
-    for (const relPath of cFiles) {
-      if (!relPath) continue;
-
-      // 1. Try local notebook files first
-      let found = false;
-      for (const nb of notebooksLookup) {
-        const idx = nb.files.indexOf(relPath);
-        if (idx !== -1) {
-          const localPath = nb.localFiles[idx];
-          if (fs.existsSync(localPath)) {
-            const pairKey = `${localPath}|__file__`;
-            if (processedPairs.has(pairKey)) {
-              found = true;
-              break;
-            }
-            processedPairs.add(pairKey);
-            const raw = fs.readFileSync(localPath, "utf-8");
-            const code = raw.includes("\n\n")
-              ? raw.split("\n\n").slice(1).join("\n\n")
-              : raw;
-            extractedBlocks.push(`// --- Source: ${relPath} (notebook) ---`);
-            extractedBlocks.push(code);
-            found = true;
-            break;
-          }
-        }
-      }
-
-      // 2. Fall back to repoRoot direct read
-      if (!found) {
-        const fullPath = path.join(repoRoot, relPath);
-        const ext = path.extname(relPath).toLowerCase();
-        if (!CODE_EXTENSIONS.has(ext)) continue;
-        if (!fs.existsSync(fullPath)) {
-          extractedBlocks.push(
-            `// [MISSING] ${relPath} not found at ${fullPath}`,
-          );
-          continue;
-        }
-        const pairKey = `${fullPath}|__file__`;
-        if (processedPairs.has(pairKey)) continue;
-        processedPairs.add(pairKey);
-        const code = fs.readFileSync(fullPath, "utf-8");
-        extractedBlocks.push(`// --- Source: ${relPath} (direct read) ---`);
-        extractedBlocks.push(code);
-      }
-    }
-  }
-  const symbolIndex: Record<string, any> = {};
-
-  // =========================================================================
-  // SECTION 5 (NEW): Dependency Manifest Co-Extraction
-  // =========================================================================
-  // Emitted ONCE before any symbols so every model reading this context file
-  // sees the dependency versions first, before any function body it will fix.
   const manifestCoExtract = findDependencyManifest(repoRoot, repoRoot, 2);
   if (manifestCoExtract !== null) {
     const rel: string = manifestCoExtract.relPath as string;
     const content: string = manifestCoExtract.content as string;
-    extractedBlocks.push(
-      `\n// =============================================================================`,
+    writeBlock(`dep_manifest_${rel.replace(/[^a-zA-Z0-9_-]/g, "_")}`, 
+      `// Dependency Manifest: ${rel}\n\n${content}`
     );
-    extractedBlocks.push(`// DEPENDENCY MANIFEST: ${rel}`);
-    extractedBlocks.push(
-      `// Co-extracted automatically alongside the target symbols.`,
-      `// IMPORTANT FOR CODING MODELS:`,
-      `// Before choosing any option value for a third-party library call`,
-      `// look up the installed version in this manifest first.`,
-    );
-    extractedBlocks.push(
-      `// =============================================================================`,
-    );
-    extractedBlocks.push(content);
 
-    // Root package.json is extra important — force include it if we are at root
     const rootPackageJson = path.join(repoRoot, "package.json");
     if (fs.existsSync(rootPackageJson) && rel !== "package.json") {
-       const rootContent = fs.readFileSync(rootPackageJson, "utf-8");
-       extractedBlocks.push(`\n// --- Root package.json (forced) ---`);
-       extractedBlocks.push(rootContent);
+       writeBlock("root_package_json", fs.readFileSync(rootPackageJson, "utf-8"));
     }
-
-    const mfn: string = rel.replace(/[^a-zA-Z0-9_-]/g, "_");
-    const manifestFileName = `dep_manifest_${mfn}.txt`;
-    const manifestFilePath = path.join(contextDir, manifestFileName);
-    fs.writeFileSync(
-      manifestFilePath,
-      `// Dependency Manifest: ${rel}\n\n${content}`,
-      "utf-8",
-    );
-  } else {
-    console.warn(
-      `[buildDeepseekContext] No dependency manifest found in mirror. Models will not have version info.`,
-    );
-    extractedBlocks.push(
-      `// [WARNING] No dependency manifest (package.json / Cargo.toml / go.mod etc.) found.`,
-      `// Models MUST NOT guess option values for third-party libraries without version info.`,
-      `// Use the NEED_MORE_CONTEXT protocol if you require dependency version information.`,
-    );
   }
 
   // ------------------------------------------------------------------
-  // SECTION 6a: Process context_files (prefer notebook local files, fallback to GitHub/direct)
+  // SECTION 6a: Process context_files
   // ------------------------------------------------------------------
   const contextFiles: string[] = Array.isArray(pathBJson.context_files)
     ? pathBJson.context_files
@@ -427,71 +303,46 @@ export function buildDeepseekContext(
 
   let notebooksLookup2: Array<{ name: string; files: string[]; localFiles: string[] }> = [];
   try {
+    const notebooksMetaPath = path.join(outDir, "notebooks.json");
     if (fs.existsSync(notebooksMetaPath)) {
       notebooksLookup2 = JSON.parse(fs.readFileSync(notebooksMetaPath, "utf-8"));
     }
   } catch {}
 
-  if (contextFiles.length > 0) {
-    extractedBlocks.push(`\n// =============================================================================`);
-    extractedBlocks.push(`// REPOSITORY SOURCE FILES`);
-    extractedBlocks.push(`// =============================================================================`);
+  for (const relPath of contextFiles) {
+    const ext = path.extname(relPath).toLowerCase();
+    if (!CODE_EXTENSIONS.has(ext)) continue;
 
-    for (const relPath of contextFiles) {
-      const ext = path.extname(relPath).toLowerCase();
-      if (!CODE_EXTENSIONS.has(ext)) continue;
+    let found = false;
+    for (const nb of notebooksLookup2) {
+      const idx = nb.files.indexOf(relPath);
+      if (idx !== -1 && fs.existsSync(nb.localFiles[idx])) {
+        const localPath = nb.localFiles[idx];
+        const pairKey = `${localPath}|__raw__`;
+        if (processedPairs.has(pairKey)) continue;
+        processedPairs.add(pairKey);
 
-      // Try notebook local files first
-      let found = false;
-      for (const nb of notebooksLookup2) {
-        const idx = nb.files.indexOf(relPath);
-        if (idx !== -1 && fs.existsSync(nb.localFiles[idx])) {
-          const localPath = nb.localFiles[idx];
-          const pairKey = `${localPath}|__raw__`;
-          if (processedPairs.has(pairKey)) continue;
-          processedPairs.add(pairKey);
-
-          const raw = fs.readFileSync(localPath, "utf-8");
-          const code = raw.includes("\n\n") ? raw.split("\n\n").slice(1).join("\n\n") : raw;
-          const lineCount = code.split("\n").length;
-
-          extractedBlocks.push(`// --- Source: ${relPath} ---`);
-          console.log(`[buildDeepseekContext] Staged notebook file: ${relPath} (${lineCount} lines)`);
-
-          if (lineCount > SPLIT_LINE_THRESHOLD) {
-            const safeName = relPath.replace(/[^a-zA-Z0-9_-]/g, "_").replace(/_+/g, "_");
-            const splitFileName = `raw_${safeName}.js`;
-            const splitFilePath = path.join(contextDir, splitFileName);
-            fs.writeFileSync(splitFilePath, `// Raw source: ${relPath}\n\n${code}`, "utf-8");
-            extractedBlocks.push(`// --- See: ${splitFileName} (${lineCount} lines) ---`);
-          } else {
-            extractedBlocks.push(code);
-          }
-          found = true;
-          break;
-        }
+        const raw = fs.readFileSync(localPath, "utf-8");
+        const code = raw.includes("\n\n") ? raw.split("\n\n").slice(1).join("\n\n") : raw;
+        writeBlock(`source_${relPath}`, `// Source: ${relPath}\n\n${code}`, ext);
+        found = true;
+        break;
       }
+    }
 
-      // Fallback to direct repo read
-      if (!found) {
-        const fullPath = path.join(repoRoot, relPath);
-        if (!fs.existsSync(fullPath)) {
-          extractedBlocks.push(`// [MISSING] ${relPath} not found`);
-          console.warn(`[buildDeepseekContext] File not found: ${fullPath}`);
-          continue;
-        }
+    if (!found) {
+      const fullPath = path.join(repoRoot, relPath);
+      if (fs.existsSync(fullPath)) {
         const pairKey = `${fullPath}|__raw__`;
         if (processedPairs.has(pairKey)) continue;
         processedPairs.add(pairKey);
-        const code = fs.readFileSync(fullPath, "utf-8");
-        extractedBlocks.push(`// --- Source: ${relPath} (direct) ---`);
-        extractedBlocks.push(code);
+        writeBlock(`source_${relPath}`, `// Source: ${relPath} (direct)\n\n${fs.readFileSync(fullPath, "utf-8")}`, ext);
       }
     }
   }
 
   // ------------------------------------------------------------------
-  // SECTION 6b: target_symbols — extract specific functions
+  // SECTION 6b: target_symbols
   // ------------------------------------------------------------------
   const targetSymbols = Array.isArray(pathBJson.target_symbols)
     ? pathBJson.target_symbols
@@ -501,355 +352,60 @@ export function buildDeepseekContext(
     const hint = symRequest.name_hint || symRequest.name;
     if (!hint) continue;
 
-    extractedBlocks.push(
-      `// --- Symbol: "${hint}" | Role: ${symRequest.role || "unspecified"} | Type: ${symRequest.type || "unknown"} ---`,
-    );
-
-    const rawSourceFile: string | undefined =
-      typeof symRequest.source_file === "string" &&
-      symRequest.source_file.trim()
-        ? symRequest.source_file.trim()
-        : undefined;
-
-    const explicitSourceFile = rawSourceFile ?? undefined;
-
+    const rawSourceFile = typeof symRequest.source_file === "string" ? symRequest.source_file.trim() : undefined;
     let candidateFiles: CandidateFile[] = [];
 
-    if (explicitSourceFile) {
-      const explicit: string = explicitSourceFile;
-      // Check notebook local files first
-      let resolvedFromNotebook = false;
+    if (rawSourceFile) {
+      const explicit = rawSourceFile;
+      let resolved = false;
       for (const nb of notebooksLookup2) {
         const idx = nb.files.indexOf(explicit);
         if (idx !== -1 && fs.existsSync(nb.localFiles[idx])) {
           candidateFiles = [{ fullPath: nb.localFiles[idx], relPath: explicit }];
-          resolvedFromNotebook = true;
+          resolved = true;
           break;
         }
       }
-
-      if (!resolvedFromNotebook) {
+      if (!resolved) {
         const fullPath = path.join(repoRoot, explicit);
-        if (fs.existsSync(fullPath)) {
-          candidateFiles = [{ fullPath, relPath: explicit }];
-        } else {
-          extractedBlocks.push(
-            `// [WARN] source_file "${explicit}" not found — falling back to heuristic search`,
-          );
-          candidateFiles = resolveCandidateFiles(
-            hint,
-            symbolIndex,
-            contextFiles,
-            notebooksLookup2,
-            repoRoot,
-            explicit,
-          );
-        }
+        if (fs.existsSync(fullPath)) candidateFiles = [{ fullPath, relPath: explicit }];
       }
-    } else {
-      candidateFiles = resolveCandidateFiles(
-        hint,
-        symbolIndex,
-        contextFiles,
-        notebooksLookup2,
-        repoRoot,
-      );
     }
 
     if (candidateFiles.length === 0) {
-      extractedBlocks.push(`// [NOT FOUND] No source file found for "${hint}"`);
-      continue;
+      candidateFiles = resolveCandidateFiles(hint, {}, contextFiles, notebooksLookup2, repoRoot);
     }
 
-    candidateFiles.sort(
-      (a, b) => sourceFilePriority(a.relPath) - sourceFilePriority(b.relPath),
-    );
+    if (candidateFiles.length > 0) {
+      const { fullPath, relPath } = candidateFiles[0];
+      const pairKey = `${fullPath}|${hint}`;
+      if (processedPairs.has(pairKey)) continue;
+      processedPairs.add(pairKey);
 
-    const { fullPath, relPath } = candidateFiles[0];
-
-    const pairKey = `${fullPath}|${hint}`;
-    if (processedPairs.has(pairKey)) {
-      extractedBlocks.push(
-        `// (already included above: ${hint} from ${relPath})`,
-      );
-      continue;
-    }
-    processedPairs.add(pairKey);
-
-    const code = fs.readFileSync(fullPath, "utf-8");
-    const blocks = extractFunctionsFromCode(code, hint);
-
-    extractedBlocks.push(`// --- Source: ${relPath} ---`);
-
-    if (blocks.length === 0) {
-      const rawKey = `${fullPath}|__raw__`;
-      if (processedPairs.has(rawKey)) {
-        extractedBlocks.push(
-          `// (${hint} not isolated — full source already staged above)`,
-        );
-        console.warn(
-          `[buildDeepseekContext] Could not isolate "${hint}" in ${relPath} but file already staged — skipping duplicate.`,
-        );
-        continue;
-      }
-
-      const lines = code.split("\n");
-      const lowerHint = hint.toLowerCase();
-      const hitLines = lines
-        .map((l, i) => (l.toLowerCase().includes(lowerHint) ? i : -1))
-        .filter((i) => i !== -1);
-
-      console.warn(
-        `[buildDeepseekContext] No functions matched "${hint}" in ${relPath}${hitLines.length > 0 ? ` — using windowed fallback around line ${hitLines[0]}` : " — emitting capped head"}.`,
-      );
-
-      let snippet: string;
-      const fileHeader = extractFileHeader(code).trim();
-      let nodeContext = "";
-      const nodeInfo = importGraph[relPath];
-      if (nodeInfo) {
-        if (nodeInfo.imports.length > 0) nodeContext += `// [DEPENDENCIES] Imports: ${nodeInfo.imports.join(", ")}\n`;
-        if (nodeInfo.imported_by.length > 0) nodeContext += `// [CONSUMERS] Used by: ${nodeInfo.imported_by.join(", ")}\n`;
-        if (nodeContext) nodeContext += "\n";
-      }
-
-      if (hitLines.length > 0) {
-        const centre = hitLines[0];
-        // Use larger windows for fallback too
-        const from = Math.max(
-          0,
-          centre - Math.max(200, SURROUNDING_LINES_BEFORE),
-        );
-        const to = Math.min(lines.length - 1, centre + 200);
-        snippet =
-          (from > 0 ? `// [truncated ${from} lines before...]\n` : "") +
-          lines.slice(from, to + 1).join("\n") +
-          (to < lines.length - 1
-            ? `\n// [...truncated ${lines.length - to - 1} lines after]`
-            : "");
+      const code = fs.readFileSync(fullPath, "utf-8");
+      const blocks = extractFunctionsFromCode(code, hint);
+      
+      if (blocks.length > 0) {
+        for (const block of blocks) {
+          writeBlock(`symbol_${hint}`, `// Source: ${relPath}\n// Symbol: ${hint}\n\n${block}`, ".js");
+        }
       } else {
-        const CAP = 300;
-        snippet =
-          lines.slice(0, CAP).join("\n") +
-          (lines.length > CAP
-            ? `\n// [...file truncated at ${CAP} lines — "${hint}" not found]`
-            : "");
-      }
-
-      // Prepend header and dependency info to the fallback snippet
-      const finalSnippet = [
-        `// Source: ${relPath}`,
-        `// Symbol: ${hint} (windowed fallback)`,
-        ``,
-        fileHeader ? `// --- File Header (Imports/Setup) ---\n${fileHeader}\n` : "",
-        nodeContext,
-        `// --- Content Window ---`,
-        snippet,
-      ].filter(Boolean).join("\n");
-
-      const safeName = hint.replace(/[^a-zA-Z0-9_-]/g, "_");
-      const splitFileName = `${safeName}.js`;
-      const splitFilePath = path.join(contextDir, splitFileName);
-      fs.writeFileSync(
-        splitFilePath,
-        finalSnippet,
-        "utf-8",
-      );
-      extractedBlocks.push(
-        `// --- See: ${splitFileName} (windowed context around "${hint}") ---`,
-      );
-      continue;
-    }
-
-    // ---------------------------------------------------------------
-    // SURROUNDING CONTEXT WINDOW — emitted for every extracted block
-    // ---------------------------------------------------------------
-    // We find the character offset of the extracted block in the full
-    // source, then use extractSurroundingContext to get the lines
-    // immediately before (require/imports) and after (module.exports).
-    //
-    // For small blocks we emit inline with labelled headers.
-    // For large blocks we write to the split file with the prefix and
-    // suffix included so the split file is self-contained.
-    // ---------------------------------------------------------------
-    for (const block of blocks) {
-      const lineCount = block.split("\n").length;
-
-      // Locate the block in the original source by exact string match.
-      // This works because extractFunctionsFromCode uses code.slice() on
-      // AST node offsets, so the block is a verbatim substring of code.
-      const blockCharStart = code.indexOf(block);
-      const blockCharEnd =
-        blockCharStart >= 0 ? blockCharStart + block.length : -1;
-
-      let prefixText = "";
-      let suffixText = "";
-      const fileHeader = extractFileHeader(code).trim();
-
-      if (blockCharStart >= 0) {
-        const surrounding = extractSurroundingContext(
-          code,
-          blockCharStart,
-          blockCharEnd,
-        );
-        prefixText = surrounding.prefix.trim();
-        suffixText = surrounding.suffix.trim();
-      }
-
-      // If the fileHeader is not already in the prefixText, prepend it
-      // to ensure the model sees the imports.
-      let fullBlockContext = "";
-      if (fileHeader && !prefixText.includes(fileHeader.substring(0, 50))) {
-        fullBlockContext += `// --- File Header (Imports/Setup) ---\n${fileHeader}\n\n`;
-      }
-
-      // Add dependency info from graph.json if available
-      const nodeInfo = importGraph[relPath];
-      if (nodeInfo) {
-        if (nodeInfo.imports.length > 0) {
-          fullBlockContext += `// [DEPENDENCIES] This file imports: ${nodeInfo.imports.join(", ")}\n`;
-        }
-        if (nodeInfo.imported_by.length > 0) {
-          fullBlockContext += `// [CONSUMERS] This file is used by: ${nodeInfo.imported_by.join(", ")}\n`;
-        }
-        fullBlockContext += "\n";
-      }
-
-      if (lineCount > SPLIT_LINE_THRESHOLD) {
-        const safeName = hint.replace(/[^a-zA-Z0-9_-]/g, "_");
-        const splitFileName = `${safeName}.js`;
-        const splitFilePath = path.join(contextDir, splitFileName);
-
-        // Write prefix + body + suffix into the split file so it is
-        // fully self-contained: the model sees require() stmts, the
-        // function, and the module.exports line all in one file.
-        const fullContentItems = [
-          `// Source: ${relPath}`,
-          `// Symbol: ${hint}`,
-          ``,
-          fullBlockContext,
-          prefixText
-            ? `// --- Module context before ${hint} (require/imports/module-level config) ---\n${prefixText}\n`
-            : "",
-          `// --- Symbol body ---`,
-          block,
-          suffixText
-            ? `\n// --- Module context after ${hint} (exports/wiring) ---\n${suffixText}`
-            : "",
-        ];
-
-        const fullContent = fullContentItems
-          .filter((s) => s !== "")
-          .join("\n");
-
-        fs.writeFileSync(splitFilePath, fullContent, "utf-8");
-        extractedBlocks.push(
-          `// --- See: ${splitFileName} (${lineCount} lines, split to keep context readable) ---`,
-        );
-      } else {
-        // Inline: emit header/deps → prefix → body → suffix with clear section labels
-        if (fullBlockContext) {
-          extractedBlocks.push(fullBlockContext);
-        }
-        if (prefixText) {
-          extractedBlocks.push(
-            `// --- Module context before ${hint} (require/imports/module-level config) ---`,
-          );
-          extractedBlocks.push(prefixText);
-        }
-        extractedBlocks.push(block);
-        if (suffixText) {
-          extractedBlocks.push(
-            `// --- Module context after ${hint} (exports/wiring) ---`,
-          );
-          extractedBlocks.push(suffixText);
-        }
+        // Fallback for symbols that couldn't be parsed
+        writeBlock(`symbol_${hint}_fallback`, `// Source: ${relPath}\n// Symbol: ${hint} (fallback)\n\n${code.slice(0, 5000)}`, ".js");
       }
     }
   }
 
   // =========================================================================
-  // SECTION 7: Append gap-filled symbols (previous round requests)
+  // SECTION 7: Gap-filled symbols
   // =========================================================================
-  const gapFiles = fs
-    .readdirSync(contextDir)
-    .filter(
-      (f) => f.startsWith("gap_") && (f.endsWith(".js") || f.endsWith(".txt")),
-    )
-    .sort();
-
-  if (gapFiles.length > 0) {
-    extractedBlocks.push(
-      `\n// =============================================================================`,
-    );
-    extractedBlocks.push(
-      `// GAP-FILLED SYMBOLS (fetched on previous round at DeepSeek's request)`,
-    );
-    extractedBlocks.push(
-      `// =============================================================================`,
-    );
-
-    for (const gapFile of gapFiles) {
-      const gapFilePath = path.join(contextDir, gapFile);
-      const gapContent = fs.readFileSync(gapFilePath, "utf-8");
-
-      const headerMatch = gapContent.match(
-        /^\/\/ Gap-filled: (\S+) from (\S+)/m,
-      );
-      const gapSymbol =
-        headerMatch?.[1] ?? gapFile.replace(/^gap_/, "").replace(/\.js$/, "");
-      const gapSourceFile = headerMatch?.[2];
-
-      extractedBlocks.push(`// --- Gap-filled symbol: "${gapSymbol}" ---`);
-
-      let extracted = false;
-      if (gapSourceFile) {
-        const match = gapContent.match(/```typescript\n([\s\S]*?)```/);
-        if (match !== null && match[1]) {
-          const sourceCode: string = match[1];
-          const blocks = extractFunctionsFromCode(sourceCode, gapSymbol);
-          if (blocks.length > 0) {
-            extractedBlocks.push(`// Source: ${gapSourceFile} (gap-filled)`);
-            for (const block of blocks) {
-              const lineCount = block.split("\n").length;
-              if (lineCount > SPLIT_LINE_THRESHOLD) {
-                const trimmedPath = path.join(contextDir, gapFile);
-                fs.writeFileSync(
-                  trimmedPath,
-                  `// Gap-filled: ${gapSymbol} from ${gapSourceFile}\n\n${block}`,
-                  "utf-8",
-                );
-                extractedBlocks.push(`// --- See: ${gapFile} (${lineCount} lines) ---`);
-              } else {
-                extractedBlocks.push(block);
-              }
-            }
-            extracted = true;
-          }
-        }
-      }
-
-      if (!extracted) {
-        const lineCount = gapContent.split("\n").length;
-        if (lineCount <= SPLIT_LINE_THRESHOLD * 2) {
-          extractedBlocks.push(gapContent);
-        } else {
-          extractedBlocks.push(
-            `// [GAP FILE TOO LARGE — ${lineCount} lines] Could not isolate "${gapSymbol}". Check the full context upload for this symbol.`,
-          );
-        }
-      }
-    }
+  const gapFiles = fs.readdirSync(contextDir).filter(f => f.startsWith("gap_")).sort();
+  for (const gapFile of gapFiles) {
+    const gapContent = fs.readFileSync(path.join(contextDir, gapFile), "utf-8");
+    writeBlock(`gap_${gapFile}`, gapContent);
   }
 
-  // =========================================================================
-  // Write main context file and return
-  // =========================================================================
-  const mainContextText = extractedBlocks.join("\n\n");
-  const mainFile = path.join(contextDir, "context.js");
-  fs.writeFileSync(mainFile, mainContextText, "utf-8");
-
-  return { contextDir, contextText: mainContextText };
+  return { contextDir, contextText: "Individual context blocks staged." };
 }
 
 // =============================================================================

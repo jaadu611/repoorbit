@@ -244,7 +244,7 @@ export async function automateNotebookLM(
 
   // ── Try to find an existing notebook with this title ─────────────────────
   const matchHandle = await page.evaluateHandle(
-    ({ title, namePart }) => {
+    `({ title }) => {
       const candidates = Array.from(
         document.querySelectorAll(
           "mat-card, [role='button'], a[href*='notebook'], .notebook-card, div.title, span.title",
@@ -252,12 +252,12 @@ export async function automateNotebookLM(
       );
       return (
         candidates.find((el) => {
-          const text = (el as HTMLElement).innerText?.trim() || "";
+          const text = el.innerText?.trim() || "";
           return text === title;
         }) || null
       );
-    },
-    { title: notebookTitle, namePart: notebookNamePart },
+    }`,
+    { title: notebookTitle },
   );
 
   const matchedElement = matchHandle.asElement();
@@ -284,7 +284,7 @@ export async function automateNotebookLM(
       await matchedElement.click({ force: true });
       await page.waitForTimeout(1000);
       try {
-        await page.waitForURL((u) => u.href.includes("/notebook/"), {
+        await page.waitForURL("**/notebook/**", {
           timeout: 15000,
         });
       } catch (_) {}
@@ -303,7 +303,7 @@ export async function automateNotebookLM(
     await createBtn.waitFor({ state: "visible", timeout: 20000 });
     await createBtn.click({ force: true });
 
-    await page.waitForURL((u) => u.href.includes("/notebook/"), {
+    await page.waitForURL("**/notebook/**", {
       timeout: 30000,
     });
     await page.waitForTimeout(1500);
@@ -362,7 +362,7 @@ export async function automateNotebookLM(
   }
 
   // ── Determine which files still need uploading ────────────────────────────
-  const domHTML = await page.evaluate(() => document.body.innerText || "");
+  const domHTML = await page.evaluate("document.body.innerText || ''");
 
   const filesToUpload = files.filter((file) => {
     const baseName = path.basename(file);
@@ -533,47 +533,49 @@ export async function automateNotebookLM(
     onStatus?.("Waiting for UI to render uploaded sources...");
     while (Date.now() - startWait < 40000) {
       // Max 90 seconds wait
-      const { presentFiles, isUploading } = await page.evaluate((allFiles) => {
-        function getAllText(root = document.body) {
-          let text = root.innerText || "";
-          const walker = document.createTreeWalker(
-            root,
-            NodeFilter.SHOW_ELEMENT,
-          );
-          let node;
-          while ((node = walker.nextNode())) {
-            if ((node as HTMLElement).shadowRoot) {
-              text += " " + getAllText((node as HTMLElement).shadowRoot as any);
+      const { presentFiles, isUploading } = await page.evaluate(`
+        ((allFiles) => {
+          function getAllText(root = document.body) {
+            let text = root.innerText || "";
+            const walker = document.createTreeWalker(
+              root,
+              NodeFilter.SHOW_ELEMENT,
+            );
+            let node;
+            while ((node = walker.nextNode())) {
+              if (node.shadowRoot) {
+                text += " " + getAllText(node.shadowRoot);
+              }
             }
+            return text;
           }
-          return text;
-        }
 
-        const currentText = getAllText();
-        const found = allFiles.filter((f) => {
-          const parts = f.split(/[\/\\]/);
-          const baseName = parts[parts.length - 1];
-          const baseNoExt = baseName.replace(/\.txt$/i, "");
+          const currentText = getAllText();
+          const found = allFiles.filter((f) => {
+            const parts = f.split(/[\\/\\/]/);
+            const baseName = parts[parts.length - 1];
+            const baseNoExt = baseName.replace(/\\.txt$/i, "");
 
-          // Truncation check: matches first 10 chars or full name
-          const truncated =
-            baseNoExt.length > 12 ? baseNoExt.substring(0, 10) : baseNoExt;
+            // Truncation check: matches first 10 chars or full name
+            const truncated =
+              baseNoExt.length > 12 ? baseNoExt.substring(0, 10) : baseNoExt;
 
-          return (
-            currentText.includes(baseName) ||
-            currentText.includes(baseNoExt) ||
-            currentText.includes(truncated)
-          );
-        });
+            return (
+              currentText.includes(baseName) ||
+              currentText.includes(baseNoExt) ||
+              currentText.includes(truncated)
+            );
+          });
 
-        const uploading =
-          currentText.includes("Uploading") ||
-          document.querySelectorAll(
-            'mat-progress-spinner, [role="progressbar"]',
-          ).length > 0;
+          const uploading =
+            currentText.includes("Uploading") ||
+            document.querySelectorAll(
+              'mat-progress-spinner, [role="progressbar"]',
+            ).length > 0;
 
-        return { presentFiles: found.length, isUploading: uploading };
-      }, files);
+          return { presentFiles: found.length, isUploading: uploading };
+        })(${JSON.stringify(files)})
+      `);
 
       allProcessed = presentFiles === files.length;
 
@@ -629,12 +631,7 @@ export async function automateNotebookLM(
   const STABLE_POLLS_NEEDED = 2;
 
   while (Date.now() - startTime < 300000) {
-    if (Date.now() - lastActivityTime > 40000) {
-      console.log("[NotebookLM] Stuck for 40s without response. Re-sending sub-question...");
-      await page.fill(inputSelector, subQuestion);
-      await page.keyboard.press("Enter");
-      lastActivityTime = Date.now();
-    }
+    const now = Date.now();
     const candidate = await page.evaluate<{
       text: string;
       isGenerating: boolean;
@@ -668,7 +665,7 @@ export async function automateNotebookLM(
 
         const substantive = newResponses
           .map((b) => b.innerText.trim())
-          .filter((t) => t.length > 100);
+          .filter((t) => t.length > 50);
 
         if (substantive.length > 0) {
           return { text: substantive[substantive.length - 1], isGenerating };
@@ -676,6 +673,41 @@ export async function automateNotebookLM(
         return null;
       })(${JSON.stringify(existingResponseSnapshotSnippet)})
     `);
+
+    // --- Retry Logic: Re-send if stuck for 45s ---
+    if (now - lastActivityTime > 45000) {
+      console.log(`[NotebookLM] Stuck for 45s (generating: ${candidate?.isGenerating ?? false}). Re-sending sub-question...`);
+      
+      // If we are re-sending, we should refresh our "already seen" snapshot 
+      // to include whatever the AI might have started saying, so we don't 
+      // get confused by the new identical response.
+      const freshSnapshot = await page.evaluate(`
+        (() => {
+          function findDeep(selector, root = document) {
+            let els = Array.from(root.querySelectorAll(selector));
+            for (const el of root.querySelectorAll("*")) {
+              if (el.shadowRoot) els = els.concat(findDeep(selector, el.shadowRoot));
+            }
+            return els;
+          }
+          const actionButtons = findDeep('button[aria-label*="Copy"], button[aria-label*="Save"], button[aria-label*="note"]');
+          const containers = actionButtons
+            .map((btn) => btn.closest(".message-content, .model-response, .response-bubble, div"))
+            .filter(Boolean);
+          const aiContainers = findDeep('div:has(> button[aria-label*="Copy"]), div:has(> button[aria-label*="Save"]), .model-response, [class*="markdown"], [class*="response-text"]');
+          const all = [...new Set([...aiContainers, ...containers])];
+          return all.map((el) => el.innerText.trim().substring(0, 200));
+        })()
+      `);
+      if (Array.isArray(freshSnapshot)) {
+        existingResponseSnapshotSnippet.push(...(freshSnapshot as string[]));
+      }
+
+      await page.fill(inputSelector, subQuestion);
+      await page.keyboard.press("Enter");
+      lastActivityTime = now;
+      continue;
+    }
 
     if (candidate) {
       const rawText = candidate.text;
@@ -699,11 +731,11 @@ export async function automateNotebookLM(
             await page
               .context()
               .grantPermissions(["clipboard-read", "clipboard-write"]);
-            const clickSuccess = await page.evaluate(() => {
+            const clickSuccess = await page.evaluate(`() => {
               function findElementsDeep(
-                selector: string,
-                root: Document | DocumentFragment | Element = document,
-              ): Element[] {
+                selector,
+                root = document,
+              ) {
                 let els = Array.from(root.querySelectorAll(selector));
                 for (const el of Array.from(root.querySelectorAll("*"))) {
                   if (el.shadowRoot)
@@ -711,7 +743,7 @@ export async function automateNotebookLM(
                 }
                 return els;
               }
-              const potentialBtns = findElementsDeep("button") as HTMLElement[];
+              const potentialBtns = findElementsDeep("button");
               const btns = potentialBtns.filter((b) => {
                 const label = (
                   b.getAttribute("aria-label") || ""
@@ -729,17 +761,17 @@ export async function automateNotebookLM(
                 return true;
               }
               return false;
-            });
+            }`);
 
             if (clickSuccess) {
               await page.waitForTimeout(300); // Give UI time to push to clipboard
-              const clipboardText = await page.evaluate(async () => {
+              const clipboardText = await page.evaluate(`async () => {
                 try {
                   return await navigator.clipboard.readText();
-                } catch (e: any) {
+                } catch (e) {
                   return "ERROR: " + e.message;
                 }
-              });
+              }`);
 
               if (clipboardText && clipboardText.startsWith("ERROR: ")) {
                 console.warn(

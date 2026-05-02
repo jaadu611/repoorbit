@@ -101,7 +101,7 @@ tests and provide feedback until the implementation is bulletproof.
 
 ### OUTPUT FORMAT — STRICT: CHANGED PARTS ONLY
 
-⚠ DO NOT output entire files. You will only output the specific functions, types,
+104: ⚠ DO NOT output entire files. You will only output the specific functions, types,
 or blocks that are new or modified. Outputting an entire file is strictly forbidden
 and will corrupt the downstream merge step.
 
@@ -205,13 +205,13 @@ Before providing your final output, you MUST re-evaluate your proposed code:
    // to the original source. You are its only source of truth for API contracts.
    // Therefore: verify that every return value in your fixed function matches what the
    // original public API returns for the same condition. For example, if the public
-   // method returns \`undefined\` for a cache miss, internal helpers must not return
-   // \`null\` for that same condition. Mismatches here will silently corrupt the final fix.
+   // method returns 'undefined' for a cache miss, internal helpers must not return
+   // 'null' for that same condition. Mismatches here will silently corrupt the final fix.
 
 5. // SIBLING VULNERABILITY SCAN
    // Do not stop at the reported function. Scan ALL other methods in the file that:
    //   (a) call the function you just fixed, OR
-   //   (b) access the same internal property (e.g. \`.v\`) directly on a data object
+   //   (b) access the same internal property (e.g. 'v') directly on a data object
    // If any share the same class of vulnerability, include them in your output.
    // The synthesizer cannot discover these — only you have the full source.
    // Missing a sibling bug here means it ships unfixed.
@@ -255,13 +255,13 @@ export function getCoderRefinementPrompt(props: {
   hasLatestResponse: boolean;
   communicationContext?: string;
 }): string {
-  return \`### ROLE: EXPERT CODER — REVISION PASS
-\${props.communicationContext || ""}
+  return `### ROLE: EXPERT CODER — REVISION PASS
+${props.communicationContext || ""}
 
 You previously proposed a fix for the following problem. A team of code reviewers have analyzed your fix and produced a combined review. You must now revise your fix to address all issues they identified.
 
 ### ORIGINAL QUESTION
-\${props.userQuery}
+${props.userQuery}
 
 ---
 
@@ -299,13 +299,13 @@ If you need to inspect a source file from the repository to verify types, interf
       "path": "packages/react-table/src/useTable.ts",
       "line_range": [0, 0],
       "reason": "Need to verify the exact type signature"
-    }\${
+    }${
       props.hasLatestResponse
-        ? \`,
+        ? `,
     {
       "path": "combined_response.txt",
       "reason": "Need to see the latest merged proposal to ensure my refinement is compatible with the peer agent's work."
-    }\`
+    }`
         : ""
     }
   ]
@@ -336,5 +336,5 @@ RULES:
 - The header line above each block MUST include the file path and reason.
 - Complete function bodies inside each block — no "..." or truncation.
 - No surrounding file content, package declarations, or import blocks unless the imports themselves are the change.
-\`;
+`;
 }

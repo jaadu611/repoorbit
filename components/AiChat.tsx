@@ -5,6 +5,7 @@ import { Cpu, Send, Loader2, Github, Square, Trash2 } from "lucide-react";
 import { useSelectionStore } from "@/lib/core/store";
 import { FullRepoData } from "@/lib/core/types";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 interface AiChatProps {
   repoData: FullRepoData;
@@ -12,58 +13,89 @@ interface AiChatProps {
 
 const MarkdownRenderer = ({ content }: { content: string }) => (
   <ReactMarkdown
+    remarkPlugins={[remarkGfm]}
     components={{
       p: ({ children }) => (
-        <p className="mb-2 last:mb-0 leading-relaxed">{children}</p>
+        <div className="mb-3 last:mb-0 leading-relaxed text-slate-300">{children}</div>
       ),
       h1: ({ children }) => (
-        <h1 className="font-bold text-sm text-slate-100 mt-3 mb-1 border-b border-slate-700 pb-1">
+        <h1 className="font-bold text-base text-slate-100 mt-6 mb-2 border-b border-slate-800 pb-2">
           {children}
         </h1>
       ),
       h2: ({ children }) => (
-        <h2 className="font-bold text-[13px] text-slate-100 mt-3 mb-1">
+        <h2 className="font-bold text-sm text-slate-100 mt-5 mb-2 flex items-center gap-2">
+          <div className="w-1 h-4 bg-blue-500 rounded-full" />
           {children}
         </h2>
       ),
       h3: ({ children }) => (
-        <h3 className="font-semibold text-xs text-slate-200 mt-2 mb-1">
+        <h3 className="font-semibold text-[13px] text-slate-200 mt-4 mb-1.5">
           {children}
         </h3>
       ),
       ul: ({ children }) => (
-        <ul className="list-disc list-inside space-y-0.5 mb-2 pl-1">
+        <ul className="list-disc list-outside space-y-1.5 mb-4 ml-4 text-slate-400">
           {children}
         </ul>
       ),
       ol: ({ children }) => (
-        <ol className="list-decimal list-inside space-y-0.5 mb-2 pl-1">
+        <ol className="list-decimal list-outside space-y-1.5 mb-4 ml-4 text-slate-400">
           {children}
         </ol>
       ),
       li: ({ children }) => (
-        <li className="text-slate-300 leading-relaxed">{children}</li>
+        <li className="pl-1">{children}</li>
       ),
-      code: ({ inline, children }: any) =>
-        inline ? (
-          <code className="bg-slate-800 text-blue-300 px-1 py-0.5 rounded text-[11px] font-mono">
+      table: ({ children }) => (
+        <div className="my-4 overflow-x-auto rounded-lg border border-slate-800">
+          <table className="w-full text-left border-collapse text-[11px]">
+            {children}
+          </table>
+        </div>
+      ),
+      thead: ({ children }) => (
+        <thead className="bg-slate-800/50 text-slate-200 font-bold">
+          {children}
+        </thead>
+      ),
+      th: ({ children }) => (
+        <th className="p-2 border-b border-slate-700">{children}</th>
+      ),
+      td: ({ children }) => (
+        <td className="p-2 border-b border-slate-800 text-slate-400">{children}</td>
+      ),
+      code: ({ inline, className, children }: any) => {
+        const match = /language-(\w+)/.exec(className || "");
+        const lang = match ? match[1] : "";
+        
+        return inline ? (
+          <code className="bg-slate-800/50 text-blue-300 px-1.5 py-0.5 rounded text-[11px] font-mono border border-slate-700/30">
             {children}
           </code>
         ) : (
-          <pre className="bg-slate-800/80 border border-slate-700 rounded p-2 mt-1 mb-2 overflow-x-auto">
-            <code className="text-[11px] text-blue-200 whitespace-pre font-mono">
-              {children}
-            </code>
-          </pre>
-        ),
+          <div className="group relative my-3">
+            {lang && (
+              <div className="absolute right-3 top-2 text-[9px] font-mono text-slate-500 uppercase tracking-widest opacity-0 group-hover:opacity-100 transition-opacity">
+                {lang}
+              </div>
+            )}
+            <pre className="bg-[#0d1117] border border-slate-800 rounded-lg p-4 overflow-x-auto shadow-inner">
+              <code className="text-[11px] text-blue-100/90 whitespace-pre font-mono leading-relaxed">
+                {children}
+              </code>
+            </pre>
+          </div>
+        );
+      },
       strong: ({ children }) => (
-        <strong className="text-slate-100 font-semibold">{children}</strong>
+        <strong className="text-blue-100 font-bold">{children}</strong>
       ),
       em: ({ children }) => (
-        <em className="text-slate-300 italic">{children}</em>
+        <em className="text-slate-200 italic font-medium">{children}</em>
       ),
       blockquote: ({ children }) => (
-        <blockquote className="border-l-2 border-blue-500/50 pl-2 my-1 text-slate-400 italic">
+        <blockquote className="border-l-4 border-blue-500/30 bg-blue-500/5 px-4 py-2 my-4 text-slate-400 italic rounded-r-lg">
           {children}
         </blockquote>
       ),
@@ -72,12 +104,12 @@ const MarkdownRenderer = ({ content }: { content: string }) => (
           href={href}
           target="_blank"
           rel="noopener noreferrer"
-          className="text-blue-400 hover:text-blue-300 underline underline-offset-2"
+          className="text-blue-400 hover:text-blue-300 underline underline-offset-4 decoration-blue-500/30 transition-colors"
         >
           {children}
         </a>
       ),
-      hr: () => <hr className="border-slate-700 my-2" />,
+      hr: () => <hr className="border-slate-800 my-6" />,
     }}
   >
     {content}
@@ -274,7 +306,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
   const repoName = repoCtx?.meta.name ?? repoData.metadata.name;
 
   return (
-    <div className="w-[400px] shrink-0 flex flex-col bg-gray-900 border border-gray-700 rounded-xl overflow-hidden h-full shadow-2xl">
+    <div className="w-[300px] shrink-0 flex flex-col bg-gray-900 border border-gray-700 rounded-xl overflow-hidden h-full shadow-2xl">
       <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between bg-gray-950/50">
         <div className="flex items-center gap-1.5">
           <Cpu size={12} className="text-blue-500" />

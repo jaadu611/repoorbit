@@ -1,91 +1,227 @@
+import http from "http";
+import { spawn, ChildProcess } from "child_process";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
+
+let opencodeProcess: ChildProcess | null = null;
+
+/**
+ * Ensures the OpenCode server is running on the specified port.
+ * Aggressively kills existing processes on the port to ensure directory switch.
+ */
+export async function ensureOpenCodeServer(
+  port: number,
+  directory: string,
+): Promise<void> {
+  const { execSync } = await import("child_process");
+
+  try {
+    execSync(`fuser -k ${port}/tcp`, { stdio: "ignore" });
+    await new Promise((r) => setTimeout(r, 2000));
+  } catch (e) {
+    // Ignore if nothing was running
+  }
+
+  // Always regenerate the config to ensure it's valid (removes stale fields like 'variant')
+  createOpenCodeJson(directory);
+
+  opencodeProcess = spawn("opencode", ["serve", "--port", String(port)], {
+    stdio: "inherit",
+    cwd: directory,
+  });
+
+  for (let i = 0; i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    const ready = await new Promise<boolean>((resolve) => {
+      const req = http.get(`http://localhost:${port}/session`, (res) => {
+        res.resume();
+        resolve(true);
+      });
+      req.on("error", () => resolve(false));
+      req.end();
+    });
+    if (ready) {
+      return;
+    }
+  }
+  throw new Error(`OpenCode server failed to start on port ${port}`);
+}
+
+/**
+ * Sends a prompt message to the OpenCode session.
+ */
 export async function sendToPort(
   port: number,
   sessionId: string,
   prompt: string,
 ): Promise<string> {
-  // Use a very long timeout (15 minutes) as disk operations/builds take time
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 15 * 60 * 1000);
+  const data = JSON.stringify({ parts: [{ type: "text", text: prompt }] });
 
-  try {
-    const res = await fetch(
-      `http://localhost:${port}/session/${sessionId}/message`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ parts: [{ type: "text", text: prompt }] }),
-        signal: controller.signal,
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: "localhost",
+      port: port,
+      path: `/session/${sessionId}/message`,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(data),
       },
-    );
-    
-    if (!res.ok) {
-      throw new Error(`OpenCode error: ${res.status} ${res.statusText}`);
-    }
+      timeout: 15 * 60 * 1000,
+    };
 
-    const data = await res.json();
-    // Extract text response
-    const text = data.parts?.find((p: any) => p.type === "text")?.text || "";
-    return text;
-  } finally {
-    clearTimeout(timeoutId);
-  }
+    const req = http.request(options, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        body += chunk;
+      });
+      res.on("end", () => {
+        if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
+          reject(
+            new Error(`OpenCode error: ${res.statusCode} ${res.statusMessage}`),
+          );
+          return;
+        }
+        try {
+          const parsed = JSON.parse(body);
+          const text =
+            parsed.parts?.find((p: any) => p.type === "text")?.text || "";
+          resolve(text);
+        } catch (e) {
+          reject(
+            new Error(
+              `Failed to parse OpenCode response: ${e instanceof Error ? e.message : String(e)}`,
+            ),
+          );
+        }
+      });
+    });
+
+    req.on("error", (e) => {
+      reject(e);
+    });
+
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("OpenCode request timed out after 15 minutes"));
+    });
+
+    req.write(data);
+    req.end();
+  });
 }
 
+/**
+ * Creates a new OpenCode session via API.
+ */
 export async function createSession(
   port: number,
   directory: string,
   model?: string,
 ): Promise<string> {
-  const body: Record<string, string> = { directory };
-  if (model) body.model = model;
+  const bodyData: any = { directory };
+  if (model) bodyData.model = model;
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 5 * 60 * 1000);
+  const data = JSON.stringify(bodyData);
 
-  try {
-    const res = await fetch(`http://localhost:${port}/session`, {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: "localhost",
+      port: port,
+      path: "/session",
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(data),
+      },
+      timeout: 5 * 60 * 1000,
+    };
+
+    const req = http.request(options, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        body += chunk;
+      });
+      res.on("end", () => {
+        if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
+          reject(
+            new Error(
+              `Failed to create session: ${res.statusCode} ${res.statusMessage} - Body: ${body}`,
+            ),
+          );
+          return;
+        }
+        try {
+          const parsed = JSON.parse(body);
+          if (!parsed.id) {
+            reject(new Error("Session creation response missing 'id'"));
+          } else {
+            const projectID = parsed.projectID || "";
+            resolve(parsed.id);
+          }
+        } catch (e) {
+          reject(
+            new Error(
+              `Failed to parse session response: ${e instanceof Error ? e.message : String(e)}`,
+            ),
+          );
+        }
+      });
     });
 
-    if (!res.ok) {
-      throw new Error(`Failed to create session: ${res.status} ${res.statusText}`);
-    }
+    req.on("error", (e) => {
+      reject(e);
+    });
 
-    const data = await res.json();
-    return data.id;
-  } finally {
-    clearTimeout(timeoutId);
-  }
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Session creation timed out"));
+    });
+
+    req.write(data);
+    req.end();
+  });
 }
 
 /**
- * Clones the given GitHub repo into ~/  (e.g. ~/repoorbit).
- * If the directory already exists it is left as-is so previous runs
- * are not wiped out mid-session.
- * Returns the absolute path of the cloned repo.
+ * Generates an opencode.json config to grant full permissions.
+ */
+export function createOpenCodeJson(targetDirectory: string): void {
+  const opencodeJsonPath = path.join(targetDirectory, "opencode.json");
+  const opencodeConfig = {
+    $schema: "https://opencode.ai/config.json",
+    permission: "allow",
+  };
+
+  fs.writeFileSync(
+    opencodeJsonPath,
+    JSON.stringify(opencodeConfig, null, 2),
+    "utf8",
+  );
+}
+
+/**
+ * Clones the given GitHub repo and generates an opencode.json config.
  */
 export async function cloneRepoForDiskWork(
   owner: string,
   repo: string,
 ): Promise<string> {
-  const { execSync } = await import("child_process");
-  const os = await import("os");
-  const path = await import("path");
-  const fs = await import("fs");
-
   const cloneDir = path.join(os.homedir(), repo);
 
-  if (fs.existsSync(cloneDir)) {
-    console.log(`[ORCHESTRATOR] Repo already cloned at ${cloneDir} — reusing existing disk state.`);
-    return cloneDir;
+  if (!fs.existsSync(cloneDir)) {
+    const { execSync } = await import("child_process");
+    const cloneUrl = `https://github.com/${owner}/${repo}.git`;
+    execSync(`git clone ${cloneUrl} ${cloneDir}`, { stdio: "pipe" });
+  } else {
   }
 
-  const cloneUrl = `https://github.com/${owner}/${repo}.git`;
-  console.log(`[ORCHESTRATOR] Cloning ${cloneUrl} into ${cloneDir}...`);
-  execSync(`git clone ${cloneUrl} ${cloneDir}`, { stdio: "pipe" });
-  console.log(`[ORCHESTRATOR] Clone complete: ${cloneDir}`);
+  // Permission Injection
+  createOpenCodeJson(cloneDir);
+
   return cloneDir;
 }
+

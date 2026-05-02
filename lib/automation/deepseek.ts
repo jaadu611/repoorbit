@@ -31,23 +31,28 @@ export async function askDeepseek(
   }
 
   const allTmpPaths: string[] = [];
+  const addedFiles = new Set<string>();
+
+  const addFile = (p: string) => {
+    const base = path.basename(p);
+    if (!addedFiles.has(base)) {
+      allTmpPaths.push(p);
+      addedFiles.add(base);
+    }
+  };
 
   // ── 1. Stage Context Files (from deepseek_context folder) ────────────────
   if (fs.existsSync(contextDir)) {
     const contextFiles = fs
       .readdirSync(contextDir)
       .filter((f) => f.endsWith(".js") || f.endsWith(".txt"))
-      .sort((a, b) => {
-        if (a === "context.js") return -1;
-        if (b === "context.js") return 1;
-        return a.localeCompare(b);
-      });
+      .sort();
 
     for (const fileName of contextFiles) {
       const content = fs.readFileSync(path.join(contextDir, fileName), "utf-8");
       const tmpPath = path.join(sessionDir, fileName);
       fs.writeFileSync(tmpPath, content, "utf-8");
-      allTmpPaths.push(tmpPath);
+      addFile(tmpPath);
       console.log(`[Deepseek] Staged Context: ${fileName}`);
     }
   }
@@ -57,8 +62,7 @@ export async function askDeepseek(
     const metadataBase =
       outDir && fs.existsSync(outDir) ? outDir : process.cwd();
 
-    // graph.json is excluded — 68k+ lines for Postgres, irrelevant for function-level fixes.
-    // Dependency info is already embedded in context.js via // --- Source: ... --- headers.
+    // Dependency info is handled via individual numbered blocks (00x_dep_manifest...).
     const rootMetadata = ["00_Root_Manifest.txt"];
 
     for (const fileName of rootMetadata) {
@@ -67,7 +71,7 @@ export async function askDeepseek(
         const content = fs.readFileSync(filePath, "utf-8");
         const tmpPath = path.join(sessionDir, fileName);
         fs.writeFileSync(tmpPath, content, "utf-8");
-        allTmpPaths.push(tmpPath);
+        addFile(tmpPath);
         console.log(
           `[Deepseek] Staged Metadata: ${fileName} (from ${metadataBase})`,
         );
@@ -79,18 +83,25 @@ export async function askDeepseek(
     }
   }
 
-  // ── 5. Single Atomic Upload ──────────────────────────────────────────────
-  onStatus?.(`Uploading ${allTmpPaths.length} file(s) to Deepseek...`);
-  await uploadFilesToDeepseek(page, allTmpPaths);
+  try {
+    onStatus?.(`DeepSeek: Uploading ${allTmpPaths.length} file(s)…`);
+    await uploadFilesToDeepseek(page, allTmpPaths);
 
-  // ── 6. Send Query ────────────────────────────────────────────────────────
-  onStatus?.("Sending query to Deepseek...");
-  await typeAndSubmit(page, query);
+    // ── 6. Send Query ────────────────────────────────────────────────────────
+    onStatus?.("DeepSeek: Typing query…");
+    await typeAndSubmit(page, query);
 
-  onStatus?.("Waiting for Deepseek to respond...");
-  const rawText = await waitForDeepseekCompletion(page, onStatus);
-
-  return rawText;
+    onStatus?.("DeepSeek: Waiting for response…");
+    return await waitForDeepseekCompletion(page, onStatus);
+  } catch (err: any) {
+    if (err.message === "RELOAD_SIGNAL") {
+      console.log("[Deepseek] Caught reload signal in main loop. Retrying turn...");
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForTimeout(5000);
+      return askDeepseek(page, query, manifestContent, contextDir, onStatus, outDir, isFirstTurn);
+    }
+    throw err;
+  }
 }
 
 export function cleanupDeepseekTempFiles(paths: string[]): void {
@@ -115,7 +126,7 @@ async function uploadFilesToDeepseek(
   if (filePaths.length === 0) return;
 
   const attemptUpload = async () => {
-    // Stage 1: Attempt the sequential upload
+    // Reverted to 1-by-1 upload as requested by user
     for (const file of filePaths) {
       console.log(`[Deepseek] Uploading file 1-by-1: ${path.basename(file)}...`);
       
@@ -184,7 +195,7 @@ async function uploadFilesToDeepseek(
             }
           }
           return !document.querySelector('[class*="uploading"], [class*="spinner"], .ds-loading');
-        }, { timeout: 45_000 });
+        }, { timeout: 30_000 });
       } catch (err) {
         console.warn(`[Deepseek] Parsing stalled for ${path.basename(file)}. Reloading page...`);
         throw new Error("RELOAD_SIGNAL");
@@ -198,19 +209,20 @@ async function uploadFilesToDeepseek(
     await attemptUpload();
   } catch (err: any) {
     if (err.message === "RELOAD_SIGNAL") {
-      console.log("[Deepseek] Triggering page reload and restarting upload...");
+      console.log("[Deepseek] Upload stalled. Reloading page and retrying upload...");
       await page.reload({ waitUntil: "domcontentloaded" });
       await page.waitForTimeout(5000);
       return uploadFilesToDeepseek(page, filePaths); // Retry from start
     }
     console.error(`[Deepseek] CRITICAL: Upload sequence failed: ${err.message}`);
+    throw err;
   }
 }
 
 // ─── Input & submit ───────────────────────────────────────────────────────────
 
 async function typeAndSubmit(page: Page, message: string): Promise<void> {
-  const inputSelector = '#chat-input, textarea, [contenteditable="true"]';
+  const inputSelector = '#chat-input, textarea[placeholder*="Message" i], textarea, [contenteditable="true"]';
   await page.waitForSelector(inputSelector, { timeout: 30000 });
 
   const inputLocator = page.locator(inputSelector).first();
@@ -239,9 +251,11 @@ async function typeAndSubmit(page: Page, message: string): Promise<void> {
 
   // Try to find the send button and click it, fallback to Enter
   const sendSelectors = [
+    'div[role="button"]:has(svg):not([class*="disabled"])',
     'div.ds-icon-button[role="button"]:not([aria-disabled="true"])',
     'button[aria-label*="send" i]',
     'div[role="button"][style*="cursor: pointer"] svg',
+    'div._52c986b', // Fresh selector from subagent
   ];
 
   let clicked = false;
@@ -319,10 +333,15 @@ async function waitForDeepseekCompletion(
       }
 
       if (!lastBubble) return null;
-      const text = lastBubble.innerText?.trim() ?? "";
-      if (!text) return null;
       
-      return { text, isGenerating: isGenerating && !isDone };
+      // Capture thinking text separately if present
+      const thinkEl = lastBubble.querySelector('.ds-thought, [class*="thought"], [class*="thinking"]');
+      const thinkText = thinkEl ? (thinkEl as HTMLElement).innerText : "";
+      
+      const text = lastBubble.innerText?.trim() ?? "";
+      if (!text && !thinkText) return null;
+      
+      return { text: thinkText + "\n" + text, isGenerating: isGenerating && !isDone };
     });
 
     if (candidate && candidate.text.length > 0) {

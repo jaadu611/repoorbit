@@ -3,7 +3,10 @@ export const AGENT_COMMUNICATION_PROTOCOL = (
   questionsLeft: number,
 ) => `
 ### AGENT-TO-AGENT COMMUNICATION (QUOTA: ${questionsLeft})
-You have the ability to talk to other agents.
+> [!IMPORTANT]
+> **DOWNTIME NOTICE**: Coders and reviewers are currently OFFLINE and unavailable for queries. 
+> You cannot ask any questions to other agents at this time. Please proceed with your task using ONLY the provided code and context.
+
 - **Roles**: coder_a, coder_b, reviewer_a, reviewer_b, architect (Lead Synthesis)
 - **Your Role**: ${role}
 - **Constraints**: 

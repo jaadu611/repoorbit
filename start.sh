@@ -7,14 +7,10 @@ C_GREEN='\033[0;32m'
 C_BOLD='\033[1m'
 C_NC='\033[0m'
 
-LOG_DIR="$(cd "$(dirname "$0")" && pwd)/.opencode_logs"
-mkdir -p "$LOG_DIR"
 
 # Mode: Core Engine (Gemma + Flash)
 if [ "$1" == "--cores" ]; then
-  GEMMA_LOG="$LOG_DIR/gemma_3001.log"
-  FLASH_LOG="$LOG_DIR/flash_3002.log"
-  PID_FILE="$LOG_DIR/pids"
+  PID_FILE="/tmp/opencode_pids"
   > "$PID_FILE"
 
   stop_cores() {
@@ -25,9 +21,7 @@ if [ "$1" == "--cores" ]; then
   }
   trap stop_cores EXIT INT TERM
 
-  opencode serve --port 3001 --hostname 127.0.0.1 > "$GEMMA_LOG" 2>&1 &
-  echo "$!" >> "$PID_FILE"
-  opencode serve --port 3002 --hostname 127.0.0.1 > "$FLASH_LOG" 2>&1 &
+  opencode serve --port 3001 --hostname 127.0.0.1 > /dev/null 2>&1 &
   echo "$!" >> "$PID_FILE"
 
   wait_for_port() {
@@ -42,13 +36,10 @@ if [ "$1" == "--cores" ]; then
 
   wait_for_port 3001
   printf " ${C_BLUE}┌───────────────────────────────────────────┐${C_NC}\n"
-  printf " ${C_BLUE}│${C_NC}  GEMMA 4-31B (3001)    •  [ ${C_GREEN}ACTIVE${C_NC} ]      ${C_BLUE}│${C_NC}\n"
-
-  wait_for_port 3002
-  printf " ${C_BLUE}│${C_NC}  GEMINI FLASH (3002)   •  [ ${C_GREEN}ACTIVE${C_NC} ]      ${C_BLUE}│${C_NC}\n"
+  printf " ${C_BLUE}│${C_NC}  UNIFIED CORE (3001)   •  [ ${C_GREEN}ACTIVE${C_NC} ]      ${C_BLUE}│${C_NC}\n"
   printf " ${C_BLUE}└───────────────────────────────────────────┘${C_NC}\n"
 
-  printf "  ${C_BOLD}URL:${C_NC}      ${C_GREEN}http://localhost:3000${C_NC}\n\n"
+  printf "  ${C_BOLD}URL:${C_NC}      ${C_GREEN}http://localhost:3000${C_NC}\n"
   wait
   exit 0
 fi

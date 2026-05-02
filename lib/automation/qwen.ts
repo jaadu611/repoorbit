@@ -113,9 +113,15 @@ async function uploadFiles(page: Page, filePaths: string[]): Promise<void> {
 
         const allText = container.textContent?.toLowerCase() || "";
         const isStillParsing =
-          allText.includes("parsing") || allText.includes("loading");
+          allText.includes("parsing") || allText.includes("loading") || allText.includes("pending");
 
-        // We need the number of chips to match AND no busy indicators to be present
+        const hasFailed = allText.includes("failed") || allText.includes("error");
+
+        if (hasFailed && !isStillParsing) {
+          // If we see "Failed" but nothing is "Parsing", it's a hard error
+          throw new Error("FILE_PARSING_FAILED");
+        }
+
         return (
           chips.length >= expectedCount && !hasLoading && !isStillParsing
         );
@@ -137,13 +143,14 @@ async function uploadFiles(page: Page, filePaths: string[]): Promise<void> {
       return;
     } catch (e: any) {
       lastErr = e;
+      const isParsingError = e.message.includes("FILE_PARSING_FAILED");
       console.warn(
-        `[Qwen] Upload attempt ${attempt} failed: ${e.message}.`,
+        `[Qwen] Upload attempt ${attempt} failed: ${e.message}${isParsingError ? " (Model-side parsing error)" : ""}.`,
       );
       if (attempt < 3) {
-        console.log(`[Qwen] Reloading page and retrying upload (Attempt ${attempt + 1}/3)...`);
+        console.log(`[Qwen] Reloading page to clear failed states and retrying (Attempt ${attempt + 1}/3)...`);
         await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
-        await page.waitForTimeout(5000); // Settle after reload
+        await page.waitForTimeout(5000); 
       }
     }
   }
@@ -296,18 +303,28 @@ async function extractResponseAtIndex(
 
   while (Date.now() < deadline) {
     // Check if generation finished
-    const isGenerating = await page.evaluate(
-      () => !!document.querySelector(
-        '.qwen-chat-package-comp-new-action-control-container-stop, .anticon-loading, [class*="stop-generating"]',
-      ),
-    );
+    const isGenerating = await page.evaluate(() => {
+      const stopBtn = document.querySelector(
+        '.qwen-chat-package-comp-new-action-control-container-stop, [class*="stop-generating"], button:has(svg[data-icon="stop"])',
+      );
+      if (stopBtn) return true;
 
-    // Sample current partial output
+      // Check if there's a loading indicator in the latest assistant message
+      const bubbles = document.querySelectorAll('.response-message-content.phase-answer');
+      const last = bubbles[bubbles.length - 1];
+      if (last && last.querySelector('.anticon-loading, .ds-loading, .typing-dot')) return true;
+
+      return false;
+    });
+
+    // Sample current partial output (including thinking blocks)
     const currentText = await page.evaluate(
       ({ sel, idx }: { sel: string; idx: number }) => {
         const els = document.querySelectorAll(sel);
         const bubble = els[idx] as HTMLElement | undefined;
-        return bubble?.innerText?.trim() ?? "";
+        if (!bubble) return "";
+        const think = bubble.querySelector('[class*="think"], [class*="reasoning"]');
+        return (think ? (think as HTMLElement).innerText : "") + bubble.innerText;
       },
       { sel: REPLY_SEL, idx: targetIndex },
     );
@@ -318,14 +335,25 @@ async function extractResponseAtIndex(
     }
 
     const stalledMs = Date.now() - lastChangeAt;
+
+    // --- NEW: Stable Text Fallback ---
+    // If the text is long (>500 chars) and hasn't changed for 45s, 
+    // even if isGenerating is true, we consider it done. 
+    // This handles "ghost" stop buttons.
+    if (stalledMs >= 45_000 && currentText.length > 500) {
+      console.log(`[Qwen] Text stable for 45s and looks complete (${currentText.length} chars). Finishing.`);
+      break;
+    }
+
     if (stalledMs >= STALL_LIMIT_MS && isGenerating) {
-      console.warn(`[Qwen] No output change for ${stalledMs / 1000}s — reloading page.`);
-      await page.reload({ waitUntil: "domcontentloaded", timeout: 45_000 });
-      await page.waitForTimeout(3_000);
-      throw new QwenStallError(`[Qwen] Stalled for ${STALL_LIMIT_MS / 1000}s with no new output.`);
+      console.warn(`[Qwen] No output change for ${stalledMs / 1000}s — ignoring stall per user request.`);
+      // No reload, no error — just keep waiting
+      lastChangeAt = Date.now(); // Reset watchdog to avoid spamming logs
     }
 
     if (!isGenerating) break;
+    // Auto-scroll to bottom to keep latest content in view
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await page.waitForTimeout(2_000);
   }
 
@@ -378,7 +406,7 @@ export async function askQwen(
       waitUntil: "domcontentloaded",
       timeout: 45_000,
     });
-    await qPage.setViewportSize({ width: 1280, height: 800 });
+    await qPage.setViewportSize({ width: 1280, height: 1000 });
     await qPage.waitForTimeout(2_000);
   }
 
@@ -435,7 +463,7 @@ export async function askQwen(
   }
 
   if (batches.length === 0) {
-    let currentStallLimit = 90_000;
+    let currentStallLimit = 300_000;
     while (true) {
       try {
         const countBefore = await getReplyCount(qPage);
@@ -475,13 +503,15 @@ export async function askQwen(
           : query;
 
       // Snapshot BEFORE sending — this index is exactly where the final answer will land
-      let currentStallLimit = 90_000;
+      let currentStallLimit = 300_000;
       while (true) {
         try {
           const finalReplyIndex = await getReplyCount(qPage);
-          onStatus?.("Sending final query…");
+          onStatus?.("Qwen: Typing final query…");
           await typeAndSend(qPage, msg);
+          onStatus?.("Qwen: Waiting for reply…");
           await waitForReply(qPage, finalReplyIndex, currentStallLimit);
+          onStatus?.("Qwen: Extracting response…");
           return await extractResponseAtIndex(qPage, finalReplyIndex, currentStallLimit);
         } catch (e: any) {
           if (e instanceof QwenStallError) {
@@ -499,7 +529,7 @@ export async function askQwen(
             qPage,
             `Context Part ${i + 1}/${batches.length} attached. Wait for the next part. Reply only "Ready".`,
           );
-          await waitForReply(qPage, replyCountBefore, 60_000); // Wait 60s for "Ready" acknowledgement
+          await waitForReply(qPage, replyCountBefore, 300_000); // Wait 300s for "Ready" acknowledgement
           console.log(`[Qwen] Batch ${i + 1} acknowledged. Settling...`);
       await qPage.waitForTimeout(5000);
     }
