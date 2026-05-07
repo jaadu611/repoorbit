@@ -1354,7 +1354,7 @@ export default function TreeView({
     );
   };
 
-  const sidebarWidth = legendOpen ? 180 : 48;
+  const sidebarWidth = legendOpen ? 180 : 40;
   const fc = activeFile ? fileColor(activeFile.node.ext) : null;
 
   return (
@@ -1640,7 +1640,6 @@ export default function TreeView({
                     {storeFileContext.metrics.codeLines}c ·
                     {storeFileContext.metrics.commentLines}m ·
                     {storeFileContext.metrics.emptyLines}e
-
                   </span>
                 )}
               </div>
@@ -2012,7 +2011,11 @@ export default function TreeView({
                             Repository Path
                           </span>
                           <button
-                            onClick={() => navigator.clipboard.writeText(storeFileContext.path)}
+                            onClick={() =>
+                              navigator.clipboard.writeText(
+                                storeFileContext.path,
+                              )
+                            }
                             className="text-slate-500 hover:text-blue-400 p-1 rounded hover:bg-white/5 transition-colors cursor-pointer"
                             title="Copy path"
                           >
@@ -2033,7 +2036,11 @@ export default function TreeView({
                             SHA: {activeFile.node.sha?.slice(0, 8)}
                           </span>
                           <button
-                            onClick={() => navigator.clipboard.writeText(activeFile.node.sha ?? "")}
+                            onClick={() =>
+                              navigator.clipboard.writeText(
+                                activeFile.node.sha ?? "",
+                              )
+                            }
                             className="text-slate-600 hover:text-blue-400 p-1 rounded hover:bg-white/5 transition-colors cursor-pointer"
                             title="Copy SHA"
                           >
@@ -2052,7 +2059,10 @@ export default function TreeView({
                           <span className="text-[10px] font-bold text-slate-400 group-hover:text-blue-100 uppercase tracking-widest transition-colors">
                             View on GitHub
                           </span>
-                          <ExternalLink size={10} className="text-slate-500 group-hover:text-blue-400 transition-colors" />
+                          <ExternalLink
+                            size={10}
+                            className="text-slate-500 group-hover:text-blue-400 transition-colors"
+                          />
                         </a>
                       )}
                     </div>
@@ -2063,7 +2073,10 @@ export default function TreeView({
                   <div className="relative">
                     <FileCode2 size={40} className="text-slate-700" />
                     <div className="absolute -bottom-2 -right-2 p-1.5 rounded bg-blue-500/10 border border-blue-500/20">
-                      <Loader2 size={12} className="text-blue-500 animate-spin" />
+                      <Loader2
+                        size={12}
+                        className="text-blue-500 animate-spin"
+                      />
                     </div>
                   </div>
                   <div className="text-center">

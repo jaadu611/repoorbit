@@ -1,379 +1,97 @@
-import { Page } from "playwright";
+import OpenAI from "openai";
 import * as fs from "fs";
 import * as path from "path";
-import * as os from "os";
-
 import { NotebookPlan } from "@/lib/core/types";
 
+// Keep the model name in a variable as requested
+export const DEEPSEEK_MODEL = "deepseek-ai/deepseek-v4-pro";
+
+const openai = new OpenAI({
+  apiKey: process.env.NVIDIA_API_KEY || "",
+  baseURL: "https://integrate.api.nvidia.com/v1",
+});
+
+/**
+ * Replaces the browser-based askDeepseek with a direct API call to NVIDIA.
+ */
 export async function askDeepseek(
-  page: Page,
+  _page: any, // Kept for signature compatibility but unused
   query: string,
   manifestContent: string,
   contextDir: string,
   onStatus?: (msg: string, partial?: string, progress?: number) => void,
-  outDir: string = "",
+  _outDir: string = "",
   isFirstTurn: boolean = true,
+  logPrefix: string = "[Deepseek]",
 ): Promise<string> {
-  const url = page.url();
-  if (!url.includes("chat.deepseek.com")) {
-    onStatus?.("Navigating to Deepseek...");
-    await page.goto("https://chat.deepseek.com/", {
-      waitUntil: "domcontentloaded",
-      timeout: 45000,
-    });
-    await page.waitForTimeout(3000);
-  }
+  onStatus?.("Preparing context...");
 
-  // Create a unique session directory for this specific run
-  const sessionDir = path.join(os.tmpdir(), `deepseek_upload_${Date.now()}`);
-  if (!fs.existsSync(sessionDir)) {
-    fs.mkdirSync(sessionDir, { recursive: true });
-  }
+  let fullPrompt = "";
 
-  const allTmpPaths: string[] = [];
-  const addedFiles = new Set<string>();
-
-  const addFile = (p: string) => {
-    const base = path.basename(p);
-    if (!addedFiles.has(base)) {
-      allTmpPaths.push(p);
-      addedFiles.add(base);
-    }
-  };
-
-  // ── 1. Stage Context Files (from deepseek_context folder) ────────────────
-  if (fs.existsSync(contextDir)) {
-    const contextFiles = fs
-      .readdirSync(contextDir)
-      .filter((f) => f.endsWith(".js") || f.endsWith(".txt"))
-      .sort();
-
-    for (const fileName of contextFiles) {
-      const content = fs.readFileSync(path.join(contextDir, fileName), "utf-8");
-      const tmpPath = path.join(sessionDir, fileName);
-      fs.writeFileSync(tmpPath, content, "utf-8");
-      addFile(tmpPath);
-      console.log(`[Deepseek] Staged Context: ${fileName}`);
-    }
-  }
-
-  // ── 2. Stage Structural Metadata ─────────────────────────────────────────
+  // ── 1. System Context & Manifest ──────────────────────────────────────────
   if (isFirstTurn) {
-    const metadataBase =
-      outDir && fs.existsSync(outDir) ? outDir : process.cwd();
+    fullPrompt += `### REPOSITORY MANIFEST\n${manifestContent}\n\n`;
+  }
 
-    // Dependency info is handled via individual numbered blocks (00x_dep_manifest...).
-    const rootMetadata = ["00_Root_Manifest.txt"];
-
-    for (const fileName of rootMetadata) {
-      const filePath = path.join(metadataBase, fileName);
-      if (fs.existsSync(filePath)) {
-        const content = fs.readFileSync(filePath, "utf-8");
-        const tmpPath = path.join(sessionDir, fileName);
-        fs.writeFileSync(tmpPath, content, "utf-8");
-        addFile(tmpPath);
-        console.log(
-          `[Deepseek] Staged Metadata: ${fileName} (from ${metadataBase})`,
-        );
-      } else {
-        console.error(
-          `[Deepseek] CRITICAL: ${fileName} NOT FOUND at ${filePath}`,
-        );
+  // ── 2. Add Context Files (from deepseek_context or extra directories) ──────
+  if (contextDir && fs.existsSync(contextDir)) {
+    const files = fs
+      .readdirSync(contextDir)
+      .filter((f) => f.endsWith(".js") || f.endsWith(".ts") || f.endsWith(".txt") || f.endsWith(".md"));
+    
+    if (files.length > 0) {
+      fullPrompt += "### ADDITIONAL CONTEXT FILES\n";
+      for (const file of files) {
+        const content = fs.readFileSync(path.join(contextDir, file), "utf-8");
+        fullPrompt += `\n--- FILE: ${file} ---\n${content}\n`;
       }
+      fullPrompt += "\n";
     }
   }
+
+  fullPrompt += query;
 
   try {
-    onStatus?.(`DeepSeek: Uploading ${allTmpPaths.length} file(s)…`);
-    await uploadFilesToDeepseek(page, allTmpPaths);
-
-    // ── 6. Send Query ────────────────────────────────────────────────────────
-    onStatus?.("DeepSeek: Typing query…");
-    await typeAndSubmit(page, query);
-
-    onStatus?.("DeepSeek: Waiting for response…");
-    return await waitForDeepseekCompletion(page, onStatus);
-  } catch (err: any) {
-    if (err.message === "RELOAD_SIGNAL") {
-      console.log("[Deepseek] Caught reload signal in main loop. Retrying turn...");
-      await page.reload({ waitUntil: "domcontentloaded" });
-      await page.waitForTimeout(5000);
-      return askDeepseek(page, query, manifestContent, contextDir, onStatus, outDir, isFirstTurn);
-    }
-    throw err;
-  }
-}
-
-export function cleanupDeepseekTempFiles(paths: string[]): void {
-  for (const p of paths) {
-    try {
-      if (fs.existsSync(p)) {
-        fs.unlinkSync(p);
-        console.log(`[Deepseek] Cleaned up temp file: ${p}`);
-      }
-    } catch (e) {
-      console.warn(`[Deepseek] Could not delete temp file ${p}:`, e);
-    }
-  }
-}
-
-// ── Single multi-file upload ──────────────────────────────────────────────────
-
-async function uploadFilesToDeepseek(
-  page: Page,
-  filePaths: string[],
-): Promise<void> {
-  if (filePaths.length === 0) return;
-
-  const attemptUpload = async () => {
-    // Reverted to 1-by-1 upload as requested by user
-    for (const file of filePaths) {
-      console.log(`[Deepseek] Uploading file 1-by-1: ${path.basename(file)}...`);
-      
-      const attachSelectors = [
-        'button[aria-label*="attach" i]',
-        'button[aria-label*="upload" i]',
-        'button[aria-label*="file" i]',
-        'label[for*="file" i]',
-        'button[data-testid*="attach" i]',
-        'button svg[data-icon="paperclip"]',
-      ];
-
-      let fileInput = await page.$('input[type="file"]');
-      if (!fileInput) {
-        for (const sel of attachSelectors) {
-          try {
-            const exists = await page.waitForSelector(sel, { timeout: 1000 }).catch(() => null);
-            if (exists) {
-              await page.click(sel, { force: true });
-              await page.waitForTimeout(500);
-              fileInput = await page.$('input[type="file"]');
-              if (fileInput) break;
-            }
-          } catch {}
-        }
-      }
-
-      if (!fileInput) {
-        const handle = await page.evaluateHandle(() => {
-          const inputs = Array.from(
-            document.querySelectorAll('input[type="file"]'),
-          );
-          const el = inputs[0] as HTMLInputElement | undefined;
-          if (el) {
-            el.style.display = "block";
-            el.style.opacity = "1";
-            el.style.position = "fixed";
-            el.style.top = "0";
-            el.style.left = "0";
-            el.style.zIndex = "99999";
-          }
-          return el ?? null;
-        });
-        fileInput = handle.asElement();
-      }
-
-      if (!fileInput) throw new Error("Could not find a file input on DeepSeek.");
-      await fileInput.setInputFiles([file]);
-      await page.waitForTimeout(1000);
-
-      // Wait for the parsing chip to clear
-      try {
-        await page.waitForFunction(() => {
-          const fileChips = Array.from(
-            document.querySelectorAll('[class*="file"], [class*="upload"], [class*="attach"]')
-          );
-          for (const chip of fileChips) {
-            const text = (chip as HTMLElement).innerText?.toLowerCase() || "";
-            if (
-              text.includes("pending") ||
-              text.includes("parsing") ||
-              text.includes("uploading") ||
-              text.includes("loading")
-            ) {
-              return false;
-            }
-          }
-          return !document.querySelector('[class*="uploading"], [class*="spinner"], .ds-loading');
-        }, { timeout: 30_000 });
-      } catch (err) {
-        console.warn(`[Deepseek] Parsing stalled for ${path.basename(file)}. Reloading page...`);
-        throw new Error("RELOAD_SIGNAL");
-      }
-      
-      await page.waitForTimeout(1000);
-    }
-  };
-
-  try {
-    await attemptUpload();
-  } catch (err: any) {
-    if (err.message === "RELOAD_SIGNAL") {
-      console.log("[Deepseek] Upload stalled. Reloading page and retrying upload...");
-      await page.reload({ waitUntil: "domcontentloaded" });
-      await page.waitForTimeout(5000);
-      return uploadFilesToDeepseek(page, filePaths); // Retry from start
-    }
-    console.error(`[Deepseek] CRITICAL: Upload sequence failed: ${err.message}`);
-    throw err;
-  }
-}
-
-// ─── Input & submit ───────────────────────────────────────────────────────────
-
-async function typeAndSubmit(page: Page, message: string): Promise<void> {
-  const inputSelector = '#chat-input, textarea[placeholder*="Message" i], textarea, [contenteditable="true"]';
-  await page.waitForSelector(inputSelector, { timeout: 30000 });
-
-  const inputLocator = page.locator(inputSelector).first();
-
-  // Ensure the input area is clear and we are focused
-  await inputLocator.click();
-
-  try {
-    // Locator.fill supports contenteditable in Playwright
-    await inputLocator.fill(message);
-  } catch {
-    // Fallback if fill fails for some reason
-    await page.evaluate((text) => {
-      const el = document.querySelector(
-        '#chat-input, textarea, [contenteditable="true"]',
-      ) as HTMLElement;
-      if (el) {
-        el.innerText = text;
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-    }, message);
-  }
-
-  // Deepseek can block submission if uploading isn't technically complete
-  await page.waitForTimeout(1000);
-
-  // Try to find the send button and click it, fallback to Enter
-  const sendSelectors = [
-    'div[role="button"]:has(svg):not([class*="disabled"])',
-    'div.ds-icon-button[role="button"]:not([aria-disabled="true"])',
-    'button[aria-label*="send" i]',
-    'div[role="button"][style*="cursor: pointer"] svg',
-    'div._52c986b', // Fresh selector from subagent
-  ];
-
-  let clicked = false;
-  for (const sel of sendSelectors) {
-    try {
-      const btn = page.locator(sel).last();
-      if (await btn.isVisible()) {
-        await btn.click({ timeout: 2000, force: true });
-        clicked = true;
-        break;
-      }
-    } catch {}
-  }
-
-  if (!clicked) {
-    await page.keyboard.press("Enter");
-  }
-}
-
-// ─── Response polling ─────────────────────────────────────────────────────────
-
-async function waitForDeepseekCompletion(
-  page: Page,
-  onStatus?: (msg: string, partial?: string, progress?: number) => void,
-  timeoutMs = 300_000,
-): Promise<string> {
-  const startTime = Date.now();
-  let lastSeenText = "";
-  let stableCount = 0;
-  const STABLE_POLLS_NEEDED = 5;
-
-  await page.waitForTimeout(2000);
-
-  while (Date.now() - startTime < timeoutMs) {
-    const candidate = await page.evaluate<{
-      text: string;
-      isGenerating: boolean;
-    } | null>(() => {
-      const isGenerating =
-        Array.from(
-          document.querySelectorAll('button, div[role="button"]'),
-        ).some((el) => {
-          const text = (el as HTMLElement).textContent?.trim() ?? "";
-          const label = el.getAttribute("aria-label")?.toLowerCase() ?? "";
-          return (
-            text === "Stop" ||
-            label.includes("stop") ||
-            label.includes("cancel")
-          );
-        }) ||
-        document.querySelector(
-          '.ds-loading, [class*="loading"], [class*="generating"], .ds-icon-stop'
-        ) !== null;
-
-      // New: Check for indicators that it IS finished
-      const isDone = document.querySelector(
-        'button[aria-label*="Regenerate" i], .ds-icon-regenerate, [class*="regenerate"], .ds-icon-copy'
-      ) !== null;
-
-      const selectors = [
-        '[data-message-author-role="assistant"]',
-        ".ds-markdown",
-        '.markdown-body:not([class*="user"])',
-        '.prose:not([class*="user"])',
-        '[class*="assistant"]',
-      ];
-
-      let lastBubble: HTMLElement | null = null;
-      for (const sel of selectors) {
-        const nodes = Array.from(document.querySelectorAll<HTMLElement>(sel));
-        if (nodes.length > 0) {
-          lastBubble = nodes[nodes.length - 1];
-          break;
-        }
-      }
-
-      if (!lastBubble) return null;
-      
-      // Capture thinking text separately if present
-      const thinkEl = lastBubble.querySelector('.ds-thought, [class*="thought"], [class*="thinking"]');
-      const thinkText = thinkEl ? (thinkEl as HTMLElement).innerText : "";
-      
-      const text = lastBubble.innerText?.trim() ?? "";
-      if (!text && !thinkText) return null;
-      
-      return { text: thinkText + "\n" + text, isGenerating: isGenerating && !isDone };
+    onStatus?.("Calling NVIDIA API...");
+    
+    const completion = await openai.chat.completions.create({
+      model: DEEPSEEK_MODEL,
+      messages: [{ role: "user", content: fullPrompt }],
+      temperature: 1,
+      top_p: 0.95,
+      max_tokens: 16384,
+      // @ts-ignore - NVIDIA specific extension
+      chat_template_kwargs: { thinking: false },
+      stream: true,
     });
 
-    if (candidate && candidate.text.length > 0) {
-      const preview = candidate.text.substring(0, 120).replace(/\n/g, " ");
-      onStatus?.("Deepseek generating...", preview + "...");
-
-      if (candidate.text === lastSeenText && !candidate.isGenerating) {
-        stableCount++;
-        if (stableCount >= STABLE_POLLS_NEEDED) {
-          onStatus?.("Deepseek response complete.");
-          return candidate.text;
-        }
-      } else {
-        stableCount = 0;
-        lastSeenText = candidate.text;
+    let fullContent = "";
+    for await (const chunk of completion) {
+      const delta = chunk.choices[0]?.delta?.content || "";
+      fullContent += delta;
+      
+      if (onStatus) {
+        const preview = fullContent.substring(fullContent.length - 100).replace(/\n/g, " ");
+        onStatus("Generating...", preview + "...");
       }
     }
 
-    await page.waitForTimeout(1000);
+    onStatus?.("Response complete.");
+    return fullContent;
+  } catch (err: any) {
+    console.error(`${logPrefix} API Error:`, err);
+    throw new Error(`NVIDIA API failure: ${err.message}`);
   }
-
-  if (lastSeenText.length > 0) {
-    onStatus?.("Deepseek timed out — using partial response.");
-    return lastSeenText;
-  }
-
-  throw new Error(
-    "Deepseek analysis timeout after 5 minutes with no response.",
-  );
 }
 
-// ─── Response parser ──────────────────────────────────────────────────────────
+/**
+ * Dummy cleanup function to maintain compatibility.
+ */
+export function cleanupDeepseekTempFiles(_paths: string[]): void {
+  // No longer needed for API approach
+}
+
+// ─── Response parser (Kept as is because it's still useful for parsing JSON from text) ──────────
 
 export function parseNotebookPlan(raw: string): NotebookPlan {
   const attempts: Array<() => NotebookPlan | null> = [

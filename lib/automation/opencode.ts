@@ -5,6 +5,8 @@ import * as path from "path";
 import * as os from "os";
 
 let opencodeProcess: ChildProcess | null = null;
+let opencodeLogs: string = "";
+const OPENCODE_PATH = "/home/jaadu/.npm-global/bin/opencode";
 
 /**
  * Ensures the OpenCode server is running on the specified port.
@@ -17,19 +19,37 @@ export async function ensureOpenCodeServer(
   const { execSync } = await import("child_process");
 
   try {
+    console.log(`[ORCHESTRATOR] Killing existing OpenCode server on port ${port}...`);
     execSync(`fuser -k ${port}/tcp`, { stdio: "ignore" });
     await new Promise((r) => setTimeout(r, 2000));
   } catch (e) {
     // Ignore if nothing was running
   }
 
-  // Always regenerate the config to ensure it's valid (removes stale fields like 'variant')
-  createOpenCodeJson(directory);
+  // Always regenerate the config to ensure it's valid
+  writeOpencodeConfig(directory);
 
-  opencodeProcess = spawn("opencode", ["serve", "--port", String(port)], {
-    stdio: "inherit",
+  console.log(`[ORCHESTRATOR] Starting OpenCode server in: ${directory}`);
+  opencodeLogs = ""; // Reset logs
+  // Use detached and unref but pipe stdout to capture progress
+  opencodeProcess = spawn("node", [OPENCODE_PATH, "serve", "--port", String(port)], {
+    stdio: ["ignore", "pipe", "pipe"],
     cwd: directory,
+    detached: true,
   });
+  
+  opencodeProcess.stdout?.on("data", (data) => {
+    const chunk = data.toString();
+    opencodeLogs += chunk;
+    // Keep only last 1000 characters to avoid memory issues
+    if (opencodeLogs.length > 5000) opencodeLogs = opencodeLogs.slice(-5000);
+  });
+
+  opencodeProcess.stderr?.on("data", (data) => {
+    opencodeLogs += data.toString();
+  });
+
+  opencodeProcess.unref();
 
   for (let i = 0; i < 30; i++) {
     await new Promise((r) => setTimeout(r, 1000));
@@ -42,6 +62,7 @@ export async function ensureOpenCodeServer(
       req.end();
     });
     if (ready) {
+      console.log(`[ORCHESTRATOR] OpenCode server is ready on port ${port}.`);
       return;
     }
   }
@@ -159,7 +180,6 @@ export async function createSession(
           if (!parsed.id) {
             reject(new Error("Session creation response missing 'id'"));
           } else {
-            const projectID = parsed.projectID || "";
             resolve(parsed.id);
           }
         } catch (e) {
@@ -189,11 +209,12 @@ export async function createSession(
 /**
  * Generates an opencode.json config to grant full permissions.
  */
-export function createOpenCodeJson(targetDirectory: string): void {
+export function writeOpencodeConfig(targetDirectory: string): void {
   const opencodeJsonPath = path.join(targetDirectory, "opencode.json");
   const opencodeConfig = {
     $schema: "https://opencode.ai/config.json",
     permission: "allow",
+    model: "google/gemma-4-31b-it" 
   };
 
   fs.writeFileSync(
@@ -210,18 +231,24 @@ export async function cloneRepoForDiskWork(
   owner: string,
   repo: string,
 ): Promise<string> {
-  const cloneDir = path.join(os.homedir(), repo);
+  const cloneDir = path.join("/tmp", "repoorbit_sandbox", `${owner}_${repo}`);
 
   if (!fs.existsSync(cloneDir)) {
+    fs.mkdirSync(path.dirname(cloneDir), { recursive: true });
     const { execSync } = await import("child_process");
     const cloneUrl = `https://github.com/${owner}/${repo}.git`;
     execSync(`git clone ${cloneUrl} ${cloneDir}`, { stdio: "pipe" });
-  } else {
   }
 
   // Permission Injection
-  createOpenCodeJson(cloneDir);
+  writeOpencodeConfig(cloneDir);
 
   return cloneDir;
 }
 
+/**
+ * Returns the latest logs from the OpenCode server.
+ */
+export function getOpenCodeLogs(): string {
+  return opencodeLogs;
+}

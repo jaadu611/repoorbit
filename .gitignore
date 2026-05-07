@@ -39,3 +39,10 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# local data
+scratch/
+notebooklm_sources/
+
+# docker
+docker-compose.override.yml

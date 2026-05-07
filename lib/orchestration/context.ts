@@ -1,26 +1,32 @@
 import fs from "fs";
 import path from "path";
-import { buildDeepseekContext } from "@/lib/builders/deepseekContext";
 import { fetchFile } from "./github";
 import { MAX_LINES_PER_FILE, MAX_FILES_PER_TURN } from "./constants";
+import { getFuzzyCandidates } from "./utils";
 
 export async function fillMissingFiles(
   missingFiles: any[],
-  filledSet: Set<string>,
   modelName: string,
   modelInvestDir: string,
   owner: string,
   repo: string,
   branch: string,
   outDir: string,
+  manifestContent?: string,
   _latestResponsePath?: string,
 ): Promise<number> {
   const filesToFetch = missingFiles.slice(0, MAX_FILES_PER_TURN);
   let count = 0;
 
   for (const f of filesToFetch) {
-    const filePath = f.path || f.file_path;
-    if (!filePath) continue;
+    const rawPath = f.path || f.file_path;
+    if (!rawPath) continue;
+
+    console.log(
+      `[ORCHESTRATOR] Processing model request: ${JSON.stringify(f)}`,
+    );
+
+    let filePath = rawPath;
 
     const lowerPath = filePath.toLowerCase();
 
@@ -82,10 +88,6 @@ export async function fillMissingFiles(
     }
 
     const lineRange = Array.isArray(f.line_range) ? f.line_range : undefined;
-    const key = `${filePath}|${lineRange?.join(",") || ""}`.toLowerCase();
-    if (filledSet.has(key)) continue;
-    filledSet.add(key);
-
     console.log(
       `[ORCHESTRATOR] ${modelName} requesting: ${filePath}${lineRange ? ` lines ${lineRange.join("-")}` : ""}`,
     );
@@ -143,43 +145,7 @@ export async function fillMissingFiles(
       continue;
     }
 
-    // SYMBOL REQUEST
-    if (f.name_hint || f.name) {
-      const symbolPathB = {
-        intent: `Missing symbol: ${f.name_hint || f.name}`,
-        target_symbols: [
-          {
-            name: f.name_hint || f.name,
-            source_file: filePath,
-            role: f.role,
-            type: f.type,
-          },
-        ],
-      };
-      const tempOutDir = path.join(modelInvestDir, `temp_${count}`);
-      fs.mkdirSync(tempOutDir, { recursive: true });
-      ["notebooks.json", "package.json"].forEach((file) => {
-        const src = path.join(outDir, file);
-        if (fs.existsSync(src))
-          fs.copyFileSync(src, path.join(tempOutDir, file));
-      });
-
-      buildDeepseekContext(symbolPathB, tempOutDir);
-
-      const nestedDir = path.join(tempOutDir, "deepseek_context");
-      if (fs.existsSync(nestedDir)) {
-        for (const file of fs.readdirSync(nestedDir)) {
-          const src = path.join(nestedDir, file);
-          const dst = path.join(modelInvestDir, `extra_${count}_${file}`);
-          fs.copyFileSync(src, dst);
-        }
-      }
-      fs.rmSync(tempOutDir, { recursive: true, force: true });
-      count++;
-      continue;
-    }
-
-    const content = await fetchFile(
+    let content = await fetchFile(
       outDir,
       owner,
       repo,
@@ -187,11 +153,54 @@ export async function fillMissingFiles(
       filePath,
       lineRange as [number, number],
     );
+
+    // FUZZY RECOVERY
+    if (content === null) {
+      let fuzzyCandidates = getFuzzyCandidates(filePath);
+
+      // Add candidates from manifest if available
+      if (manifestContent) {
+        const base = path.basename(filePath);
+        const manifestPaths = manifestContent
+          .split("\n")
+          .map((l) => l.trim())
+          .filter(Boolean);
+        const manifestMatches = manifestPaths.filter(
+          (p) => p.endsWith(base) && p !== filePath,
+        );
+        fuzzyCandidates = [
+          ...new Set([...fuzzyCandidates, ...manifestMatches]),
+        ];
+      }
+
+      for (const candidate of fuzzyCandidates) {
+        console.log(
+          `[ORCHESTRATOR] ${modelName}: ${filePath} not found. Trying fuzzy recovery: ${candidate}`,
+        );
+        content = await fetchFile(
+          outDir,
+          owner,
+          repo,
+          branch,
+          candidate,
+          lineRange as [number, number],
+        );
+        if (content !== null) {
+          console.log(
+            `[ORCHESTRATOR] ${modelName}: Fuzzy recovery SUCCESS for ${candidate}`,
+          );
+          filePath = candidate; // Update filePath for logging/saving
+          break;
+        }
+      }
+    }
+
     if (content === null) {
       console.warn(
         `[ORCHESTRATOR] ${modelName}: Skipping ${filePath} (not found).`,
       );
-      continue;
+      // User requested: "send along the files address that this file doesnt exist"
+      content = `// [SYSTEM ERROR]: The file "${filePath}" could not be found in the repository manifest.\n// Please check the path and try again or use the manifest to find correct paths.`;
     }
 
     const safeName = filePath.replace(/[^a-zA-Z0-9_-]/g, "_");

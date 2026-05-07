@@ -15,15 +15,15 @@ graph TD
     A[ GitHub Repository ] -->| Structural Analysis | B( GitHub API / Core Logic )
     B -->| Context Mapping | C[ Notebook Neighborhoods ]
     
-    C -->| Raw Context | D( Dual Planners: DeepSeek V3 + Qwen 2.5 )
+    C -->| Raw Context | D( Dual Planners: DeepSeek V4 API + Qwen 2.5 )
     D -->| Draft Plans | E[ Gemini 2.5 Flash Plan Merger ]
     E -->| Unified Investigation Plan | F[ NotebookLM Evidence Engine ]
     
-    F -->| Precise Code Evidence | G( Parallel Coders: DeepSeek R1 + Qwen 2.5 )
-    G -->| Raw Implementations | H[ DeepSeek Architect Combiner ]
+    F -->| Precise Code Evidence | G( Parallel Coders: DeepSeek V4 API + Qwen 2.5 )
+    G -->| Raw Implementations | H[ Architecture Combiner ]
     
-    H -->| Synthesized Fix | I( Parallel Reviewers: DeepSeek R1 + Qwen 2.5 )
-    I -->| Raw Feedback | J{ DeepSeek Architect Combiner }
+    H -->| Synthesized Fix | I( Parallel Reviewers: DeepSeek V4 API + Qwen 2.5 )
+    I -->| Raw Feedback | J{ Architecture Combiner }
     
     J -->| HAS_ISSUES: YES | G
     J -->| HAS_ISSUES: NO | K[ Gemma 4-31B Disk Operator ]
@@ -122,6 +122,6 @@ Execute the full orchestration stack:
 
 ---
 
-**Note**: RepoOrbit utilizes browser-based automation for DeepSeek and Qwen to minimize API costs and maximize reasoning capabilities. Ensure you are authenticated with these platforms in your primary browser context.
+**Note**: RepoOrbit utilizes browser-based automation for Qwen to minimize API costs and maximize reasoning capabilities. DeepSeek is powered by the NVIDIA API for high-performance inference. Ensure you have `NVIDIA_API_KEY` set in your environment.
 
 _Engineered for high-fidelity codebase surgery._

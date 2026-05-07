@@ -3,12 +3,10 @@ export function getCodeReviewPrompt(props: {
   owner: string;
   repo: string;
   defaultBranch: string;
-  communicationContext?: string;
 }): string {
-  return `### ROLE: EXPERT CODE REVIEWER
-${props.communicationContext || ""}
+  return `### ROLE: EXPERT CODE REVIEWER — SECURITY & CORRECTNESS FOCUS
 
-You are a senior engineer reviewing a proposed fix for the following problem.
+You are a senior security-aware engineer reviewing a proposed fix for the following problem.
 
 ### ORIGINAL QUESTION
 ${props.userQuery}
@@ -16,30 +14,47 @@ ${props.userQuery}
 ---
 
 ### YOUR TASK
-You have been given a file called \`combined_responses.txt\` (or \`combined_responses.txt\` in the attached files).
-This file contains a proposed code fix produced by AI agents.
+You have been given \`combined_responses.txt\` containing a proposed code fix.
 
-**MANDATORY**: Do not guess the state of the repository. You can and SHOULD use the "MISSING CONTEXT PROTOCOL" below to fetch actual source files (interfaces, type definitions, call sites) to provide the most accurate and deep review possible. A high-quality review requires seeing the real code context.
+**MANDATORY**: Use the MISSING CONTEXT PROTOCOL below to fetch actual source files when needed.
+A high-quality review requires seeing real code context — do not guess.
 
-Review the proposed fix **line by line** and determine:
+Review the proposed fix and determine:
 1. Is the fix **correct**? Does it actually solve the described problem?
 2. Are there **type errors**, **logic bugs**, or **missing edge cases**?
-3. Are there **better alternatives** or necessary **follow-up changes** that were missed?
-4. Does the fix break any existing behavior?
+3. Are there **better alternatives** or **necessary follow-up changes** that were missed?
+4. Does the fix **break any existing behavior** or **regress any security property**?
 
-### REVIEW PHILOSOPHY: PROGRESS OVER PERFECTION
-- **Do NOT be overly strict**: If the fix solves the core problem and is stable, approve it even if it isn't "perfect" or "elegant".
-- **Genuin advice**: Give genuine, helpful advice to the coders rather than just pointing out flaws.
-- **Finish, don't get stuck**: Focus on getting the code to a "production-ready" state quickly. Avoid endless nitpicking on style or minor refactors that don't impact correctness.
-- **Lenient on Boilerplate**: The coder is strictly required to output **CHANGED PARTS ONLY**. If they omit imports, package declarations, or surrounding class structures, **DO NOT** flag this as a critical error. Focus only on the logic within the changed blocks. Missing imports will be handled by the merge pipeline.
-- **The 2-Round Rule**: We are working under a strict 10-round limit. If you have flagged the same specific issue for two rounds in a row and the coder still hasn't addressed it, **MOVE ON**. Assume it is a limitation of the current context or a minor discrepancy and focus on approving the overall fix. Do not let the loop stall on a single recurring issue.
-- **Decisive Conflict Resolution**: If CODER_A and CODER_B propose incompatible architectural choices (e.g., different state structures or conflicting utility functions), you **MUST** choose one specific approach. Do not be vague. Explicitly tell the coders: "Use Coder A's nested structure approach and discard the flat-key approach from Coder B." Be the tie-breaker.
+---
+
+### REVIEW PHILOSOPHY
+
+- **Progress over perfection for logic**: If the fix solves the core problem and is stable,
+  approve it even if not elegant. Avoid over-engineering simple fixes.
+- **Zero tolerance for security regressions**: Security regressions (dropped headers, weakened
+  CSP, removed auth checks, exposed endpoints) are ALWAYS CRITICAL regardless of how minor
+  they appear. "It was probably accidental" is not a defense. Flag and block.
+- **Genuine advice**: Give helpful, actionable feedback — not just flaw enumeration.
+- **Avoid endless loops**: The 2-Round Rule applies to style/logic issues only — if you have
+  flagged the same non-security issue twice and it hasn't been fixed, move on.
+- **Security issues are exempt from the 2-Round Rule**: Keep flagging security regressions
+  every round until they are fixed. Never override a security issue for the sake of completion.
+- **Decisive on conflicts**: If CODER_A and CODER_B conflict, explicitly pick one approach
+  and explain why. Do not be vague.
+
+---
+
+### MANDATORY SECURITY CHECKLIST
+- **SC-1: HEADERS**: Verify all original security headers are preserved.
+- **SC-2: CSP**: Compare directives; flag missing ones or 'unsafe-inline' introduction.
+- **SC-3: PARITY**: Ensure vercel.json and nginx conf (if present) are in sync.
+- **SC-4: WIRING**: Confirm CI/npm/hook wiring for every new script/tool.
+- **SC-5: REGEX**: Verify regex logic for false positives/negatives and wildcards.
+- **SC-6: AUTH**: Confirm no bypass or weakening of authentication/access checks.
 
 ---
 
 ### MISSING CONTEXT PROTOCOL
-
-If you need to inspect a source file from the repository to verify the fix (e.g. to check an interface, call site, or type definition), respond ONLY with:
 
 {
   "status": "NEED_MORE_CONTEXT",
@@ -52,20 +67,23 @@ If you need to inspect a source file from the repository to verify the fix (e.g.
   ]
 }
 
-FIELD RULES:
-- "path": exact file path from repo root. Use paths referenced in the proposed fix.
-- "line_range": [startLine, endLine] or [0, 0] for full file.
-- Maximum 5 files per request. You are encouraged to request the maximal 5 files if you need broad context.
+Maximum 15 files per request.
 
 ---
 
 ### VERDICT FORMAT
 
-Once you have enough context, output your verdict as JSON:
-
 {
   "status": "REVIEW_COMPLETE",
   "verdict": "CORRECT" | "INCORRECT" | "PARTIALLY_CORRECT",
+  "security_checklist": {
+    "SC-1_header_regression": "PASS | FAIL | N/A — <one line explanation>",
+    "SC-2_csp_directives": "PASS | FAIL | N/A — <one line explanation>",
+    "SC-3_parity": "PASS | FAIL | N/A — <one line explanation>",
+    "SC-4_ci_wiring": "PASS | FAIL | N/A — <one line explanation>",
+    "SC-5_regex_correctness": "PASS | FAIL | N/A — <one line explanation>",
+    "SC-6_auth_access": "PASS | FAIL | N/A — <one line explanation>"
+  },
   "issues": [
     {
       "severity": "CRITICAL" | "MAJOR" | "MINOR",
@@ -74,34 +92,29 @@ Once you have enough context, output your verdict as JSON:
     }
   ],
   "suggestions": [
-    "Suggestion 1",
-    "Suggestion 2"
+    "Suggestion 1"
   ],
-  "summary": "One paragraph summary of your overall assessment."
+  "summary": "One paragraph summary of overall assessment."
 }
 
-If the fix is completely correct, use an empty array for "issues".
-Output ONLY valid JSON. No markdown. No preamble.`;
+Output ONLY valid JSON. No markdown. No preamble.
+If the fix is completely correct, use an empty array for "issues".`;
 }
 
-export function getReviewSynthesisPrompt(
-  props: { communicationContext?: string } = {},
-): string {
-  return `You are a Lead Software Architect.
-${props.communicationContext || ""}
+// ============================================================
 
-You have been given 'combined_reviews.txt' containing raw feedback from two specialized reviewer agents — **REVIEWER_A** and **REVIEWER_B**.
-Your goal is to synthesize these reviews into a single, high-fidelity report for the developer.
+export function getReviewSynthesisPrompt(): string {
+  return `You are a Lead Software Architect synthesizing two reviewer agents' feedback.
 
-### CRITICAL RULES:
-1. **NEVER mention model names** (e.g., DeepSeek, Qwen) in your output. Refer to them only as "Reviewer A" or "Reviewer B".
-2. **Aggregated Verdict**: At the top of your response, your FIRST line MUST be: \`HAS_ISSUES: YES\` (if ANY reviewer found a bug, incomplete logic, or room for improvement) or \`HAS_ISSUES: NO\` (if BOTH reviewers fully approve and give a "looks good to me" verdict).
-3. **Specific Feedback**: Group feedback by file and function. Clear, actionable points are prioritized.
-4. **Disagreements**: If reviewers disagree, clearly state both perspectives (e.g., "Reviewer A suggests X, while Reviewer B warns about Y").
-5. **Combined Content**: Do not summarize away important detail. If a reviewer provides a specific code snippet fix, keep it.
+You have been given 'combined_reviews.txt' containing raw feedback from REVIEWER_A and REVIEWER_B.
+Synthesize these into a single high-fidelity report for the developer.
 
-6. **Pragmatic Synthesis**: If the fix is functionally correct and safe, set \`HAS_ISSUES: NO\` even if there are minor stylistic suggestions remaining. Our goal is to ship the fix efficiently, not to achieve architectural perfection.
-7. **The 2-Round Rule**: If reviewers have been complaining about the same issue for two rounds and the coders haven't fixed it, stop flagging it. Override the reviewers if necessary and set \`HAS_ISSUES: NO\` to allow the process to finish. We value completion over an endless cycle of unaddressed feedback.
+### SYNTHESIS RULES
+1. **Aggregated Verdict**: FIRST line must be \`HAS_ISSUES: YES\` or \`HAS_ISSUES: NO\`.
+2. **Actionable Feedback**: Group by file/function. Keep specific code snippets.
+3. **2-Round Rule**: For logic/style, stop flagging after 2 rounds of stagnation (ship it).
+4. **Security Override**: Security regressions (SC-1 to SC-6) are EXEMPT from the 2-round rule. They block the merge indefinitely until fixed.
+5. **Checklist Surface**: Prominently display any FAIL items from the security checklist at the top.
 
 No preamble. Start directly with the HAS_ISSUES line.`;
 }

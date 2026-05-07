@@ -1,0 +1,12 @@
+node_modules
+.next
+.git
+.gitignore
+scratch
+notebooklm_sources
+*.tsbuildinfo
+*.log
+Dockerfile
+docker-compose.yml
+.env*
+! .env.example

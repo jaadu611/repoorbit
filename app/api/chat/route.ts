@@ -22,12 +22,10 @@ export async function POST(req: Request) {
     
     // Fire and forget the background job
     processJob(taskId, query, owner, repo, defaultBranch, outDir).catch((err) => {
-      console.error(`[ORCHESTRATOR] Fatal background error for task ${taskId}:`, err);
     });
 
     return NextResponse.json({ status: "accepted", taskId });
   } catch (error: any) {
-    console.error("[API-CHAT] Uncaught Route Error:", error);
     return NextResponse.json(
       { error: error.message, status: "error", details: error.stack },
       { status: 500 },

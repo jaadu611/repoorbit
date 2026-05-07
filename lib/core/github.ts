@@ -107,7 +107,7 @@ export async function fetchFileContents(
 
             if (!res.ok) {
               const errBody = await res.text().catch(() => "(unreadable)");
-              console.warn(
+              console.error(
                 `[REST]   X ${f.path} -- non-OK: ${errBody.slice(0, 200)}`,
               );
               return; // still silently skip -- best effort
@@ -120,7 +120,7 @@ export async function fetchFileContents(
             }
           } catch (err: any) {
             // Best-effort -- log but don't throw
-            console.warn(
+            console.error(
               `[REST]   X EXCEPTION ${f.path} after ${Date.now() - fileStart}ms:`,
               err.message,
             );
@@ -140,7 +140,7 @@ export async function fetchFileContents(
 
     const stillMissing = droppedFiles.filter((f: any) => !result.has(f.path));
     if (stillMissing.length > 0) {
-      console.warn(
+      console.error(
         `[fetchFileContents] ${stillMissing.length} file(s) could not be fetched by either GraphQL or REST:`,
         stillMissing.map((f: any) => f.path),
       );
@@ -450,7 +450,7 @@ export const getRepoData = async (owner: string, repo: string) => {
 
   if (!repoRes.ok) {
     const errorBody = await repoRes.json().catch(() => ({}));
-    console.error(`Repo fetch failed for ${owner}/${repo}:`, {
+    console.error({
       status: repoRes.status,
       errorBody,
       url,
@@ -522,7 +522,6 @@ export const getRepoData = async (owner: string, repo: string) => {
   if (!treeValue?.ok) {
     const status = treeValue?.status;
     const errorBody = await treeValue?.json().catch(() => ({}));
-    console.error("Tree fetch failed:", { status, errorBody });
     const reason =
       status === 403
         ? `GitHub API error: ${errorBody.message || "Rate limited or tree too large"} — add a GITHUB_TOKEN to your .env`

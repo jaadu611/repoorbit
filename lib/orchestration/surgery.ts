@@ -3,18 +3,19 @@ import path from "path";
 import { BrowserContext } from "playwright";
 import {
   getDeepseekCodingPrompt,
-  getGeminiSynthesisPrompt,
-  getCodeReviewPrompt,
-  getReviewSynthesisPrompt,
   getCoderRefinementPrompt,
-  getFinalPolishPrompt,
-  AGENT_COMMUNICATION_PROTOCOL,
+  getCodeReviewPrompt,
+  getSynthesisPrompt,
+  getReviewSynthesisPrompt,
+  getFinalArchitectureSynthesisPrompt,
 } from "@/lib/prompts";
-import { runSingleModelTurn, deepseekCombine } from "./agents";
-import { MAX_ROUNDS } from "./constants";
-import { activeJobs, persistentPages } from "./globals";
+import { runSingleModelTurn, qwenCombine } from "./agents";
+import { persistentPages } from "./globals";
 
-export async function runCoderReviewerLoop(
+/**
+ * Initial synthesis phase with Coder-Reviewer loop.
+ */
+export async function runInitialSynthesis(
   query: string,
   owner: string,
   repo: string,
@@ -26,107 +27,109 @@ export async function runCoderReviewerLoop(
   onStatus: (msg: string) => void,
   questionsUsed: Map<string, number>,
 ): Promise<string> {
-  const dsCoderInvestDir = path.join(outDir, "invest_ds_coder");
-  const qwenCoderInvestDir = path.join(outDir, "invest_qwen_coder");
-  const dsReviewInvestDir = path.join(outDir, "invest_ds_reviewer");
-  const qwenReviewInvestDir = path.join(outDir, "invest_qwen_reviewer");
-  
-  [
-    dsCoderInvestDir,
-    qwenCoderInvestDir,
-    dsReviewInvestDir,
-    qwenReviewInvestDir,
-  ].forEach((d) => fs.mkdirSync(d, { recursive: true }));
+  let currentIteration = 0;
+  let latestReviewFeedback = "";
+  let latestCombinedCoderPath = "";
+  let hasIssues = true;
 
-  const dsCoderFilled = new Set<string>();
-  const qwenCoderFilled = new Set<string>();
-  const dsReviewFilled = new Set<string>();
-  const qwenReviewFilled = new Set<string>();
+  // Persist root manifest to outDir for reference
+  fs.writeFileSync(
+    path.join(outDir, "00_Root_Manifest.txt"),
+    rootManifestContent,
+    "utf-8",
+  );
 
-  let coderFirstTurn = true;
-  let activeResponsePath = "";
-  let finalSynthesis = "";
+  while (hasIssues) {
+    onStatus(`Coder-Reviewer Loop — Iteration ${currentIteration}...`);
 
-  for (let round = 0; round < MAX_ROUNDS; round++) {
-    onStatus(`=== Round ${round} ===`);
+    const dsCoderInvestDir = path.join(
+      outDir,
+      `invest_ds_coder_${currentIteration}`,
+    );
+    const qwenCoderInvestDir = path.join(
+      outDir,
+      `invest_qwen_coder_${currentIteration}`,
+    );
+    const dsRevInvestDir = path.join(
+      outDir,
+      `invest_ds_reviewer_${currentIteration}`,
+    );
+    const qwenRevInvestDir = path.join(
+      outDir,
+      `invest_qwen_reviewer_${currentIteration}`,
+    );
 
-    const coderPromptGenerator = (questionsLeft: number) =>
-      round === 0
-        ? getDeepseekCodingPrompt({
-            userQuery: query,
-            mode: "FIX",
-            communicationContext: AGENT_COMMUNICATION_PROTOCOL(
-              "coder_a",
-              questionsLeft,
-            ),
-          })
-        : getCoderRefinementPrompt({
-            userQuery: query,
-            owner,
-            repo,
-            defaultBranch,
-            hasLatestResponse: !!activeResponsePath,
-            communicationContext: AGENT_COMMUNICATION_PROTOCOL(
-              "coder_a",
-              questionsLeft,
-            ),
-          });
+    [
+      dsCoderInvestDir,
+      qwenCoderInvestDir,
+      dsRevInvestDir,
+      qwenRevInvestDir,
+    ].forEach((d) => fs.mkdirSync(d, { recursive: true }));
 
-    const coderPromptGeneratorQwen = (questionsLeft: number) =>
-      round === 0
-        ? getDeepseekCodingPrompt({
-            userQuery: query,
-            mode: "FIX",
-            communicationContext: AGENT_COMMUNICATION_PROTOCOL(
-              "coder_b",
-              questionsLeft,
-            ),
-          })
-        : getCoderRefinementPrompt({
-            userQuery: query,
-            owner,
-            repo,
-            defaultBranch,
-            hasLatestResponse: !!activeResponsePath,
-            communicationContext: AGENT_COMMUNICATION_PROTOCOL(
-              "coder_b",
-              questionsLeft,
-            ),
-          });
+    const dsCoderFilled = new Set<string>();
+    const qwenCoderFilled = new Set<string>();
+    const dsRevFilled = new Set<string>();
+    const qwenRevFilled = new Set<string>();
 
-    let coderUploadDir: string | null = null;
-    if (coderFirstTurn) {
-      coderUploadDir = path.join(outDir, "coder_upload_round0");
-      if (fs.existsSync(coderUploadDir))
-        fs.rmSync(coderUploadDir, { recursive: true, force: true });
-      fs.mkdirSync(coderUploadDir, { recursive: true });
-      for (const f of fs.readdirSync(dsBaseContextDir)) {
-        if (f === "gap_filler.txt") continue;
+    // 1. Parallel Coders
+    onStatus(
+      `Researcher — Iteration ${currentIteration}: Gathering parallel implementation drafts...`,
+    );
+
+    // For Iteration 0, we use the base context (manifest/exploration results)
+    // For Iteration 1+, we use the same base context + previous review feedback
+    const coderUploadDir = path.join(
+      outDir,
+      `coder_upload_${currentIteration}`,
+    );
+    fs.mkdirSync(coderUploadDir, { recursive: true });
+
+    // Copy base context (exploration results)
+    for (const f of fs.readdirSync(dsBaseContextDir)) {
+      fs.copyFileSync(
+        path.join(dsBaseContextDir, f),
+        path.join(coderUploadDir, f),
+      );
+    }
+    // Explicitly add root manifest (only once per session)
+    if (currentIteration === 0) {
+      fs.writeFileSync(
+        path.join(coderUploadDir, "00_Root_Manifest.txt"),
+        rootManifestContent,
+        "utf-8",
+      );
+    }
+
+    // If we have previous reviews, provide them to coders
+    if (latestReviewFeedback) {
+      fs.writeFileSync(
+        path.join(coderUploadDir, "combined_reviews.txt"),
+        latestReviewFeedback,
+        "utf-8",
+      );
+      // Also provide the previous merged fix so they can see the baseline
+      if (latestCombinedCoderPath && fs.existsSync(latestCombinedCoderPath)) {
         fs.copyFileSync(
-          path.join(dsBaseContextDir, f),
-          path.join(coderUploadDir, f),
-        );
-      }
-    } else {
-      const reviewPath = path.join(outDir, `combined_review_${round - 1}.txt`);
-      if (fs.existsSync(reviewPath)) {
-        coderUploadDir = path.join(outDir, `coder_upload_round${round}`);
-        if (fs.existsSync(coderUploadDir))
-          fs.rmSync(coderUploadDir, { recursive: true, force: true });
-        fs.mkdirSync(coderUploadDir, { recursive: true });
-        fs.copyFileSync(
-          reviewPath,
-          path.join(coderUploadDir, path.basename(reviewPath)),
+          latestCombinedCoderPath,
+          path.join(coderUploadDir, "combined_response.txt"),
         );
       }
     }
 
-    onStatus(`Round ${round}: Running both coders in parallel...`);
     const [dsCoderRaw, qwenCoderRaw] = await Promise.all([
       runSingleModelTurn(
         "DeepSeek",
-        persistentPages.dsCoder!,
-        coderPromptGenerator,
+        null, // No page needed for API
+        (qLeft) =>
+          currentIteration === 0
+            ? getDeepseekCodingPrompt({ userQuery: query })
+            : getCoderRefinementPrompt({
+                userQuery: query,
+                owner,
+                repo,
+                defaultBranch,
+                hasLatestResponse: !!latestCombinedCoderPath,
+              }),
         coderUploadDir,
         dsCoderInvestDir,
         dsCoderFilled,
@@ -136,14 +139,23 @@ export async function runCoderReviewerLoop(
         defaultBranch,
         rootManifestContent,
         onStatus,
-        activeResponsePath,
+        latestCombinedCoderPath,
         "coder_a",
         questionsUsed,
       ),
       runSingleModelTurn(
         "Qwen",
         persistentPages.qwenCoder!,
-        coderPromptGeneratorQwen,
+        (qLeft) =>
+          currentIteration === 0
+            ? getDeepseekCodingPrompt({ userQuery: query })
+            : getCoderRefinementPrompt({
+                userQuery: query,
+                owner,
+                repo,
+                defaultBranch,
+                hasLatestResponse: !!latestCombinedCoderPath,
+              }),
         coderUploadDir,
         qwenCoderInvestDir,
         qwenCoderFilled,
@@ -153,236 +165,183 @@ export async function runCoderReviewerLoop(
         defaultBranch,
         rootManifestContent,
         onStatus,
-        activeResponsePath,
+        latestCombinedCoderPath,
         "coder_b",
         questionsUsed,
       ),
     ]);
-    coderFirstTurn = false;
 
-    if (coderUploadDir && fs.existsSync(coderUploadDir)) {
-      try {
-        fs.rmSync(coderUploadDir, { recursive: true, force: true });
-      } catch {}
-    }
-
+    // 2. Combine Coders
     const rawCoderBlock = [
-      `// CODER_A (DeepSeek) — Round ${round}`,
+      "// CODER_A RESPONSE",
       dsCoderRaw || "// [No response]",
       "",
-      `// CODER_B (Qwen) — Round ${round}`,
+      "// CODER_B RESPONSE",
       qwenCoderRaw || "// [No response]",
     ].join("\n");
 
     const rawCoderPath = path.join(
       outDir,
-      `combined_response_raw_${round}.txt`,
+      `raw_coder_iteration_${currentIteration}.txt`,
     );
     fs.writeFileSync(rawCoderPath, rawCoderBlock, "utf-8");
 
-    const coderSynthesis = await deepseekCombine(
-      (questionsLeft) =>
-        getGeminiSynthesisPrompt({
+    onStatus(
+      `Synthesizer — Iteration ${currentIteration}: Merging coder proposals...`,
+    );
+    const combinedCoderPath = path.join(
+      outDir,
+      `combined_coder_iteration_${currentIteration}.txt`,
+    );
+    const combinedCoderContent = await qwenCombine(
+      (qLeft) =>
+        getSynthesisPrompt({
           synthesisPrompt: query,
-          latestReview: round > 0 ? finalSynthesis : undefined,
-          communicationContext: AGENT_COMMUNICATION_PROTOCOL(
-            "architect",
-            questionsLeft,
-          ),
+          latestReview: latestReviewFeedback,
         }),
       [rawCoderPath],
-      `Synthesizing coder outputs (round ${round})`,
+      "Coder Synthesis",
       outDir,
       onStatus,
       questionsUsed,
-      round > 0 ? finalSynthesis : undefined,
+      latestReviewFeedback,
     );
+    fs.writeFileSync(combinedCoderPath, combinedCoderContent, "utf-8");
+    latestCombinedCoderPath = combinedCoderPath;
 
-    activeResponsePath = path.join(outDir, `combined_response_${round}.txt`);
-    fs.writeFileSync(activeResponsePath, coderSynthesis, "utf-8");
-
-    const debugResponsePath = path.join(
-      outDir,
-      `combined_response_debug_${round}.txt`,
+    // 3. Parallel Reviewers
+    onStatus(
+      `Reviewer — Iteration ${currentIteration}: Reviewing merged proposal...`,
     );
-    fs.writeFileSync(
-      debugResponsePath,
-      [
-        rawCoderBlock,
-        "=".repeat(60) + "\n",
-        `// DEEPSEEK SYNTHESIS — ROUND ${round}`,
-        "=".repeat(60) + "\n\n",
-        coderSynthesis,
-      ].join("\n"),
-      "utf-8",
-    );
-
-    activeJobs.forEach((job, id) => {
-      if (
-        job.statusText?.includes("coder") ||
-        job.statusText?.includes("Round")
-      ) {
-        activeJobs.set(id, {
-          ...job,
-          result: coderSynthesis,
-          answerSource: "initial",
-        });
-      }
-    });
-
-    const reviewerPromptGenerator = (questionsLeft: number) =>
-      getCodeReviewPrompt({
-        userQuery: query,
-        owner,
-        repo,
-        defaultBranch,
-        communicationContext: AGENT_COMMUNICATION_PROTOCOL(
-          "reviewer_a",
-          questionsLeft,
-        ),
-      });
-
-    const reviewerPromptGeneratorQwen = (questionsLeft: number) =>
-      getCodeReviewPrompt({
-        userQuery: query,
-        owner,
-        repo,
-        defaultBranch,
-        communicationContext: AGENT_COMMUNICATION_PROTOCOL(
-          "reviewer_b",
-          questionsLeft,
-        ),
-      });
 
     const reviewerUploadDir = path.join(
       outDir,
-      `reviewer_upload_round${round}`,
+      `reviewer_upload_${currentIteration}`,
     );
-    if (fs.existsSync(reviewerUploadDir))
-      fs.rmSync(reviewerUploadDir, { recursive: true, force: true });
     fs.mkdirSync(reviewerUploadDir, { recursive: true });
     fs.copyFileSync(
-      activeResponsePath,
-      path.join(reviewerUploadDir, path.basename(activeResponsePath)),
+      combinedCoderPath,
+      path.join(reviewerUploadDir, "combined_responses.txt"),
     );
+    // Explicitly add root manifest for reviewers too (only once per session)
+    if (currentIteration === 0) {
+      fs.writeFileSync(
+        path.join(reviewerUploadDir, "00_Root_Manifest.txt"),
+        rootManifestContent,
+        "utf-8",
+      );
+    }
 
-    onStatus(`Round ${round}: Running both reviewers in parallel...`);
-    const [dsReviewRaw, qwenReviewRaw] = await Promise.all([
+    const [dsRevRaw, qwenRevRaw] = await Promise.all([
       runSingleModelTurn(
         "DeepSeek",
-        persistentPages.dsReviewer!,
-        reviewerPromptGenerator,
+        null, // No page needed for API
+        (qLeft) =>
+          getCodeReviewPrompt({ userQuery: query, owner, repo, defaultBranch }),
         reviewerUploadDir,
-        dsReviewInvestDir,
-        dsReviewFilled,
+        dsRevInvestDir,
+        dsRevFilled,
         outDir,
         owner,
         repo,
         defaultBranch,
         rootManifestContent,
         onStatus,
-        activeResponsePath,
+        combinedCoderPath,
         "reviewer_a",
         questionsUsed,
       ),
       runSingleModelTurn(
         "Qwen",
         persistentPages.qwenReviewer!,
-        reviewerPromptGeneratorQwen,
+        (qLeft) =>
+          getCodeReviewPrompt({ userQuery: query, owner, repo, defaultBranch }),
         reviewerUploadDir,
-        qwenReviewInvestDir,
-        qwenReviewFilled,
+        qwenRevInvestDir,
+        qwenRevFilled,
         outDir,
         owner,
         repo,
         defaultBranch,
         rootManifestContent,
         onStatus,
-        activeResponsePath,
+        combinedCoderPath,
         "reviewer_b",
         questionsUsed,
       ),
     ]);
 
-    if (fs.existsSync(reviewerUploadDir)) {
-      try {
-        fs.rmSync(reviewerUploadDir, { recursive: true, force: true });
-      } catch {}
-    }
-
+    // 4. Combine Reviews
     const rawReviewBlock = [
-      `// REVIEWER_A (DeepSeek) — Round ${round}`,
-      dsReviewRaw || "// [No response]",
+      "// REVIEWER_A FEEDBACK",
+      dsRevRaw || "// [No response]",
       "",
-      `// REVIEWER_B (Qwen) — Round ${round}`,
-      qwenReviewRaw || "// [No response]",
+      "// REVIEWER_B FEEDBACK",
+      qwenRevRaw || "// [No response]",
     ].join("\n");
 
-    const rawReviewPath = path.join(outDir, `combined_review_raw_${round}.txt`);
+    const rawReviewPath = path.join(
+      outDir,
+      `raw_review_iteration_${currentIteration}.txt`,
+    );
     fs.writeFileSync(rawReviewPath, rawReviewBlock, "utf-8");
 
-    const reviewSynthesis = await deepseekCombine(
-      (questionsLeft) =>
-        getReviewSynthesisPrompt({
-          communicationContext: AGENT_COMMUNICATION_PROTOCOL(
-            "architect",
-            questionsLeft,
-          ),
-        }),
+    onStatus(
+      `Synthesizer — Iteration ${currentIteration}: Synthesizing reviews...`,
+    );
+    latestReviewFeedback = await qwenCombine(
+      () => getReviewSynthesisPrompt(),
       [rawReviewPath],
-      `Synthesizing reviewer outputs (round ${round})`,
+      "Review Synthesis",
       outDir,
       onStatus,
       questionsUsed,
     );
 
-    const combinedReviewPath = path.join(
-      outDir,
-      `combined_review_${round}.txt`,
-    );
-    fs.writeFileSync(
-      combinedReviewPath,
-      [
-        rawReviewBlock,
-        "=".repeat(60) + "\n",
-        `// DEEPSEEK REVIEW SYNTHESIS — ROUND ${round}`,
-        "=".repeat(60) + "\n\n",
-        reviewSynthesis,
-      ].join("\n"),
-      "utf-8",
-    );
-
-    finalSynthesis = reviewSynthesis;
-    const hasIssues = /HAS_ISSUES:\s*YES/i.test(reviewSynthesis);
-    onStatus(`Round ${round} verdict — HAS_ISSUES: ${hasIssues}`);
-
-    if (!hasIssues) {
-      onStatus(
-        `Round ${round}: Reviewers satisfied. Loop complete after ${round + 1} round(s).`,
-      );
-      break;
-    }
-
-    if (round + 1 >= MAX_ROUNDS) {
-      onStatus("Max rounds reached. Returning best available answer.");
-      break;
-    }
-
+    // 5. Check Termination
+    hasIssues = latestReviewFeedback.toUpperCase().includes("HAS_ISSUES: YES");
     onStatus(
-      `Round ${round}: Issues found — coders will refine in round ${round + 1}.`,
+      `Iteration ${currentIteration} Complete. Has Issues: ${hasIssues ? "YES" : "NO"}`,
     );
+
+    if (!hasIssues) break;
+    currentIteration++;
   }
 
-  onStatus("Performing final code polish...");
-  const polishedAnswer = await deepseekCombine(
-    () => getFinalPolishPrompt(),
-    [activeResponsePath],
-    "Final Polish",
+  // 6. Final Architecture Synthesis (Chief Architect)
+  onStatus("Synthesizer — Drafting final architect plan...");
+  // Gather all final inputs
+  const allCoders = fs
+    .readdirSync(outDir)
+    .filter((f) => f.startsWith("raw_coder_iteration_"))
+    .sort()
+    .map((f) => fs.readFileSync(path.join(outDir, f), "utf-8"))
+    .join("\n\n---\n\n");
+  const allReviews = fs
+    .readdirSync(outDir)
+    .filter((f) => f.startsWith("raw_review_iteration_"))
+    .sort()
+    .map((f) => fs.readFileSync(path.join(outDir, f), "utf-8"))
+    .join("\n\n---\n\n");
+
+  const finalCoderInput = path.join(outDir, "final_all_coders.txt");
+  const finalReviewInput = path.join(outDir, "final_all_reviews.txt");
+  fs.writeFileSync(finalCoderInput, allCoders, "utf-8");
+  fs.writeFileSync(finalReviewInput, allReviews, "utf-8");
+
+  const finalPlan = await qwenCombine(
+    (qLeft) =>
+      getFinalArchitectureSynthesisPrompt({
+        query,
+        allCoderResponses: "[See attached final_all_coders.txt]",
+        allReviewerResponses: "[See attached final_all_reviews.txt]",
+      }),
+    [finalCoderInput, finalReviewInput],
+    "Final Architecture Synthesis",
     outDir,
     onStatus,
     questionsUsed,
-    finalSynthesis,
   );
 
-  return polishedAnswer;
+  return finalPlan;
 }

@@ -572,6 +572,20 @@ export interface FinalPhaseResult {
   coverage_gaps: string[];
 }
 
+export interface ChatStep {
+  id: string;
+  label: string;
+  status: "pending" | "running" | "done" | "error";
+  output?: string;
+}
+
+export interface CombinedFile {
+  path: string;
+  status: "modified" | "created" | "reviewed";
+  coderContent?: string;
+  reviewerFeedback?: string;
+}
+
 /** PATH C gap shape — now includes last_known_node for smarter gap scouting. */
 export interface MissingContextResult {
   status: "MISSING_CONTEXT";
@@ -593,7 +607,10 @@ export interface JobStatus {
   error?: string;
   statusText?: string;
   progress?: number;
+  logs?: string;
   answerSource?: "planner" | "final" | "chatgpt" | "initial" | "reviewed";
+  history?: ChatStep[];
+  files?: CombinedFile[];
 }
 
 export interface LightFileMetadata {

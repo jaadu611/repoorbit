@@ -45,6 +45,8 @@ if [ "$1" == "--cores" ]; then
 fi
 
 # Main Entry Point: Orchestrator
+NEXT_CMD=${NEXT_CMD:-"next dev"}
+
 npx concurrently --kill-others-on-fail --names "opencode,next" --prefix-colors "cyan,green" \
   "bash $0 --cores" \
-  "bash -c \"next dev | grep -vE 'Next.js|Local:|Network:|Environments:|Starting|Ready in|^[[:space:]]*$' --line-buffered; exit 0\""
+  "bash -c \"$NEXT_CMD | grep -vE 'Next.js|Local:|Network:|Environments:|Starting|Ready in|^[[:space:]]*$' --line-buffered; exit 0\""

@@ -51,7 +51,6 @@ export default async function Workspace({
 
       treeRoot = transformToTree(tree, repo, metadata);
     } catch (e) {
-      console.error(e);
       error = "Could not fetch repository. Check the URL or try again later.";
     }
   }

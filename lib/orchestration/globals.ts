@@ -8,18 +8,14 @@ export const activeJobs: Map<string, JobStatus> =
 
 const GLOBAL_PAGES_KEY = Symbol.for("repoorbit.playwright.pages");
 export interface PersistentPages {
-  dsCoder: Page | null;
   qwenCoder: Page | null;
-  dsReviewer: Page | null;
   qwenReviewer: Page | null;
-  dsSynthesizer: Page | null;
+  qwenSynthesizer: Page | null;
 }
 export const persistentPages: PersistentPages = (global as any)[GLOBAL_PAGES_KEY] || {
-  dsCoder: null,
   qwenCoder: null,
-  dsReviewer: null,
   qwenReviewer: null,
-  dsSynthesizer: null,
+  qwenSynthesizer: null,
 };
 (global as any)[GLOBAL_PAGES_KEY] = persistentPages;
 

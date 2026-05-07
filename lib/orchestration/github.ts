@@ -10,20 +10,14 @@ export async function fetchFile(
 ): Promise<string | null> {
   const safeBranch = branch && branch.trim() ? branch.trim() : "main";
   const url = `https://raw.githubusercontent.com/${owner}/${repo}/${safeBranch}/${filePath}`;
-  console.log(`[GITHUB] Fetching: ${url}`);
 
   try {
     const res = await fetch(url);
     if (!res.ok) {
-      console.warn(`[GITHUB] 404/Error: ${url} (Status: ${res.status})`);
       return null;
     }
     const text = await res.text();
     const lines = text.split("\n");
-
-    console.log(
-      `[GITHUB] Success: ${filePath} (${lines.length} lines). Preview: ${lines[0].substring(0, 50)}...`,
-    );
 
     if (lineRange) {
       const startIdx = lineRange[0] > 0 ? lineRange[0] - 1 : 0;
@@ -51,6 +45,6 @@ export async function fetchFile(
     return text;
   } catch (err: any) {
     console.error(`[GITHUB] Error fetching ${url}:`, err.message);
-    return `// Error fetching ${filePath}`;
+    return null;
   }
 }

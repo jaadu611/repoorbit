@@ -10,7 +10,7 @@ import { AGENT_QUESTION_LIMIT, ARCHITECT_QUESTION_LIMIT } from "./constants";
 
 export async function runSingleModelTurn(
   role: "DeepSeek" | "Qwen",
-  page: Page,
+  page: Page | null,
   promptGenerator: (questionsLeft: number) => string,
   uploadDir: string | null,
   investDir: string,
@@ -25,14 +25,16 @@ export async function runSingleModelTurn(
   agentRole: string,
   questionsUsed: Map<string, number>,
 ): Promise<string> {
+  const displayName = `${role} ${agentRole.startsWith("coder") ? "Coder" : agentRole.startsWith("reviewer") ? "Reviewer" : "Synthesizer"}`;
   let done = false;
   let attempt = 0;
   let raw = "";
   const uploadedHashes = new Map<string, string>();
 
-  while (!done && attempt < 20) {
+  while (!done) {
     let effectiveUploadDir: string | null = null;
 
+    const newFiles: { src: string; dstName: string }[] = [];
     if (attempt === 0 && uploadDir) {
       effectiveUploadDir = uploadDir;
       if (fs.existsSync(uploadDir)) {
@@ -47,57 +49,75 @@ export async function runSingleModelTurn(
         outDir,
         `${role.toLowerCase()}_extra_${attempt}_${Date.now()}`,
       );
-      const newFiles: { src: string; dstName: string }[] = [];
       if (fs.existsSync(investDir)) {
         for (const f of fs.readdirSync(investDir)) {
           const src = path.join(investDir, f);
           if (!fs.statSync(src).isFile()) continue;
-          const fp = fileFingerprint(src);
-          if (uploadedHashes.get(f) === fp) continue;
+
+          // ONLY upload actual context files (extra_*) or agent-to-agent replies (a2a_reply_*)
+          // Do NOT upload subturn_*.txt or context_request_*.txt as they are already in the chat history.
+          if (!f.startsWith("extra_") && !f.startsWith("a2a_reply_")) continue;
+
+          // Check if we already uploaded this exact file content
+          const hash = fileFingerprint(src);
+          if (uploadedHashes.get(f) === hash) continue;
+
           newFiles.push({ src, dstName: f });
+          uploadedHashes.set(f, hash);
         }
       }
       if (newFiles.length > 0) {
         fs.mkdirSync(extraTurnDir, { recursive: true });
         for (const item of newFiles) {
           fs.copyFileSync(item.src, path.join(extraTurnDir, item.dstName));
-          uploadedHashes.set(item.dstName, fileFingerprint(item.src));
         }
         effectiveUploadDir = extraTurnDir;
       }
     }
 
-    const questionsUsedCount = questionsUsed.get(agentRole) || 0;
-    const questionsLeft = Math.max(0, AGENT_QUESTION_LIMIT - questionsUsedCount);
-
+    const newFilesList = newFiles.map((nf) => nf.dstName).join(", ");
     const turnPrompt =
       attempt === 0
-        ? promptGenerator(questionsLeft)
-        : "Here is the result of your previous request. Please continue.";
+        ? promptGenerator(0)
+        : `[SYSTEM]: I have successfully uploaded the requested context files: ${newFilesList || "None"}.
+Please proceed with your analysis and implementation. If you still need more files, use the NEED_MORE_CONTEXT protocol again. If you are ready to provide the fix, do so now.`;
 
-    onStatus(`[${role}] Sub-turn ${attempt}...`);
+    if (attempt > 0) {
+      onStatus(
+        `${displayName} — Sub-turn ${attempt}: Uploading ${newFiles.length} context files...`,
+      );
+      for (const nf of newFiles) {
+        console.log(
+          `[ORCHESTRATOR] ${displayName} turn ${attempt}: Uploading ${nf.dstName}`,
+        );
+      }
+    } else {
+      onStatus(`${displayName} — Starting main turn...`);
+    }
 
     try {
-      const releaseOwnPage = await lockPage(page, `${role} main turn`);
+      const releaseOwnPage = (role === "Qwen" && page) ? await lockPage(page, `${role} main turn`) : () => {};
       try {
         if (role === "DeepSeek") {
           raw = await askDeepseek(
-            page,
+            null, // Page not needed for API
             turnPrompt,
             manifestContent,
             effectiveUploadDir || "",
-            (msg) => onStatus(`[${role}] ${msg}`),
+            (msg) => onStatus(`${displayName} — ${msg}`),
             outDir,
             attempt === 0,
+            `[${displayName}]`,
           );
-        } else {
+        } else if (role === "Qwen" && page) {
           raw = await askQwen(
             page,
             turnPrompt,
             effectiveUploadDir || "",
-            (msg) => onStatus(`[${role}] ${msg}`),
+            (msg) => onStatus(`${displayName} — ${msg}`),
             outDir,
             attempt === 0,
+            `[${displayName}]`,
           );
         }
       } finally {
@@ -105,8 +125,14 @@ export async function runSingleModelTurn(
       }
 
       const json = parseJsonFromText(raw);
+
+      // Save the raw output of THIS sub-turn for debugging/transparency
+      const subTurnFileName = `subturn_${attempt}_raw.txt`;
+      fs.writeFileSync(path.join(investDir, subTurnFileName), raw, "utf-8");
+
       if (json?.status === "AGENT_QUERY" && json.to && json.question) {
         const targetRole = json.to;
+        // ... (existing targetPage logic) ...
         const targetPage =
           targetRole === "coder_a"
             ? persistentPages.dsCoder
@@ -128,13 +154,23 @@ export async function runSingleModelTurn(
 
         const used = questionsUsed.get(agentRole) || 0;
         if (used >= AGENT_QUESTION_LIMIT) {
-          onStatus(`[${agentRole}] Quota exhausted. Question blocked.`);
+          onStatus(`${displayName} — Quota exhausted. Question blocked.`);
           attempt++;
           continue;
         }
 
-        onStatus(`[${agentRole}] Querying ${targetRole}: ${json.question}`);
+        onStatus(
+          `${displayName} — Querying ${targetRole.startsWith("coder") ? "Researcher" : targetRole.startsWith("reviewer") ? "Reviewer" : "Synthesizer"}: ${json.question}`,
+        );
         questionsUsed.set(agentRole, used + 1);
+
+        // Save the QUESTION
+        const questionFileName = `a2a_query_${attempt}_to_${targetRole}.txt`;
+        fs.writeFileSync(
+          path.join(investDir, questionFileName),
+          `QUESTION TO ${targetRole}:\n\nContext: ${json.context || "None"}\n\nQuestion: ${json.question}`,
+          "utf-8",
+        );
 
         const targetModel =
           targetRole === "coder_a" ||
@@ -150,28 +186,34 @@ Question: ${json.question}
 
 Please provide a clear, technical answer. Output ONLY the answer text.`;
 
-        const releaseTargetPage = await lockPage(
+        const releaseTargetPage = (targetModel === "Qwen" && targetPage) ? await lockPage(
           targetPage,
           `${targetRole} inquiry`,
-        );
+        ) : () => {};
         let answer = "";
         try {
           if (targetModel === "DeepSeek") {
             answer = await askDeepseek(
-              targetPage,
+              null,
               answerPrompt,
               manifestContent,
               "",
-              (msg) => onStatus(`[${targetRole} REPLY] ${msg}`),
+              (msg) =>
+                onStatus(
+                  `${targetRole.startsWith("coder") ? "Researcher" : targetRole.startsWith("reviewer") ? "Reviewer" : "Synthesizer"} — ${msg}`,
+                ),
               outDir,
               false,
             );
-          } else {
+          } else if (targetModel === "Qwen" && targetPage) {
             answer = await askQwen(
               targetPage,
               answerPrompt,
               "",
-              (msg) => onStatus(`[${targetRole} REPLY] ${msg}`),
+              (msg) =>
+                onStatus(
+                  `${targetRole.startsWith("coder") ? "Researcher" : targetRole.startsWith("reviewer") ? "Reviewer" : "Synthesizer"} — ${msg}`,
+                ),
               outDir,
               false,
             );
@@ -192,27 +234,36 @@ Please provide a clear, technical answer. Output ONLY the answer text.`;
 
       if (json?.status === "NEED_MORE_CONTEXT") {
         const mFiles = json.missing_files || json.missing_symbols || [];
+        onStatus(
+          `${displayName} — Requesting ${mFiles.length} files for context...`,
+        );
+
+        // Save the REQUEST
+        const requestFileName = `context_request_${attempt}.txt`;
+        fs.writeFileSync(
+          path.join(investDir, requestFileName),
+          JSON.stringify(json, null, 2),
+          "utf-8",
+        );
+
         const fetched = await fillMissingFiles(
           mFiles,
-          filledSet,
-          role,
+          displayName,
           investDir,
           owner,
           repo,
           branch,
           outDir,
+          manifestContent,
           latestResponsePath,
         );
-        if (fetched === 0) {
-          onStatus(`[${role}] No new files fetched. Finishing.`);
-          done = true;
-        }
+        onStatus(`${displayName} — Fetched ${fetched} new context files.`);
       } else {
         done = true;
       }
     } catch (err: any) {
       onStatus(
-        `[${role}] CRITICAL: Sub-turn ${attempt} failed: ${err.message}`,
+        `${displayName} — CRITICAL: Sub-turn ${attempt} failed: ${err.message}`,
       );
       done = true;
       break;
@@ -231,10 +282,21 @@ Please provide a clear, technical answer. Output ONLY the answer text.`;
     attempt++;
   }
 
-  return raw;
+  // Final cleanup: strip any JSON status blocks from the response
+  // so they don't pollute the combined file.
+  // We prioritize keeping things that look like code (e.g., have // or functions)
+  let cleanResponse = raw.replace(/\{[\s\S]*?"status"[\s\S]*?\}/g, "").trim();
+
+  // If the cleanup leaves us with nothing but the model was in a "NEED_MORE_CONTEXT" loop,
+  // it means the model never actually produced code.
+  if (!cleanResponse || cleanResponse.length < 10) {
+    return "// [No code implementation produced by this agent]";
+  }
+
+  return cleanResponse;
 }
 
-export async function deepseekCombine(
+export async function qwenCombine(
   promptGenerator: (questionsLeft: number) => string,
   filesToAttach: string[],
   stepLabel: string,
@@ -243,7 +305,8 @@ export async function deepseekCombine(
   questionsUsed: Map<string, number>,
   latestReview?: string,
 ): Promise<string> {
-  onStatus(`[DeepSeek] ${stepLabel}...`);
+  const displayName = "Qwen Synthesizer";
+  onStatus(`${displayName} — ${stepLabel}...`);
   const synthDir = path.join(outDir, `synth_${Date.now()}`);
   fs.mkdirSync(synthDir, { recursive: true });
   for (const f of filesToAttach) {
@@ -262,27 +325,25 @@ export async function deepseekCombine(
   let attempt = 0;
   let res = "";
 
-  while (!done && attempt < 10) {
-    const used = questionsUsed.get("architect") || 0;
-    const questionsLeft = Math.max(0, ARCHITECT_QUESTION_LIMIT - used);
+  while (!done) {
     const turnPrompt =
       attempt === 0
-        ? promptGenerator(questionsLeft)
+        ? promptGenerator(0) // Dummy value
         : "Here is the answer to your previous query. Please continue with the synthesis.";
 
     const releaseOwnPage = await lockPage(
-      persistentPages.dsSynthesizer!,
+      persistentPages.qwenSynthesizer!,
       `architect synthesis`,
     );
     try {
-      res = await askDeepseek(
-        persistentPages.dsSynthesizer!,
+      res = await askQwen(
+        persistentPages.qwenSynthesizer!,
         turnPrompt,
-        "",
-        attempt === 0 ? synthDir : "",
-        (msg) => onStatus(`[DeepSeek ${stepLabel}] ${msg}`),
+        synthDir,
+        (msg) => onStatus(`${displayName} — ${stepLabel}: ${msg}`),
         outDir,
         false,
+        `[${displayName}]`,
       );
     } finally {
       releaseOwnPage();
@@ -301,22 +362,27 @@ export async function deepseekCombine(
               : targetRole === "reviewer_b"
                 ? persistentPages.qwenReviewer
                 : targetRole === "architect"
-                  ? persistentPages.dsSynthesizer
+                  ? persistentPages.qwenSynthesizer
                   : null;
 
-      if (!targetPage) {
-        onStatus(`[Architect] Invalid target agent: ${targetRole}`);
+      if (!targetPage && targetModel === "Qwen") {
+        onStatus(
+          `${displayName} — Invalid target agent: ${targetRole.startsWith("coder") ? "Coder" : "Reviewer"}`,
+        );
         attempt++;
         continue;
       }
 
+      const used = questionsUsed.get("architect") || 0;
       if (used >= ARCHITECT_QUESTION_LIMIT) {
-        onStatus(`[Architect] Quota exhausted. Query blocked.`);
+        onStatus(`${displayName} — Quota exhausted. Query blocked.`);
         attempt++;
         continue;
       }
 
-      onStatus(`[Architect] Querying ${targetRole}: ${json.question}`);
+      onStatus(
+        `${displayName} — Querying ${targetRole.startsWith("coder") ? "Coder" : targetRole.startsWith("reviewer") ? "Reviewer" : "Synthesizer"}: ${json.question}`,
+      );
       questionsUsed.set("architect", used + 1);
 
       const targetModel =
@@ -333,28 +399,34 @@ Question: ${json.question}
 
 Please provide a clear, technical answer. Output ONLY the answer text.`;
 
-      const releaseTargetPage = await lockPage(
+      const releaseTargetPage = (targetModel === "Qwen" && targetPage) ? await lockPage(
         targetPage,
         `architect inquiry to ${targetRole}`,
-      );
+      ) : () => {};
       let answer = "";
       try {
         if (targetModel === "DeepSeek") {
           answer = await askDeepseek(
-            targetPage,
+            null,
             answerPrompt,
             "",
             "",
-            (msg) => onStatus(`[${targetRole} REPLY] ${msg}`),
+            (msg) =>
+              onStatus(
+                `${targetRole.startsWith("coder") ? "Researcher" : targetRole.startsWith("reviewer") ? "Reviewer" : "Synthesizer"} — ${msg}`,
+              ),
             outDir,
             false,
           );
-        } else {
+        } else if (targetModel === "Qwen" && targetPage) {
           answer = await askQwen(
             targetPage,
             answerPrompt,
             "",
-            (msg) => onStatus(`[${targetRole} REPLY] ${msg}`),
+            (msg) =>
+              onStatus(
+                `${targetRole.startsWith("coder") ? "Researcher" : targetRole.startsWith("reviewer") ? "Reviewer" : "Synthesizer"} — ${msg}`,
+              ),
             outDir,
             false,
           );
@@ -362,9 +434,11 @@ Please provide a clear, technical answer. Output ONLY the answer text.`;
       } finally {
         releaseTargetPage();
       }
-      
+
       // Synthesis agents get answer in follow-up prompt
-      onStatus(`[Architect] Received answer from ${targetRole}.`);
+      onStatus(
+        `${displayName} — Received answer from ${targetRole.startsWith("coder") ? "Coder" : targetRole.startsWith("reviewer") ? "Reviewer" : "Synthesizer"}.`,
+      );
       attempt++;
       continue;
     }
