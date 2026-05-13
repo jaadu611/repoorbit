@@ -1,14 +1,7 @@
 import fs, { mkdirSync } from "fs";
-import { writeFile, readFile } from "fs/promises";
+import { writeFile } from "fs/promises";
 import { join } from "path";
-import { RepoLanguage, QueryIntent, ExpertPlan } from "@/lib/core/types";
-
-// --- Filtering ---
-const EXCLUDE_PATTERNS: RegExp[] = [];
-
-function shouldInclude(filePath: string): boolean {
-  return true;
-}
+import { RepoLanguage, ExpertPlan } from "@/lib/core/types";
 
 function detectRepoLanguage(filesMetadata: any[]): RepoLanguage {
   if (!filesMetadata || filesMetadata.length === 0) return "mixed";
@@ -68,7 +61,7 @@ export async function buildMasterContext(
   ];
 
   const sortedFiles = filesMetadata
-    .filter((f) => f && f.path && shouldInclude(f.path))
+    .filter((f) => f && f.path)
     .sort((a, b) => a.path.localeCompare(b.path));
 
   for (const f of sortedFiles) {

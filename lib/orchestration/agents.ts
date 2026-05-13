@@ -1,453 +1,255 @@
 import fs from "fs";
 import path from "path";
-import { Page } from "playwright";
-import { askDeepseek } from "@/lib/automation/deepseek";
-import { askQwen } from "@/lib/automation/qwen";
-import { persistentPages } from "./globals";
-import { parseJsonFromText, fileFingerprint, lockPage } from "./utils";
-import { fillMissingFiles } from "./context";
-import { AGENT_QUESTION_LIMIT, ARCHITECT_QUESTION_LIMIT } from "./constants";
+import { parseJsonFromText } from "./utils";
+import { askNvidia, NVIDIA_MODEL } from "@/lib/automation/llm";
+import { exec as execAsyncRaw } from "child_process";
+import { promisify } from "util";
+const exec = promisify(execAsyncRaw);
+const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
 
+/**
+ * Orchestrates a single model's thought process, including multi-turn context fetching.
+ */
 export async function runSingleModelTurn(
-  role: "DeepSeek" | "Qwen",
-  page: Page | null,
-  promptGenerator: (questionsLeft: number) => string,
-  uploadDir: string | null,
+  model: NVIDIA_MODEL,
+  promptGenerator: (attempt: number) => string,
   investDir: string,
-  filledSet: Set<string>,
-  outDir: string,
+  contextDir: string,
   owner: string,
   repo: string,
-  branch: string,
-  manifestContent: string,
+  defaultBranch: string,
+  rootManifestContent: string,
   onStatus: (msg: string) => void,
-  latestResponsePath: string | undefined,
-  agentRole: string,
+  latestResponsePath: string,
+  displayName: string,
   questionsUsed: Map<string, number>,
-): Promise<string> {
-  const displayName = `${role} ${agentRole.startsWith("coder") ? "Coder" : agentRole.startsWith("reviewer") ? "Reviewer" : "Synthesizer"}`;
+  updateAgent?: (agent: any) => void,
+  readOnly: boolean = true,
+  existingMessages: any[] = []
+): Promise<{ answer: string; messages: any[] }> {
   let done = false;
   let attempt = 0;
-  let raw = "";
-  const uploadedHashes = new Map<string, string>();
+  let currentPrompt = promptGenerator(0);
+  
+  const messages: any[] = existingMessages.length > 0 ? [...existingMessages] : [
+    { role: "user", content: currentPrompt },
+    { role: "user", content: `### REPOSITORY MANIFEST\nBelow is the complete file list of the repository. Use this to locate files before running commands.\n\n${rootManifestContent}` }
+  ];
 
-  while (!done) {
-    let effectiveUploadDir: string | null = null;
+  // Inject latest context as a "Correction/Update" if we have history
+  if (latestResponsePath && fs.existsSync(latestResponsePath)) {
+    const latestContent = fs.readFileSync(latestResponsePath, "utf-8");
+    const prefix = existingMessages.length > 0 ? "### UPDATE: LATEST REVISED PLAN\n" : "### PEER CONTEXT (IMPORTANT)\n";
+    messages.push({
+      role: "user",
+      content: `${prefix}Here is the latest plan/response from the previous pass or peer agents. Use this to maintain consistency:\n\n${latestContent}`,
+    });
+  }
 
-    const newFiles: { src: string; dstName: string }[] = [];
-    if (attempt === 0 && uploadDir) {
-      effectiveUploadDir = uploadDir;
-      if (fs.existsSync(uploadDir)) {
-        for (const f of fs.readdirSync(uploadDir)) {
-          const src = path.join(uploadDir, f);
-          if (fs.statSync(src).isFile())
-            uploadedHashes.set(f, fileFingerprint(src));
-        }
+  let finalContent = "";
+  const MAX_ATTEMPTS = 100;
+
+  while (!done && attempt < MAX_ATTEMPTS) {
+    if (!fs.existsSync(investDir)) fs.mkdirSync(investDir, { recursive: true });
+
+    if (attempt === MAX_ATTEMPTS - 1) {
+      messages.push({
+        role: "user",
+        content: "### FINAL ATTEMPT\nWrap up your analysis and output the FINAL CODE BLOCKS now. Do not run more commands or fetch more context."
+      });
+    }
+
+    if (updateAgent) {
+      updateAgent({
+        id: displayName,
+        name: displayName,
+        model: model,
+        status: "thinking",
+        lastMsg: `Thinking (Turn ${attempt})...`
+      });
+    }
+
+    const messagesToModel: any[] = [
+      { 
+        role: "system", 
+        content: "You are a technical pipeline agent. NO PROSE. NO SMALL TALK. Respond ONLY with JSON protocol or CODE blocks.\n\n" +
+                 (readOnly 
+                   ? "### MODE: READ-ONLY\nYou are in the investigation phase. You CANNOT modify files. Use 'cat' and 'grep' to gather data. Any attempt to write will be blocked.\n\n" 
+                   : "### MODE: WRITE (ACTIVE SURGERY)\nYou are the Chief Surgeon. You MUST apply changes to the files. Use 'cat > file << EOF' to write code. You have full authority to modify the repo.\n\n") +
+                 "### PERSISTENCE NOTE\n" +
+                 "Your previous thoughts and peer feedback are saved locally in the 'temp/' folder for you to reference:\n" +
+                 "- `temp/combined_response.txt`: The latest synthesized code and plan from the team.\n" +
+                 "- `temp/combined_reviews.txt`: The latest critical feedback from all 3 reviewers.\n" +
+                 "You can 'cat' these files to maintain consistency and avoid repeating mistakes.\n\n" +
+                 "### SPEED OPTIMIZATION: BATCHED EXPLORATION\n" +
+                 "The server has a high cold-start latency. TO SAVE TIME, YOU MUST BATCH YOUR COMMANDS.\n" +
+                 "If you need to see multiple files or run multiple greps, output ALL of them in your FIRST response.\n" +
+                 "Do not fetch files one by one. Maximize your 5-command-per-turn limit immediately."
+      },
+      ...messages
+    ];
+
+    // --- THROTTLING LOGIC ---
+    // 5s wait before every call + 20s every 6 messages
+    await sleep(5000);
+    if (attempt > 0 && attempt % 6 === 0) {
+      onStatus(`Throttling: 20s cooldown (6-message limit)...`);
+      await sleep(20000);
+    }
+
+    const rawResponse = await askNvidia(
+      model,
+      messagesToModel,
+      onStatus,
+      `[${displayName}]`
+    );
+
+    // Save turn output for debugging
+    const turnPath = path.join(investDir, `subturn_${attempt}_raw.txt`);
+    fs.writeFileSync(turnPath, rawResponse, "utf-8");
+
+    let statusBlocks = parseJsonFromText(rawResponse, true);
+
+    // --- HEURISTIC FALLBACK (For Lazy Models) ---
+    if (statusBlocks.length === 0) {
+      // 1. Try to find raw bash blocks
+      const bashBlocks = rawResponse.match(/```bash[\s\S]*?```/g);
+      if (bashBlocks) {
+        bashBlocks.forEach(block => {
+          const content = block.replace(/^```bash\s*/, "").replace(/```$/, "").trim();
+          if (content) statusBlocks.push({ status: "RUN_COMMAND", command: content });
+        });
       }
-    } else {
-      const extraTurnDir = path.join(
-        outDir,
-        `${role.toLowerCase()}_extra_${attempt}_${Date.now()}`,
-      );
-      if (fs.existsSync(investDir)) {
-        for (const f of fs.readdirSync(investDir)) {
-          const src = path.join(investDir, f);
-          if (!fs.statSync(src).isFile()) continue;
-
-          // ONLY upload actual context files (extra_*) or agent-to-agent replies (a2a_reply_*)
-          // Do NOT upload subturn_*.txt or context_request_*.txt as they are already in the chat history.
-          if (!f.startsWith("extra_") && !f.startsWith("a2a_reply_")) continue;
-
-          // Check if we already uploaded this exact file content
-          const hash = fileFingerprint(src);
-          if (uploadedHashes.get(f) === hash) continue;
-
-          newFiles.push({ src, dstName: f });
-          uploadedHashes.set(f, hash);
-        }
-      }
-      if (newFiles.length > 0) {
-        fs.mkdirSync(extraTurnDir, { recursive: true });
-        for (const item of newFiles) {
-          fs.copyFileSync(item.src, path.join(extraTurnDir, item.dstName));
-        }
-        effectiveUploadDir = extraTurnDir;
+      // 2. Try to find custom "commands" JSON (Kimi style)
+      const jsonBlocks = rawResponse.match(/```json\n([\s\S]*?)```/g);
+      if (jsonBlocks) {
+        jsonBlocks.forEach(block => {
+          try {
+            const content = block.replace(/```json\n/, "").replace(/```/, "").trim();
+            const parsed = JSON.parse(content);
+            if (parsed.commands && Array.isArray(parsed.commands)) {
+              parsed.commands.forEach((cmd: any) => {
+                const cmdStr = typeof cmd === "string" ? cmd : JSON.stringify(cmd);
+                statusBlocks.push({ status: "RUN_COMMAND", command: cmdStr });
+              });
+            }
+          } catch(e) {}
+        });
       }
     }
 
-    const newFilesList = newFiles.map((nf) => nf.dstName).join(", ");
-    const turnPrompt =
-      attempt === 0
-        ? promptGenerator(0)
-        : `[SYSTEM]: I have successfully uploaded the requested context files: ${newFilesList || "None"}.
-Please proceed with your analysis and implementation. If you still need more files, use the NEED_MORE_CONTEXT protocol again. If you are ready to provide the fix, do so now.`;
+    // Limit to first 5 commands to prevent context explosion
+    const limitedBlocks = statusBlocks.slice(0, 5);
 
-    if (attempt > 0) {
-      onStatus(
-        `${displayName} — Sub-turn ${attempt}: Uploading ${newFiles.length} context files...`,
-      );
-      for (const nf of newFiles) {
-        console.log(
-          `[ORCHESTRATOR] ${displayName} turn ${attempt}: Uploading ${nf.dstName}`,
-        );
-      }
-    } else {
-      onStatus(`${displayName} — Starting main turn...`);
-    }
+    if (limitedBlocks.length > 0) {
+      let contextAddition = "### ADDITIONAL CONTEXT FETCHED\n\n";
+      let hasUpdates = false;
 
-    try {
-      const releaseOwnPage = (role === "Qwen" && page) ? await lockPage(page, `${role} main turn`) : () => {};
-      try {
-        if (role === "DeepSeek") {
-          raw = await askDeepseek(
-            null, // Page not needed for API
-            turnPrompt,
-            manifestContent,
-            effectiveUploadDir || "",
-            (msg) => onStatus(`${displayName} — ${msg}`),
-            outDir,
-            attempt === 0,
-            `[${displayName}]`,
-          );
-        } else if (role === "Qwen" && page) {
-          raw = await askQwen(
-            page,
-            turnPrompt,
-            effectiveUploadDir || "",
-            (msg) => onStatus(`${displayName} — ${msg}`),
-            outDir,
-            attempt === 0,
-            `[${displayName}]`,
-          );
-        }
-      } finally {
-        releaseOwnPage();
-      }
-
-      const json = parseJsonFromText(raw);
-
-      // Save the raw output of THIS sub-turn for debugging/transparency
-      const subTurnFileName = `subturn_${attempt}_raw.txt`;
-      fs.writeFileSync(path.join(investDir, subTurnFileName), raw, "utf-8");
-
-      if (json?.status === "AGENT_QUERY" && json.to && json.question) {
-        const targetRole = json.to;
-        // ... (existing targetPage logic) ...
-        const targetPage =
-          targetRole === "coder_a"
-            ? persistentPages.dsCoder
-            : targetRole === "coder_b"
-              ? persistentPages.qwenCoder
-              : targetRole === "reviewer_a"
-                ? persistentPages.dsReviewer
-                : targetRole === "reviewer_b"
-                  ? persistentPages.qwenReviewer
-                  : targetRole === "architect"
-                    ? persistentPages.dsSynthesizer
-                    : null;
-
-        if (!targetPage) {
-          console.warn(`[ORCHESTRATOR] Invalid target agent: ${targetRole}`);
-          attempt++;
-          continue;
-        }
-
-        const used = questionsUsed.get(agentRole) || 0;
-        if (used >= AGENT_QUESTION_LIMIT) {
-          onStatus(`${displayName} — Quota exhausted. Question blocked.`);
-          attempt++;
-          continue;
-        }
-
-        onStatus(
-          `${displayName} — Querying ${targetRole.startsWith("coder") ? "Researcher" : targetRole.startsWith("reviewer") ? "Reviewer" : "Synthesizer"}: ${json.question}`,
-        );
-        questionsUsed.set(agentRole, used + 1);
-
-        // Save the QUESTION
-        const questionFileName = `a2a_query_${attempt}_to_${targetRole}.txt`;
-        fs.writeFileSync(
-          path.join(investDir, questionFileName),
-          `QUESTION TO ${targetRole}:\n\nContext: ${json.context || "None"}\n\nQuestion: ${json.question}`,
-          "utf-8",
-        );
-
-        const targetModel =
-          targetRole === "coder_a" ||
-          targetRole === "reviewer_a" ||
-          targetRole === "architect"
-            ? "DeepSeek"
-            : "Qwen";
-
-        const answerPrompt = `### AGENT-TO-AGENT INQUIRY
-From: ${agentRole}
-Context: ${json.context || "No extra context provided"}
-Question: ${json.question}
-
-Please provide a clear, technical answer. Output ONLY the answer text.`;
-
-        const releaseTargetPage = (targetModel === "Qwen" && targetPage) ? await lockPage(
-          targetPage,
-          `${targetRole} inquiry`,
-        ) : () => {};
-        let answer = "";
-        try {
-          if (targetModel === "DeepSeek") {
-            answer = await askDeepseek(
-              null,
-              answerPrompt,
-              manifestContent,
-              "",
-              (msg) =>
-                onStatus(
-                  `${targetRole.startsWith("coder") ? "Researcher" : targetRole.startsWith("reviewer") ? "Reviewer" : "Synthesizer"} — ${msg}`,
-                ),
-              outDir,
-              false,
-            );
-          } else if (targetModel === "Qwen" && targetPage) {
-            answer = await askQwen(
-              targetPage,
-              answerPrompt,
-              "",
-              (msg) =>
-                onStatus(
-                  `${targetRole.startsWith("coder") ? "Researcher" : targetRole.startsWith("reviewer") ? "Reviewer" : "Synthesizer"} — ${msg}`,
-                ),
-              outDir,
-              false,
-            );
+      for (const block of limitedBlocks) {
+        if (block.status === "NEED_MORE_CONTEXT") {
+          const missingFiles = block.missing_files || [];
+          for (const file of missingFiles) {
+            const filePath = file.path;
+            const fullPath = path.join(contextDir, filePath);
+            if (fs.existsSync(fullPath)) {
+              const stat = fs.statSync(fullPath);
+              if (stat.isDirectory()) {
+                const entries = fs.readdirSync(fullPath);
+                contextAddition += `// --- DIRECTORY: ${filePath} ---\n${entries.join("\n")}\n\n`;
+              } else {
+                let content = fs.readFileSync(fullPath, "utf-8");
+                if (file.line_range && Array.isArray(file.line_range) && file.line_range.length === 2) {
+                  const [start, end] = file.line_range;
+                  const lines = content.split("\n");
+                  content = lines.slice(Math.max(0, start - 1), end).join("\n");
+                  contextAddition += `// --- FILE: ${filePath} (Lines ${start}-${end}) ---\n${content}\n\n`;
+                } else {
+                  contextAddition += `// --- FILE: ${filePath} ---\n${content}\n\n`;
+                }
+              }
+            } else {
+              contextAddition += `// --- FILE NOT FOUND: ${filePath} ---\n\n`;
+            }
           }
-        } finally {
-          releaseTargetPage();
+          hasUpdates = true;
+        } else if (block.status === "RUN_COMMAND") {
+          const command = block.command;
+          
+          // --- SECURITY FIREWALL: PREVENT MODIFICATIONS (Phase 1 Only) ---
+          const isSafe = (cmd: any) => {
+            if (!readOnly) return true; // Allow everything in Phase 2
+            
+            const cmdStr = String(cmd || "");
+            // Allow standard error redirection 2>/dev/null
+            const cleaned = cmdStr.replace(/2>\/dev\/null/g, "");
+            const dangerous = [">", ">>", "sed -i", "rm ", "mv ", "cp ", "chmod", "chown", "git ", "mkdir", "truncate", "patch"];
+            return !dangerous.some(d => cleaned.includes(d));
+          };
+
+          if (!isSafe(command)) {
+            console.log(`[ORCHESTRATOR] ${displayName} blocked dangerous command: ${command}`);
+            contextAddition += `### COMMAND BLOCKED\nERROR: Command contains forbidden modification tokens. YOU ARE IN A READ-ONLY ENVIRONMENT.\n\n`;
+            hasUpdates = true;
+            continue;
+          }
+
+          console.log(`[ORCHESTRATOR] ${displayName} executing: ${command}`);
+          try {
+            const { stdout, stderr } = await exec(command, { 
+              cwd: contextDir,
+              timeout: 15000,
+              maxBuffer: 1024 * 1024
+            });
+            const result = stdout + (stderr ? `\nERR: ${stderr}` : "");
+            contextAddition += `### COMMAND: ${command}\n${result}\n\n`;
+          } catch (e: any) {
+            contextAddition += `### COMMAND: ${command}\nERROR: ${e.message}\n\n`;
+          }
+          hasUpdates = true;
+        }
+      }
+
+      if (hasUpdates) {
+        messages.push({ role: "assistant", content: rawResponse });
+        messages.push({ role: "user", content: contextAddition + "Continue." });
+        
+        // --- CONTEXT HYGIENE: Capping total character count to prevent 1M token explosion ---
+        // (Approx 4 chars per token, capping at ~150k tokens = 600k chars)
+        let totalChars = messages.reduce((acc, m) => acc + (m.content?.length || 0), 0);
+        while (totalChars > 600000 && messages.length > 3) {
+          // Keep the prompt (index 0) and manifest (index 1), remove the oldest turn results
+          const removed = messages.splice(2, 1)[0]; 
+          totalChars -= (removed.content?.length || 0);
         }
 
-        const answerFileName = `a2a_reply_${attempt}_from_${targetRole}.txt`;
-        fs.writeFileSync(
-          path.join(investDir, answerFileName),
-          `REPLY FROM ${targetRole}:\n\n${answer}`,
-          "utf-8",
-        );
-        attempt++;
-        continue;
-      }
-
-      if (json?.status === "NEED_MORE_CONTEXT") {
-        const mFiles = json.missing_files || json.missing_symbols || [];
-        onStatus(
-          `${displayName} — Requesting ${mFiles.length} files for context...`,
-        );
-
-        // Save the REQUEST
-        const requestFileName = `context_request_${attempt}.txt`;
-        fs.writeFileSync(
-          path.join(investDir, requestFileName),
-          JSON.stringify(json, null, 2),
-          "utf-8",
-        );
-
-        const fetched = await fillMissingFiles(
-          mFiles,
-          displayName,
-          investDir,
-          owner,
-          repo,
-          branch,
-          outDir,
-          manifestContent,
-          latestResponsePath,
-        );
-        onStatus(`${displayName} — Fetched ${fetched} new context files.`);
-      } else {
-        done = true;
-      }
-    } catch (err: any) {
-      onStatus(
-        `${displayName} — CRITICAL: Sub-turn ${attempt} failed: ${err.message}`,
-      );
-      done = true;
-      break;
-    } finally {
-      if (
-        attempt > 0 &&
-        effectiveUploadDir &&
-        fs.existsSync(effectiveUploadDir)
-      ) {
-        try {
-          fs.rmSync(effectiveUploadDir, { recursive: true, force: true });
-        } catch {}
-      }
-    }
-
-    attempt++;
-  }
-
-  // Final cleanup: strip any JSON status blocks from the response
-  // so they don't pollute the combined file.
-  // We prioritize keeping things that look like code (e.g., have // or functions)
-  let cleanResponse = raw.replace(/\{[\s\S]*?"status"[\s\S]*?\}/g, "").trim();
-
-  // If the cleanup leaves us with nothing but the model was in a "NEED_MORE_CONTEXT" loop,
-  // it means the model never actually produced code.
-  if (!cleanResponse || cleanResponse.length < 10) {
-    return "// [No code implementation produced by this agent]";
-  }
-
-  return cleanResponse;
-}
-
-export async function qwenCombine(
-  promptGenerator: (questionsLeft: number) => string,
-  filesToAttach: string[],
-  stepLabel: string,
-  outDir: string,
-  onStatus: (msg: string) => void,
-  questionsUsed: Map<string, number>,
-  latestReview?: string,
-): Promise<string> {
-  const displayName = "Qwen Synthesizer";
-  onStatus(`${displayName} — ${stepLabel}...`);
-  const synthDir = path.join(outDir, `synth_${Date.now()}`);
-  fs.mkdirSync(synthDir, { recursive: true });
-  for (const f of filesToAttach) {
-    fs.copyFileSync(f, path.join(synthDir, path.basename(f)));
-  }
-
-  if (latestReview) {
-    fs.writeFileSync(
-      path.join(synthDir, "latest_review.txt"),
-      latestReview,
-      "utf-8",
-    );
-  }
-
-  let done = false;
-  let attempt = 0;
-  let res = "";
-
-  while (!done) {
-    const turnPrompt =
-      attempt === 0
-        ? promptGenerator(0) // Dummy value
-        : "Here is the answer to your previous query. Please continue with the synthesis.";
-
-    const releaseOwnPage = await lockPage(
-      persistentPages.qwenSynthesizer!,
-      `architect synthesis`,
-    );
-    try {
-      res = await askQwen(
-        persistentPages.qwenSynthesizer!,
-        turnPrompt,
-        synthDir,
-        (msg) => onStatus(`${displayName} — ${stepLabel}: ${msg}`),
-        outDir,
-        false,
-        `[${displayName}]`,
-      );
-    } finally {
-      releaseOwnPage();
-    }
-
-    const json = parseJsonFromText(res);
-    if (json?.status === "AGENT_QUERY" && json.to && json.question) {
-      const targetRole = json.to;
-      const targetPage =
-        targetRole === "coder_a"
-          ? persistentPages.dsCoder
-          : targetRole === "coder_b"
-            ? persistentPages.qwenCoder
-            : targetRole === "reviewer_a"
-              ? persistentPages.dsReviewer
-              : targetRole === "reviewer_b"
-                ? persistentPages.qwenReviewer
-                : targetRole === "architect"
-                  ? persistentPages.qwenSynthesizer
-                  : null;
-
-      if (!targetPage && targetModel === "Qwen") {
-        onStatus(
-          `${displayName} — Invalid target agent: ${targetRole.startsWith("coder") ? "Coder" : "Reviewer"}`,
-        );
-        attempt++;
-        continue;
-      }
-
-      const used = questionsUsed.get("architect") || 0;
-      if (used >= ARCHITECT_QUESTION_LIMIT) {
-        onStatus(`${displayName} — Quota exhausted. Query blocked.`);
-        attempt++;
-        continue;
-      }
-
-      onStatus(
-        `${displayName} — Querying ${targetRole.startsWith("coder") ? "Coder" : targetRole.startsWith("reviewer") ? "Reviewer" : "Synthesizer"}: ${json.question}`,
-      );
-      questionsUsed.set("architect", used + 1);
-
-      const targetModel =
-        targetRole === "coder_a" ||
-        targetRole === "reviewer_a" ||
-        targetRole === "architect"
-          ? "DeepSeek"
-          : "Qwen";
-
-      const answerPrompt = `### AGENT-TO-AGENT INQUIRY
-From: Architect
-Context: ${json.context || "No extra context provided"}
-Question: ${json.question}
-
-Please provide a clear, technical answer. Output ONLY the answer text.`;
-
-      const releaseTargetPage = (targetModel === "Qwen" && targetPage) ? await lockPage(
-        targetPage,
-        `architect inquiry to ${targetRole}`,
-      ) : () => {};
-      let answer = "";
-      try {
-        if (targetModel === "DeepSeek") {
-          answer = await askDeepseek(
-            null,
-            answerPrompt,
-            "",
-            "",
-            (msg) =>
-              onStatus(
-                `${targetRole.startsWith("coder") ? "Researcher" : targetRole.startsWith("reviewer") ? "Reviewer" : "Synthesizer"} — ${msg}`,
-              ),
-            outDir,
-            false,
-          );
-        } else if (targetModel === "Qwen" && targetPage) {
-          answer = await askQwen(
-            targetPage,
-            answerPrompt,
-            "",
-            (msg) =>
-              onStatus(
-                `${targetRole.startsWith("coder") ? "Researcher" : targetRole.startsWith("reviewer") ? "Reviewer" : "Synthesizer"} — ${msg}`,
-              ),
-            outDir,
-            false,
-          );
+        if (updateAgent) {
+          updateAgent({
+            id: displayName,
+            name: displayName,
+            model: model,
+            status: "fetching",
+            lastMsg: `Processed ${statusBlocks.length} actions.`
+          });
         }
-      } finally {
-        releaseTargetPage();
+        attempt++;
+        continue; // Next turn
       }
-
-      // Synthesis agents get answer in follow-up prompt
-      onStatus(
-        `${displayName} — Received answer from ${targetRole.startsWith("coder") ? "Coder" : targetRole.startsWith("reviewer") ? "Reviewer" : "Synthesizer"}.`,
-      );
-      attempt++;
-      continue;
     }
 
+    // If we reach here and not done, it means the model gave a final answer or no protocol
+    console.log(`[ORCHESTRATOR] ${displayName} (${model}) - Received Final Answer. Done.`);
+    finalContent = rawResponse;
     done = true;
+    if (updateAgent) {
+      updateAgent({
+        id: displayName,
+        name: displayName,
+        model: model,
+        status: "done",
+        lastMsg: "Draft complete."
+      });
+    }
   }
 
-  try {
-    fs.rmSync(synthDir, { recursive: true, force: true });
-  } catch {}
-  return res;
+  return { answer: finalContent, messages };
 }

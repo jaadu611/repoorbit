@@ -2,12 +2,9 @@ import { sectionData } from "@/constants/landingPage.constants";
 import {
   Atom,
   GitBranch,
-  icons,
   LockOpen,
   LucideIcon,
   LucideLayers,
-  Network,
-  TreePine,
 } from "lucide-react";
 
 const Page = () => {

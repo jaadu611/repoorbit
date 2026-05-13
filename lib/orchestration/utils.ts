@@ -1,10 +1,9 @@
 import fs from "fs";
 import path from "path";
-import { Page } from "playwright";
-import { pageLocks } from "./globals";
+import { activeJobs } from "./globals";
 
-export function parseJsonFromText(text: string): any {
-  if (!text) return null;
+export function parseJsonFromText(text: string, returnAll: boolean = false): any {
+  if (!text) return returnAll ? [] : null;
 
   // Find all occurrences of '{' and extract balanced objects
   let results: any[] = [];
@@ -46,7 +45,7 @@ export function parseJsonFromText(text: string): any {
       const block = text.substring(pos, endPos + 1);
       try {
         const parsed = JSON.parse(block);
-        if (parsed && typeof parsed === "object" && parsed.status) {
+        if (parsed && typeof parsed === "object") {
           results.push(parsed);
         }
       } catch {
@@ -58,7 +57,7 @@ export function parseJsonFromText(text: string): any {
     }
   }
 
-  // Return the LATEST status update if multiple exist
+  if (returnAll) return results;
   return results.length > 0 ? results[results.length - 1] : null;
 }
 
@@ -71,24 +70,7 @@ export function fileFingerprint(filePath: string): string {
   }
 }
 
-export async function lockPage(page: Page, label: string) {
-  const currentLock = pageLocks.get(page) || Promise.resolve();
-  let resolveLock: () => void;
-  const newLock = new Promise<void>((r) => {
-    resolveLock = r;
-  });
-
-  pageLocks.set(page, newLock);
-  await currentLock;
-
-  return () => {
-    resolveLock();
-    if (pageLocks.get(page) === newLock) {
-      pageLocks.delete(page);
-    }
-  };
-}
-
+// lockPage function removed as browser orchestration is no longer used.
 
 export function getFuzzyCandidates(filePath: string): string[] {
   const dir = path.dirname(filePath);

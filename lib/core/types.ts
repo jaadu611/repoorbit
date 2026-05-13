@@ -598,8 +598,17 @@ export interface MissingContextResult {
   };
 }
 
+export interface AgentProgress {
+  id: string;
+  name: string;
+  model: string;
+  status: "thinking" | "fetching" | "done" | "error";
+  lastMsg?: string;
+}
+
 export interface JobStatus {
   status: "pending" | "running" | "completed" | "done" | "error";
+  agents?: AgentProgress[];
   turn?: number;
   step?: string;
   result?: string;
@@ -608,7 +617,7 @@ export interface JobStatus {
   statusText?: string;
   progress?: number;
   logs?: string;
-  answerSource?: "planner" | "final" | "chatgpt" | "initial" | "reviewed";
+  answerSource?: "planner" | "final" | "chatgpt" | "initial" | "reviewed" | "solo";
   history?: ChatStep[];
   files?: CombinedFile[];
 }

@@ -18,7 +18,7 @@ export async function POST(req: Request) {
     const taskId = Math.random().toString(36).substring(7);
     activeJobs.set(taskId, { status: "pending" });
 
-    const outDir = path.join(CONTEXT_DIR_PATH, owner, repo);
+    const outDir = path.join(CONTEXT_DIR_PATH, owner, repo, taskId);
     
     // Fire and forget the background job
     processJob(taskId, query, owner, repo, defaultBranch, outDir).catch((err) => {

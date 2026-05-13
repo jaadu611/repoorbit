@@ -1,254 +1,87 @@
-import http from "http";
 import { spawn, ChildProcess } from "child_process";
-import * as fs from "fs";
-import * as path from "path";
-import * as os from "os";
+import path from "path";
+import fs from "fs";
+
+export const OPENCODE_MODEL_ID = "nvidia/llama-3.3-nemotron-super-49b-v1";
 
 let opencodeProcess: ChildProcess | null = null;
-let opencodeLogs: string = "";
-const OPENCODE_PATH = "/home/jaadu/.npm-global/bin/opencode";
+const OPENCODE_PATH = "opencode";
 
-/**
- * Ensures the OpenCode server is running on the specified port.
- * Aggressively kills existing processes on the port to ensure directory switch.
- */
-export async function ensureOpenCodeServer(
-  port: number,
-  directory: string,
-): Promise<void> {
-  const { execSync } = await import("child_process");
+export async function ensureOpenCodeServer(port: number, directory: string) {
+  if (opencodeProcess && !opencodeProcess.killed) return;
 
+  console.log(`[AGENT] Clearing port ${port}...`);
   try {
-    console.log(`[ORCHESTRATOR] Killing existing OpenCode server on port ${port}...`);
-    execSync(`fuser -k ${port}/tcp`, { stdio: "ignore" });
-    await new Promise((r) => setTimeout(r, 2000));
-  } catch (e) {
-    // Ignore if nothing was running
-  }
+    const { execSync } = require("child_process");
+    execSync(`fuser -k ${port}/tcp || true`);
+  } catch (e) {}
 
-  // Always regenerate the config to ensure it's valid
-  writeOpencodeConfig(directory);
-
-  console.log(`[ORCHESTRATOR] Starting OpenCode server in: ${directory}`);
-  opencodeLogs = ""; // Reset logs
-  // Use detached and unref but pipe stdout to capture progress
-  opencodeProcess = spawn("node", [OPENCODE_PATH, "serve", "--port", String(port)], {
-    stdio: ["ignore", "pipe", "pipe"],
+  console.log(`[AGENT] Booting OpenCode on port ${port}...`);
+  opencodeProcess = spawn(OPENCODE_PATH, ["serve", "--port", String(port)], {
     cwd: directory,
-    detached: true,
+    env: { ...process.env },
+  });
+
+  opencodeProcess.stdout?.on("data", (data) => process.stdout.write(`[opencode] ${data}`));
+  opencodeProcess.stderr?.on("data", (data) => process.stderr.write(`[opencode-err] ${data}`));
+
+  const start = Date.now();
+  while (Date.now() - start < 30000) {
+    try {
+      // Use 127.0.0.1 to avoid IPv6/localhost resolution issues
+      const res = await fetch(`http://127.0.0.1:${port}/session`, { signal: AbortSignal.timeout(1000) });
+      if (res.ok || res.status === 404 || res.status === 405) {
+        console.log(`[AGENT] OpenCode is ready on 127.0.0.1:${port}.`);
+        return;
+      }
+    } catch (e) {}
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  throw new Error("OpenCode failed to start within 30 seconds.");
+}
+
+export async function runAutonomousAgent(port: number, directory: string, prompt: string): Promise<string> {
+  const url = `http://127.0.0.1:${port}/session`;
+  
+  // 1. Create a session (with modelID specified at creation)
+  console.log(`[AGENT] Creating session with model ${OPENCODE_MODEL_ID}...`);
+  const sessionRes = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ 
+      directory,
+      modelID: OPENCODE_MODEL_ID 
+    }),
+    signal: AbortSignal.timeout(10000),
   });
   
-  opencodeProcess.stdout?.on("data", (data) => {
-    const chunk = data.toString();
-    opencodeLogs += chunk;
-    // Keep only last 1000 characters to avoid memory issues
-    if (opencodeLogs.length > 5000) opencodeLogs = opencodeLogs.slice(-5000);
-  });
-
-  opencodeProcess.stderr?.on("data", (data) => {
-    opencodeLogs += data.toString();
-  });
-
-  opencodeProcess.unref();
-
-  for (let i = 0; i < 30; i++) {
-    await new Promise((r) => setTimeout(r, 1000));
-    const ready = await new Promise<boolean>((resolve) => {
-      const req = http.get(`http://localhost:${port}/session`, (res) => {
-        res.resume();
-        resolve(true);
-      });
-      req.on("error", () => resolve(false));
-      req.end();
-    });
-    if (ready) {
-      console.log(`[ORCHESTRATOR] OpenCode server is ready on port ${port}.`);
-      return;
-    }
+  if (!sessionRes.ok) {
+    const errText = await sessionRes.text();
+    throw new Error(`Failed to create session (${sessionRes.status}): ${errText}`);
   }
-  throw new Error(`OpenCode server failed to start on port ${port}`);
-}
+  const { id: sessionId } = await sessionRes.json();
 
-/**
- * Sends a prompt message to the OpenCode session.
- */
-export async function sendToPort(
-  port: number,
-  sessionId: string,
-  prompt: string,
-): Promise<string> {
-  const data = JSON.stringify({ parts: [{ type: "text", text: prompt }] });
-
-  return new Promise((resolve, reject) => {
-    const options = {
-      hostname: "localhost",
-      port: port,
-      path: `/session/${sessionId}/message`,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(data),
-      },
-      timeout: 15 * 60 * 1000,
-    };
-
-    const req = http.request(options, (res) => {
-      let body = "";
-      res.setEncoding("utf8");
-      res.on("data", (chunk) => {
-        body += chunk;
-      });
-      res.on("end", () => {
-        if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
-          reject(
-            new Error(`OpenCode error: ${res.statusCode} ${res.statusMessage}`),
-          );
-          return;
-        }
-        try {
-          const parsed = JSON.parse(body);
-          const text =
-            parsed.parts?.find((p: any) => p.type === "text")?.text || "";
-          resolve(text);
-        } catch (e) {
-          reject(
-            new Error(
-              `Failed to parse OpenCode response: ${e instanceof Error ? e.message : String(e)}`,
-            ),
-          );
-        }
-      });
-    });
-
-    req.on("error", (e) => {
-      reject(e);
-    });
-
-    req.on("timeout", () => {
-      req.destroy();
-      reject(new Error("OpenCode request timed out after 15 minutes"));
-    });
-
-    req.write(data);
-    req.end();
+  // 2. Send the task
+  console.log(`[AGENT] Task started in session ${sessionId}.`);
+  const msgRes = await fetch(`${url}/${sessionId}/message`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ 
+      content: prompt,
+      modelID: OPENCODE_MODEL_ID 
+    }),
+    signal: AbortSignal.timeout(1800000), 
   });
-}
 
-/**
- * Creates a new OpenCode session via API.
- */
-export async function createSession(
-  port: number,
-  directory: string,
-  model?: string,
-): Promise<string> {
-  const bodyData: any = { directory };
-  if (model) bodyData.model = model;
-
-  const data = JSON.stringify(bodyData);
-
-  return new Promise((resolve, reject) => {
-    const options = {
-      hostname: "localhost",
-      port: port,
-      path: "/session",
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(data),
-      },
-      timeout: 5 * 60 * 1000,
-    };
-
-    const req = http.request(options, (res) => {
-      let body = "";
-      res.setEncoding("utf8");
-      res.on("data", (chunk) => {
-        body += chunk;
-      });
-      res.on("end", () => {
-        if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
-          reject(
-            new Error(
-              `Failed to create session: ${res.statusCode} ${res.statusMessage} - Body: ${body}`,
-            ),
-          );
-          return;
-        }
-        try {
-          const parsed = JSON.parse(body);
-          if (!parsed.id) {
-            reject(new Error("Session creation response missing 'id'"));
-          } else {
-            resolve(parsed.id);
-          }
-        } catch (e) {
-          reject(
-            new Error(
-              `Failed to parse session response: ${e instanceof Error ? e.message : String(e)}`,
-            ),
-          );
-        }
-      });
-    });
-
-    req.on("error", (e) => {
-      reject(e);
-    });
-
-    req.on("timeout", () => {
-      req.destroy();
-      reject(new Error("Session creation timed out"));
-    });
-
-    req.write(data);
-    req.end();
-  });
-}
-
-/**
- * Generates an opencode.json config to grant full permissions.
- */
-export function writeOpencodeConfig(targetDirectory: string): void {
-  const opencodeJsonPath = path.join(targetDirectory, "opencode.json");
-  const opencodeConfig = {
-    $schema: "https://opencode.ai/config.json",
-    permission: "allow",
-    model: "google/gemma-4-31b-it" 
-  };
-
-  fs.writeFileSync(
-    opencodeJsonPath,
-    JSON.stringify(opencodeConfig, null, 2),
-    "utf8",
-  );
-}
-
-/**
- * Clones the given GitHub repo and generates an opencode.json config.
- */
-export async function cloneRepoForDiskWork(
-  owner: string,
-  repo: string,
-): Promise<string> {
-  const cloneDir = path.join("/tmp", "repoorbit_sandbox", `${owner}_${repo}`);
-
-  if (!fs.existsSync(cloneDir)) {
-    fs.mkdirSync(path.dirname(cloneDir), { recursive: true });
-    const { execSync } = await import("child_process");
-    const cloneUrl = `https://github.com/${owner}/${repo}.git`;
-    execSync(`git clone ${cloneUrl} ${cloneDir}`, { stdio: "pipe" });
+  if (!msgRes.ok) {
+    const errText = await msgRes.text();
+    throw new Error(`Agent message failed (${msgRes.status}): ${errText}`);
   }
+  const data = await msgRes.json();
+  
+  const output = (data.parts || [])
+    .map((p: any) => p.text || p.thought || p.content || "")
+    .join("\n");
 
-  // Permission Injection
-  writeOpencodeConfig(cloneDir);
-
-  return cloneDir;
-}
-
-/**
- * Returns the latest logs from the OpenCode server.
- */
-export function getOpenCodeLogs(): string {
-  return opencodeLogs;
+  return output || "Task completed.";
 }

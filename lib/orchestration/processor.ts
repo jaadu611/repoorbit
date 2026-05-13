@@ -1,18 +1,31 @@
 import fs from "fs";
 import path from "path";
-import { execSync } from "child_process";
 import { buildMasterContext } from "@/lib/builders/context";
-import { getOrCreateContext } from "@/lib/core/browser";
+import { activeJobs } from "./globals";
+import { ensureOpenCodeServer, runAutonomousAgent } from "@/lib/automation/opencode";
+import { runTestSuite, runTestFixLoop } from "./testRunner";
 import {
-  cloneRepoForDiskWork,
-  writeOpencodeConfig,
-} from "@/lib/automation/opencode";
-import { activeJobs, persistentPages } from "./globals";
-import { runInitialSynthesis } from "./surgery";
-import { runSurgeryPhase2 } from "./surgeryPhase2";
+  ensureDepsInstalled,
+  getGitDiff,
+  commitAndCreatePR,
+  rollbackChanges,
+  buildDiffSummaryMarkdown,
+  appendChangelog,
+} from "./gitOps";
+import {
+  loadCheckpoint,
+  saveCheckpoint,
+  clearCheckpoint,
+  isStepComplete,
+  CheckpointData,
+} from "./checkpoint";
+import { getTokenStats, formatTokenReport, clearJobStats } from "./tokenTracker";
+import { setLLMContext } from "@/lib/automation/llm";
 import { ChatStep, CombinedFile } from "@/lib/core/types";
+import { cloneRepoForDiskWork } from "@/lib/automation/sandbox";
 
-const tmpRepoDir = path.join("/tmp", `repoorbit_${Date.now()}`);
+// Re-export setLLMContext from llm so it can be imported here
+// (it's already imported above)
 
 export async function processJob(
   taskId: string,
@@ -22,8 +35,6 @@ export async function processJob(
   defaultBranch: string,
   outDir: string,
 ) {
-  const manifestPath = path.join(outDir, "00_Root_Manifest.txt");
-
   try {
     const history: ChatStep[] = [];
 
@@ -42,16 +53,17 @@ export async function processJob(
         if (label) step.label = label;
         if (output) step.output = output;
       }
-      onStatus(step.label); // Trigger a refresh
+      onStatus(step.label);
     };
 
     const onStatus = (
       msg: string,
       partial?: string,
       overrideProgress?: number,
-      _unused_history?: ChatStep[],
+      _unused?: ChatStep[],
       files?: CombinedFile[],
       logs?: string,
+      agents?: any[],
     ) => {
       const job = activeJobs.get(taskId);
       if (job)
@@ -63,176 +75,303 @@ export async function processJob(
           history: [...history],
           files: files ?? job.files,
           logs: logs ?? job.logs,
+          agents: agents ?? job.agents,
         });
     };
 
-    const questionsUsed = new Map<string, number>();
-    [
-      "coder_a",
-      "coder_b",
-      "reviewer_a",
-      "reviewer_b",
-      "gemma",
-      "architect",
-    ].forEach((r) => questionsUsed.set(r, 0));
-
-    // Step 1: Clone repo and build notebooks (only on first run)
-    if (!fs.existsSync(outDir)) {
-      fs.mkdirSync(outDir, { recursive: true });
-      addOrUpdateStep("sync", "Environment", "running");
-      onStatus("Synchronizing repository environment...", undefined, 5);
-      try {
-        execSync(
-          `git clone --depth=1 https://github.com/${owner}/${repo}.git ${tmpRepoDir}`,
-          { stdio: "pipe" },
-        );
-      } catch (cloneErr: any) {
-        addOrUpdateStep("sync", "Context Creation", "error", cloneErr.message);
-        activeJobs.set(taskId, {
-          status: "error",
-          error: `git clone failed: ${cloneErr.message}`,
-          history: [...history],
-        });
-        return;
+    const updateAgent = (agent: {
+      id: string; name: string; model: string; status: any; lastMsg?: string;
+    }) => {
+      const job = activeJobs.get(taskId);
+      if (job) {
+        const current = job.agents || [];
+        const idx = current.findIndex((a) => a.id === agent.id);
+        if (idx >= 0) current[idx] = { ...current[idx], ...agent };
+        else current.push(agent);
+        onStatus(job.statusText || "", undefined, undefined, undefined, undefined, undefined, [...current]);
       }
+    };
 
-      onStatus("Gathering repository metadata...", undefined, 20);
+    const questionsUsed = new Map<string, number>();
+    ["post_reviewer", "surgeon", "test_fixer"].forEach(
+      (r) => questionsUsed.set(r, 0),
+    );
+
+    // ── Load checkpoint (if any) ──────────────────────────────────
+    if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+    let ckpt: CheckpointData | null = loadCheckpoint(outDir, taskId, owner, repo, query);
+
+    if (ckpt) {
+      onStatus(`⏩ Resuming from checkpoint (last step: ${ckpt.completedSteps.at(-1) ?? "none"})...`);
+    }
+
+    // Accumulated step outputs (loaded from checkpoint or computed fresh)
+    let repoWorkDir: string = ckpt?.repoWorkDir ?? "";
+    let rootManifestContent: string = ckpt?.rootManifestContent ?? "";
+    let baselinePassed: string[] = ckpt?.baselinePassed ?? [];
+    let baselineFailed: string[] = ckpt?.baselineFailed ?? [];
+    let finalAnswer: string = ckpt?.finalAnswer ?? "";
+    let testSummary: string = ckpt?.testSummary ?? "";
+    let diffMarkdown: string = ckpt?.diffMarkdown ?? "";
+
+    // ─────────────────────────────────────────────────────────────
+    // STEP 1 — CLONE + INDEX
+    // ─────────────────────────────────────────────────────────────
+    if (!isStepComplete(ckpt, "sync")) {
+      addOrUpdateStep("sync", "Environment", "running");
+      onStatus("Initializing sandbox...", undefined, 3);
+      repoWorkDir = await cloneRepoForDiskWork(owner, repo, taskId);
+
+      onStatus("Indexing repository...", undefined, 8);
       const filesMetadata: any[] = [];
-
       const walkRepo = (dir: string) => {
-        let entries: string[];
-        try {
-          entries = fs.readdirSync(dir);
-        } catch {
-          return;
-        }
-        for (const entry of entries) {
-          const fullPath = path.join(dir, entry);
-          let stat: fs.Stats;
-          try {
-            stat = fs.statSync(fullPath);
-          } catch {
-            continue;
-          }
-          if (stat.isDirectory()) {
-            walkRepo(fullPath);
-            continue;
-          }
-          const relPath = path.relative(tmpRepoDir, fullPath);
-
+        for (const entry of fs.readdirSync(dir)) {
+          if (entry === ".git" || entry === "node_modules") continue;
+          const full = path.join(dir, entry);
+          const stat = fs.statSync(full);
+          if (stat.isDirectory()) { walkRepo(full); continue; }
           filesMetadata.push({
-            path: relPath,
-            size: stat.size,
-            name: entry,
-            type: "file",
+            path: path.relative(repoWorkDir, full),
+            size: stat.size, name: entry, type: "file",
             ext: entry.split(".").pop() || "",
           });
         }
       };
-      walkRepo(tmpRepoDir);
+      walkRepo(repoWorkDir);
 
-      onStatus("Building master context...", undefined, 30);
-      const miniRepoContext = {
-        meta: { fullName: `${owner}/${repo}`, owner, name: repo },
-        stats: { extFrequency: {} },
-      };
+      await buildMasterContext(outDir, filesMetadata, {},
+        { meta: { fullName: `${owner}/${repo}`, owner, name: repo }, stats: { extFrequency: {} } },
+        query, undefined, true, {}, 2,
+        (msg, p) => onStatus(msg, undefined, Math.round(10 + p * 0.4)),
+      );
+      rootManifestContent = fs.readFileSync(path.join(outDir, "00_Root_Manifest.txt"), "utf-8");
+      addOrUpdateStep("sync", "Environment", "done", "Sandbox ready.");
 
-      await buildMasterContext(
-        outDir,
-        filesMetadata,
-        {}, // importGraph no longer needed for manifest
-        miniRepoContext,
-        query,
-        undefined,
-        true,
-        {},
-        2,
-        (msg, p) => onStatus(msg, undefined, Math.round(30 + p * 0.7)),
-      );
-      addOrUpdateStep(
-        "sync",
-        "Environment",
-        "done",
-        `Repository indexed successfully. ${filesMetadata.length} files analyzed.`,
-      );
-      fs.rmSync(tmpRepoDir, { recursive: true, force: true });
+      ckpt = saveCheckpoint(outDir, {
+        taskId, owner, repo, query,
+        completedSteps: [...(ckpt?.completedSteps ?? []), "sync"],
+        repoWorkDir, rootManifestContent,
+      });
+    } else {
+      addOrUpdateStep("sync", "Environment", "done", "✓ Restored from checkpoint.");
     }
 
-    const context = await getOrCreateContext();
-    if (!persistentPages.qwenCoder || persistentPages.qwenCoder.isClosed())
-      persistentPages.qwenCoder = await context.newPage();
-    if (
-      !persistentPages.qwenReviewer ||
-      persistentPages.qwenReviewer.isClosed()
-    )
-      persistentPages.qwenReviewer = await context.newPage();
-    if (
-      !persistentPages.qwenSynthesizer ||
-      persistentPages.qwenSynthesizer.isClosed()
-    )
-      persistentPages.qwenSynthesizer = await context.newPage();
+    // ─────────────────────────────────────────────────────────────
+    // STEP 2 — PRE-FLIGHT BASELINE
+    // ─────────────────────────────────────────────────────────────
+    if (!isStepComplete(ckpt, "preflight")) {
+      addOrUpdateStep("preflight", "Pre-flight Baseline", "running");
+      onStatus("Pre-flight — Installing dependencies...", undefined, 18);
+      await ensureDepsInstalled(repoWorkDir, (msg) => onStatus(msg));
 
-    const repoUrl = `https://github.com/${owner}/${repo}`;
-    const rootManifestContent = fs.readFileSync(manifestPath, "utf-8");
-    const dsBaseContextDir = path.join(outDir, "deepseek_context");
-    if (!fs.existsSync(dsBaseContextDir))
-      fs.mkdirSync(dsBaseContextDir, { recursive: true });
+      setLLMContext(taskId, "other");
+      onStatus("Pre-flight — Running baseline tests on unmodified repo...", undefined, 20);
+      const baseline = await runTestSuite(repoWorkDir, (msg) => onStatus(msg));
+      fs.writeFileSync(path.join(outDir, "baseline_test_result.json"), JSON.stringify(baseline, null, 2));
 
-    // --- PHASE 1: DIRECT IMPLEMENTATION (Coders decide context) ---
-    addOrUpdateStep("synthesis", "Synthesizer", "running");
+      baselinePassed = baseline.results.filter((r) => r.passed).map((r) => r.name);
+      baselineFailed = baseline.results.filter((r) => !r.passed).map((r) => r.name);
+      addOrUpdateStep("preflight", "Pre-flight Baseline", "done",
+        `${baselinePassed.length} passing, ${baselineFailed.length} pre-existing failures.\n${baseline.summary}`);
 
-    const finalAnswer = await runInitialSynthesis(
-      query,
-      owner,
-      repo,
-      defaultBranch,
-      outDir,
-      dsBaseContextDir, // Initially empty or just manifest
-      rootManifestContent,
-      context,
-      (msg) => onStatus(msg),
-      questionsUsed,
-    );
-    addOrUpdateStep(
-      "synthesis",
-      "Synthesizer",
-      "done",
-      "Draft implementation and synthesis complete.",
-    );
+      ckpt = saveCheckpoint(outDir, {
+        taskId, owner, repo, query,
+        completedSteps: [...(ckpt?.completedSteps ?? []), "preflight"],
+        repoWorkDir, rootManifestContent, baselinePassed, baselineFailed,
+      });
+    } else {
+      addOrUpdateStep("preflight", "Pre-flight Baseline", "done", "✓ Restored from checkpoint.");
+    }
 
-    addOrUpdateStep("execution", "Operator", "running");
+    // ─────────────────────────────────────────────────────────────
+    // STEP 3 — SURGERY + REVIEW LOOP
+    // OpenCode receives the raw task, investigates the repo itself,
+    // applies all changes, then Reviewer verifies via git diff.
+    // ─────────────────────────────────────────────────────────────
+    if (!isStepComplete(ckpt, "execution")) {
+      addOrUpdateStep("execution", "Autonomous Surgery", "running");
+      onStatus("Agent is investigating and fixing the repo...", undefined, 38);
+      
+      const agentPrompt = `
+### TASK
+${query}
 
-    const repoWorkDir = await cloneRepoForDiskWork(owner, repo);
-    writeOpencodeConfig(repoWorkDir);
+### INSTRUCTIONS
+1. Explore the repository to understand the code.
+2. Apply all necessary fixes using your tools (edit/write/bash).
+3. Verify your changes are correct.
+4. When finished, provide a summary of your work.
+`;
 
-    onStatus("Initializing OpenCode server (Port 3001)...");
-    const { ensureOpenCodeServer } = await import("@/lib/automation/opencode");
-    await ensureOpenCodeServer(3001, repoWorkDir);
+      await ensureOpenCodeServer(3001, repoWorkDir);
+      const result = await runAutonomousAgent(3001, repoWorkDir, agentPrompt);
+      
+      addOrUpdateStep("execution", "Autonomous Surgery", "done", result);
 
-    const flashResult = await runSurgeryPhase2(
-      owner,
-      repo,
-      repoWorkDir,
-      finalAnswer,
-      outDir,
-      (msg) => onStatus(msg),
-      questionsUsed,
-    );
-    addOrUpdateStep(
-      "execution",
-      "Operator",
-      "done",
-      "Changes applied to the repository workspace.",
-    );
+      ckpt = saveCheckpoint(outDir, {
+        taskId, owner, repo, query,
+        completedSteps: [...(ckpt?.completedSteps ?? []), "execution"],
+        repoWorkDir, rootManifestContent, baselinePassed, baselineFailed,
+      });
+    } else {
+      addOrUpdateStep("execution", "Surgery + Review Loop", "done", "✓ Restored from checkpoint.");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // STEP 5 — TEST SUITE
+    // ─────────────────────────────────────────────────────────────
+    if (!isStepComplete(ckpt, "testing")) {
+      addOrUpdateStep("testing", "Test Suite", "running");
+      onStatus("Running full test suite...", undefined, 62);
+      setLLMContext(taskId, "test_diag");
+
+      let testResult = await runTestSuite(repoWorkDir, (msg) => onStatus(msg));
+      fs.writeFileSync(path.join(outDir, "test_result_initial.json"), JSON.stringify(testResult, null, 2));
+
+      const regressions = testResult.results.filter(
+        (r) => !r.passed && baselinePassed.includes(r.name),
+      );
+
+      if (regressions.length > 0 || !testResult.allPassed) {
+        const failCount = testResult.results.filter((r) => !r.passed).length;
+        onStatus(`Tests: ${failCount} failure(s). Starting auto-fix loop...`, undefined, 70);
+        testResult = await runTestFixLoop(repoWorkDir, testResult, outDir, (msg) => onStatus(msg), updateAgent, 3);
+      }
+
+      testSummary = testResult.allPassed
+        ? `✓ All checks passed\n${testResult.summary}`
+        : `⚠️ ${testResult.results.filter((r) => !r.passed).length} check(s) still failing:\n${testResult.summary}\n\nAI Diagnosis:\n${testResult.aiDiagnosis || "N/A"}`;
+
+      addOrUpdateStep("testing", "Test Suite", testResult.allPassed ? "done" : "error", testSummary);
+
+      ckpt = saveCheckpoint(outDir, {
+        taskId, owner, repo, query,
+        completedSteps: [...(ckpt?.completedSteps ?? []), "testing"],
+        repoWorkDir, rootManifestContent, baselinePassed, baselineFailed, finalAnswer, testSummary,
+      }) as any;
+    } else {
+      addOrUpdateStep("testing", "Test Suite", "done", "✓ Restored from checkpoint.");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // STEP 6 — DIFF SUMMARY
+    // ─────────────────────────────────────────────────────────────
+    if (!isStepComplete(ckpt, "diff")) {
+      addOrUpdateStep("diff", "Diff Summary", "running");
+      onStatus("Generating diff summary...", undefined, 82);
+      const finalDiff = await getGitDiff(repoWorkDir);
+      diffMarkdown = buildDiffSummaryMarkdown(finalDiff);
+      fs.writeFileSync(path.join(outDir, "diff_summary.md"), diffMarkdown);
+      addOrUpdateStep("diff", "Diff Summary", "done",
+        `${finalDiff.filesChanged.length} files | +${finalDiff.additions} / -${finalDiff.deletions} lines`);
+
+      ckpt = saveCheckpoint(outDir, {
+        taskId, owner, repo, query,
+        completedSteps: [...(ckpt?.completedSteps ?? []), "diff"],
+        repoWorkDir, rootManifestContent, baselinePassed, baselineFailed,
+        finalAnswer, testSummary, diffMarkdown,
+      }) as any;
+    } else {
+      addOrUpdateStep("diff", "Diff Summary", "done", "✓ Restored from checkpoint.");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // STEP 7 — TOKEN REPORT
+    // ─────────────────────────────────────────────────────────────
+    const tokenStats = getTokenStats(taskId);
+    const tokenReport = formatTokenReport(tokenStats);
+    fs.writeFileSync(path.join(outDir, "token_report.md"), tokenReport);
+    addOrUpdateStep("tokens", "Token Report", "done",
+      `${tokenStats.calls} API calls | ~${tokenStats.totalTokens.toLocaleString()} tokens | ~$${tokenStats.estimatedCostUSD.toFixed(4)}`);
+
+    // ─────────────────────────────────────────────────────────────
+    // STEP 8 — COMMIT + CHANGELOG + PR  (or rollback)
+    // ─────────────────────────────────────────────────────────────
+    if (!isStepComplete(ckpt, "delivery")) {
+      addOrUpdateStep("delivery", "Commit + PR", "running");
+
+      const finalDiff = await getGitDiff(repoWorkDir);
+
+      // Rollback if regressions remain
+      const remainingRegressions = (await runTestSuite(repoWorkDir, () => {})).results.filter(
+        (r) => !r.passed && baselinePassed.includes(r.name),
+      );
+
+      if (remainingRegressions.length > 0) {
+        onStatus(`⚠️ ${remainingRegressions.length} regression(s) remain. Rolling back...`);
+        await rollbackChanges(repoWorkDir, (msg) => onStatus(msg));
+        addOrUpdateStep("delivery", "Commit + PR", "error",
+          `Rolled back — regressions in: ${remainingRegressions.map((r) => r.name).join(", ")}`);
+      } else if (finalDiff.filesChanged.length === 0) {
+        addOrUpdateStep("delivery", "Commit + PR", "error", "No files changed — nothing to commit.");
+      } else {
+        onStatus("Committing and creating PR...", undefined, 90);
+        const gitResult = await commitAndCreatePR(
+          owner, repo, repoWorkDir, query, finalDiff, (msg) => onStatus(msg),
+        );
+
+        // Update CHANGELOG
+        await appendChangelog(repoWorkDir, query, finalDiff, gitResult.prUrl, (msg) => onStatus(msg));
+
+        // Force-push again after changelog amend
+        if (gitResult.prUrl) {
+          const token = process.env.GITHUB_TOKEN || process.env.NEXT_PUBLIC_GITHUB_TOKEN;
+          if (token) {
+            try {
+              const { exec: execSync } = await import("child_process");
+              const { promisify } = await import("util");
+              const execP = promisify(execSync);
+              await execP(`git push origin ${gitResult.branchName} --force`, { cwd: repoWorkDir });
+            } catch { /* non-fatal */ }
+          }
+        }
+
+        addOrUpdateStep("delivery", "Commit + PR",
+          gitResult.prUrl ? "done" : "error",
+          gitResult.prUrl
+            ? `PR: ${gitResult.prUrl}\nBranch: ${gitResult.branchName}\nCommit: ${gitResult.commitSha.slice(0, 8)}`
+            : `Committed locally (${gitResult.commitSha.slice(0, 8)}) — no GITHUB_TOKEN for PR.`,
+        );
+      }
+
+      saveCheckpoint(outDir, {
+        taskId, owner, repo, query,
+        completedSteps: [...(ckpt?.completedSteps ?? []), "delivery"],
+        repoWorkDir, rootManifestContent, baselinePassed, baselineFailed,
+        finalAnswer, testSummary, diffMarkdown,
+      });
+    } else {
+      addOrUpdateStep("delivery", "Commit + PR", "done", "✓ Restored from checkpoint.");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // DONE — Persist final result and clean up
+    // ─────────────────────────────────────────────────────────────
+    clearCheckpoint(outDir);
+    clearJobStats(taskId);
+
+    const finalResult = [
+      diffMarkdown,
+      "",
+      "---",
+      "## Test Results",
+      testSummary,
+      "",
+      "---",
+      tokenReport,
+    ].join("\n");
 
     activeJobs.set(taskId, {
       status: "done",
-      result: flashResult,
-      answerSource: "reviewed",
+      result: finalResult,
+      answerSource: "solo",
       history: [...history],
     });
+
+    onStatus("✓ All done.", undefined, 100);
   } catch (err: any) {
-    console.error("[PROCESS-JOB] Error:", err);
+    console.error("[PROCESS-JOB] Fatal error:", err);
+    // Don't clear checkpoint on error — allow resume
     activeJobs.set(taskId, { status: "error", error: err.message });
   }
 }

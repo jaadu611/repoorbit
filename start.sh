@@ -21,6 +21,32 @@ if [ "$1" == "--cores" ]; then
   }
   trap stop_cores EXIT INT TERM
 
+  # Inject NVIDIA API key into OpenCode's auth store
+  OPENCODE_AUTH_DIR="$HOME/.config/opencode"
+  mkdir -p "$OPENCODE_AUTH_DIR"
+  # Load NVIDIA_API_KEY from .env or .env.local if not already in environment
+  if [ -z "$NVIDIA_API_KEY" ]; then
+    for f in ".env" ".env.local"; do
+      if [ -f "$(pwd)/$f" ]; then
+        # Parse key, strip quotes, and handle potential carriage returns
+        RAW_KEY=$(grep '^NVIDIA_API_KEY=' "$(pwd)/$f" | cut -d '=' -f2- | tr -d '\r')
+        # Strip leading/trailing double or single quotes
+        CLEAN_KEY=$(echo "$RAW_KEY" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+        if [ -n "$CLEAN_KEY" ]; then
+          export NVIDIA_API_KEY="$CLEAN_KEY"
+          break
+        fi
+      fi
+    done
+  fi
+
+  if [ -n "$NVIDIA_API_KEY" ]; then
+    echo "{\"nvidia\": \"$NVIDIA_API_KEY\"}" > "$OPENCODE_AUTH_DIR/auth.json"
+    printf " ${C_GREEN}[opencode]${C_NC} NVIDIA API key injected into auth.json\n"
+  else
+    printf " ${C_BLUE}[opencode]${C_NC} WARNING: NVIDIA_API_KEY not set — OpenCode surgery phase will fail\n"
+  fi
+
   opencode serve --port 3001 --hostname 127.0.0.1 > /dev/null 2>&1 &
   echo "$!" >> "$PID_FILE"
 
@@ -49,4 +75,4 @@ NEXT_CMD=${NEXT_CMD:-"next dev"}
 
 npx concurrently --kill-others-on-fail --names "opencode,next" --prefix-colors "cyan,green" \
   "bash $0 --cores" \
-  "bash -c \"$NEXT_CMD | grep -vE 'Next.js|Local:|Network:|Environments:|Starting|Ready in|^[[:space:]]*$' --line-buffered; exit 0\""
+  "bash -c \"$NEXT_CMD | grep -vE 'Next.js|Local:|Network:|Environments:|Starting|Ready in|GET /api/chat|/api/chat\\?taskId=|^[[:space:]]*$' --line-buffered; exit 0\""

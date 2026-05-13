@@ -275,6 +275,39 @@ const CombinedFilesView = ({ files }: { files: CombinedFile[] }) => {
   );
 };
 
+const AgentStatusGrid = ({ agents }: { agents: any[] }) => {
+  if (!agents || agents.length === 0) return null;
+  return (
+    <div className="grid grid-cols-3 gap-2 my-3">
+      {agents.map((agent) => (
+        <div
+          key={agent.id}
+          className="flex flex-col gap-1.5 p-2 rounded-lg bg-zinc-900/50 border border-zinc-800/50 animate-in fade-in zoom-in-95 duration-300"
+        >
+          <div className="flex items-center justify-between">
+            <span className="text-[9px] font-mono font-bold text-zinc-500 truncate max-w-[50px]">
+              {agent.name}
+            </span>
+            {agent.status === "thinking" || agent.status === "fetching" ? (
+              <Loader2 size={10} className="animate-spin text-blue-400" />
+            ) : agent.status === "done" ? (
+              <CheckCircle2 size={10} className="text-emerald-500" />
+            ) : (
+              <Circle size={10} className="text-zinc-700" />
+            )}
+          </div>
+          <div className="text-[8px] text-zinc-400 uppercase tracking-tighter truncate">
+            {agent.status}
+          </div>
+          <div className="text-[7px] text-zinc-600 font-mono truncate leading-tight italic">
+            {agent.lastMsg || "Waiting..."}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+};
+
 const AiChat = ({ repoData }: AiChatProps) => {
   const dummySteps: ChatStep[] = [];
 
@@ -287,6 +320,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
       streaming?: boolean;
       history?: ChatStep[];
       files?: CombinedFile[];
+      agents?: any[];
       isFinal?: boolean;
     }[]
   >([
@@ -415,6 +449,7 @@ const AiChat = ({ repoData }: AiChatProps) => {
                   content: job.partialResult ?? updated[lastIdx].content,
                   history: job.history ?? updated[lastIdx].history,
                   files: job.files ?? updated[lastIdx].files,
+                  agents: job.agents ?? updated[lastIdx].agents,
                   streaming: job.status !== "done" && job.status !== "error",
                 };
                 return updated;
@@ -556,6 +591,9 @@ const AiChat = ({ repoData }: AiChatProps) => {
                         )}
                         {msg.files && msg.files.length > 0 && (
                           <CombinedFilesView files={msg.files} />
+                        )}
+                        {msg.agents && msg.agents.length > 0 && (
+                          <AgentStatusGrid agents={msg.agents} />
                         )}
                         {msg.content !== "" && (
                           <MarkdownRenderer content={msg.content} />
