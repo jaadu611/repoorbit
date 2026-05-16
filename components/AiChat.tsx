@@ -1,699 +1,542 @@
-"use client";
-
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect } from "react";
 import {
-  Cpu,
-  Send,
-  Loader2,
-  Github,
-  Square,
-  Trash2,
-  CheckCircle2,
-  Circle,
-  Eye,
-  FileText,
+  Bot,
+  RefreshCw,
   ChevronDown,
-  ChevronUp,
-  Beaker,
-  Activity,
+  Play,
+  Pause,
+  FileText,
+  Trash2,
 } from "lucide-react";
 import { useSelectionStore } from "@/lib/core/store";
 import { FullRepoData } from "@/lib/core/types";
+import { SYSTEM_PROMPT } from "@/src/lib/core/prompt";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-interface AiChatProps {
-  repoData: FullRepoData;
+interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+  steps?: any[];
 }
 
+interface AiChatProps {
+  repoData?: FullRepoData;
+}
+
+// AiChat.tsx
+// AiChat.tsx
 const MarkdownRenderer = ({ content }: { content: string }) => (
   <ReactMarkdown
     remarkPlugins={[remarkGfm]}
     components={{
       p: ({ children }) => (
-        <div className="mb-3 last:mb-0 leading-relaxed text-zinc-300">
+        <div className="mb-2 last:mb-0 leading-relaxed text-[var(--color-antigravity-text-secondary)] text-[11px]">
           {children}
         </div>
       ),
       h1: ({ children }) => (
-        <h1 className="font-bold text-base text-zinc-100 mt-6 mb-2 border-b border-zinc-800 pb-2">
+        <h1 className="font-bold text-[13px] text-[var(--color-antigravity-text-primary)] mt-4 mb-2">
           {children}
         </h1>
       ),
       h2: ({ children }) => (
-        <h2 className="font-bold text-sm text-zinc-100 mt-5 mb-2 flex items-center gap-2">
-          <div className="w-1 h-4 bg-zinc-500 rounded-full" />
+        <h2 className="font-bold text-[11px] text-[var(--color-antigravity-text-primary)] mt-4 mb-1 opacity-90">
           {children}
         </h2>
       ),
-      h3: ({ children }) => (
-        <h3 className="font-semibold text-[13px] text-zinc-200 mt-4 mb-1.5">
-          {children}
-        </h3>
-      ),
       ul: ({ children }) => (
-        <ul className="list-disc list-outside space-y-1.5 mb-4 ml-4 text-zinc-400">
+        <ul className="list-disc list-outside space-y-1 mb-3 ml-4 text-[var(--color-antigravity-text-secondary)] text-[11px]">
           {children}
         </ul>
       ),
-      ol: ({ children }) => (
-        <ol className="list-decimal list-outside space-y-1.5 mb-4 ml-4 text-zinc-400">
-          {children}
-        </ol>
-      ),
-      li: ({ children }) => <li className="pl-1">{children}</li>,
-      table: ({ children }) => (
-        <div className="my-4 overflow-x-auto rounded-lg border border-zinc-800">
-          <table className="w-full text-left border-collapse text-[11px]">
-            {children}
-          </table>
-        </div>
-      ),
-      thead: ({ children }) => (
-        <thead className="bg-zinc-800/50 text-zinc-200 font-bold">
-          {children}
-        </thead>
-      ),
-      th: ({ children }) => (
-        <th className="p-2 border-b border-zinc-700">{children}</th>
-      ),
-      td: ({ children }) => (
-        <td className="p-2 border-b border-zinc-800 text-zinc-400">
-          {children}
-        </td>
-      ),
       code: ({ inline, className, children }: any) => {
         const match = /language-(\w+)/.exec(className || "");
-        const lang = match ? match[1] : "";
+        const lang = match ? match[1] : "text";
+        const content = String(children).replace(/\n$/, "");
+        const isLong = content.includes("\n") || content.length > 40;
 
-        return inline ? (
-          <code className="bg-zinc-800/50 text-zinc-300 px-1.5 py-0.5 rounded text-[11px] font-mono border border-zinc-700/30">
-            {children}
-          </code>
-        ) : (
-          <div className="group relative my-3">
-            {lang && (
-              <div className="absolute right-3 top-2 text-[9px] font-mono text-zinc-500 uppercase tracking-widest opacity-0 group-hover:opacity-100 transition-opacity">
+        if (inline || !isLong) {
+          return (
+            <code className="bg-white/5 text-[var(--color-antigravity-accent)] px-1.5 py-0.5 rounded text-[10px] font-mono border border-white/5 inline-block my-0.5 align-middle opacity-90">
+              {content}
+            </code>
+          );
+        }
+
+        return (
+          <div className="my-4 group/code relative rounded-lg border border-[var(--color-antigravity-border)] bg-[var(--color-antigravity-code-bg)] overflow-hidden shadow-2xl">
+            {/* Code Header */}
+            <div className="flex items-center justify-between px-3 py-1.5 bg-white/5 border-b border-[var(--color-antigravity-border)] select-none">
+              <span className="text-[9px] font-bold text-zinc-500 uppercase tracking-widest">
                 {lang}
-              </div>
-            )}
-            <pre className="bg-[#0d1117] border border-zinc-800 rounded-lg p-4 overflow-x-auto shadow-inner">
-              <code className="text-[11px] text-zinc-100/90 whitespace-pre font-mono leading-relaxed">
+              </span>
+              <button
+                onClick={() => navigator.clipboard.writeText(content)}
+                className="p-1 hover:bg-white/10 rounded transition-colors text-zinc-500 hover:text-zinc-300"
+                title="Copy code"
+              >
+                <svg
+                  className="w-3 h-3"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"
+                  />
+                </svg>
+              </button>
+            </div>
+            <pre className="p-4 overflow-x-auto bg-[var(--color-antigravity-code-bg)]">
+              <code className="text-[10px] text-[var(--color-antigravity-text-primary)] opacity-80 whitespace-pre font-mono leading-relaxed bg-transparent p-0 block">
                 {children}
               </code>
             </pre>
           </div>
         );
       },
-      strong: ({ children }) => (
-        <strong className="text-zinc-100 font-bold">{children}</strong>
-      ),
-      em: ({ children }) => (
-        <em className="text-zinc-200 italic font-medium">{children}</em>
-      ),
-      blockquote: ({ children }) => (
-        <blockquote className="border-l-4 border-zinc-500/30 bg-zinc-500/5 px-4 py-2 my-4 text-zinc-400 italic rounded-r-lg">
-          {children}
-        </blockquote>
-      ),
-      a: ({ href, children }) => (
-        <a
-          href={href}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-zinc-400 hover:text-zinc-300 underline underline-offset-4 decoration-zinc-500/30 transition-colors"
-        >
-          {children}
-        </a>
-      ),
-      hr: () => <hr className="border-zinc-800 my-6" />,
     }}
   >
     {content}
   </ReactMarkdown>
 );
 
-import { ChatStep, CombinedFile } from "@/lib/core/types";
-
-const HistoryToggle = ({
-  steps,
-  files,
-}: {
-  steps: ChatStep[];
-  files: CombinedFile[];
-}) => {
-  const [isOpen, setIsOpen] = useState(false);
-  return (
-    <div className="flex flex-col w-full">
-      {(steps.length > 0 || files.length > 0) && (
-        <button
-          onClick={() => setIsOpen(!isOpen)}
-          className="flex items-center gap-1.5 text-[9px] font-bold text-zinc-500 uppercase tracking-widest hover:text-zinc-300 transition-colors py-1 group"
-        >
-          <span className="text-[10px] text-zinc-700">
-            {isOpen ? "[-]" : "[+]"}
-          </span>
-          History
-        </button>
-      )}
-      {isOpen && (steps.length > 0 || files.length > 0) && (
-        <div className="border-l border-zinc-800 ml-1.5 pl-3 mb-2 animate-in fade-in slide-in-from-top-1 duration-200">
-          <StepHistory steps={steps} />
-          <CombinedFilesView files={files} />
-        </div>
-      )}
-    </div>
-  );
-};
-
-const StepHistory = ({ steps }: { steps: ChatStep[] }) => {
-  const [expandedStep, setExpandedStep] = useState<string | null>(null);
-
-  const filtteredSteps = steps.filter(
-    (s) => s.status === "done" || s.status === "error",
-  );
-
-  if (filtteredSteps.length > 0) {
-    return (
-      <div className="space-y-0.5 my-1 pt-1 w-full">
-        <div className="space-y-0.5 pl-1">
-          {filtteredSteps.map((step) => (
-            <div key={step.id} className="flex flex-col">
-              <div className="flex items-center justify-between py-0.5 group">
-                <div className="flex items-center gap-2 overflow-hidden flex-1">
-                  <span className="text-[10px] font-mono truncate text-zinc-500">
-                    {step.label}
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  {step.output && (
-                    <button
-                      onClick={() =>
-                        setExpandedStep(
-                          expandedStep === step.id ? null : step.id,
-                        )
-                      }
-                      className="text-zinc-600 hover:text-zinc-400 transition-colors"
-                    >
-                      {expandedStep === step.id ? (
-                        <ChevronUp size={10} />
-                      ) : (
-                        <ChevronDown size={10} />
-                      )}
-                    </button>
-                  )}
-                </div>
-              </div>
-              {expandedStep === step.id && step.output && (
-                <div className="py-1 px-1 mb-1 w-full animate-in fade-in zoom-in-95 duration-200">
-                  <pre className="text-[9px] text-zinc-200 font-mono whitespace-pre-wrap overflow-x-auto max-h-[200px] pl-2 border-l border-zinc-800">
-                    {step.output}
-                  </pre>
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-      </div>
-    );
-  } else return null;
-};
-
-const CombinedFilesView = ({ files }: { files: CombinedFile[] }) => {
-  const [expandedFile, setExpandedFile] = useState<string | null>(null);
-
-  return (
-    <div className="mt-2 pt-1 w-full">
-      <div className="text-[9px] font-bold text-zinc-500 uppercase tracking-wider mb-1.5 px-1">
-        Modified
-      </div>
-      <div className="space-y-0.5">
-        {files.map((file) => (
-          <div key={file.path} className="flex flex-col">
-            <button
-              onClick={() =>
-                setExpandedFile(expandedFile === file.path ? null : file.path)
-              }
-              className="flex items-center justify-between py-0.5 group pl-1"
-            >
-              <div className="flex items-center gap-2 overflow-hidden">
-                <span className="text-[10px] font-mono text-zinc-400 truncate">
-                  {file.path.split("/").pop()}
-                </span>
-                <span className="text-[8px] text-zinc-600 font-mono uppercase tracking-tighter">
-                  [{file.status}]
-                </span>
-              </div>
-              <span className="text-[9px] text-zinc-700 font-mono group-hover:text-zinc-500">
-                {expandedFile === file.path ? "[-]" : "[+]"}
-              </span>
-            </button>
-            {expandedFile === file.path && (
-              <div className="ml-1 pl-2 mb-1 w-full">
-                <div className="py-1">
-                  <div className="text-[8px] text-zinc-400 font-mono mb-0.5 uppercase tracking-widest italic">
-                    Proposed
-                  </div>
-                  <pre className="text-[9px] text-zinc-100 font-mono whitespace-pre overflow-x-auto max-h-[150px]">
-                    {file.coderContent || "// No content"}
-                  </pre>
-                </div>
-                <div className="py-1 border-t border-zinc-800/20">
-                  <div className="text-[8px] text-zinc-400 font-mono mb-0.5 uppercase tracking-widest italic">
-                    Feedback
-                  </div>
-                  <div className="text-[9px] text-zinc-300 font-sans italic leading-tight">
-                    {file.reviewerFeedback || "none"}
-                  </div>
-                </div>
-              </div>
-            )}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-};
-
-const AgentStatusGrid = ({ agents }: { agents: any[] }) => {
-  if (!agents || agents.length === 0) return null;
-  return (
-    <div className="grid grid-cols-3 gap-2 my-3">
-      {agents.map((agent) => (
-        <div
-          key={agent.id}
-          className="flex flex-col gap-1.5 p-2 rounded-lg bg-zinc-900/50 border border-zinc-800/50 animate-in fade-in zoom-in-95 duration-300"
-        >
-          <div className="flex items-center justify-between">
-            <span className="text-[9px] font-mono font-bold text-zinc-500 truncate max-w-[50px]">
-              {agent.name}
-            </span>
-            {agent.status === "thinking" || agent.status === "fetching" ? (
-              <Loader2 size={10} className="animate-spin text-blue-400" />
-            ) : agent.status === "done" ? (
-              <CheckCircle2 size={10} className="text-emerald-500" />
-            ) : (
-              <Circle size={10} className="text-zinc-700" />
-            )}
-          </div>
-          <div className="text-[8px] text-zinc-400 uppercase tracking-tighter truncate">
-            {agent.status}
-          </div>
-          <div className="text-[7px] text-zinc-600 font-mono truncate leading-tight italic">
-            {agent.lastMsg || "Waiting..."}
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-};
-
 const AiChat = ({ repoData }: AiChatProps) => {
-  const dummySteps: ChatStep[] = [];
-
-  const dummyFiles: CombinedFile[] = [];
-
-  const [messages, setMessages] = useState<
-    {
-      role: string;
-      content: string;
-      streaming?: boolean;
-      history?: ChatStep[];
-      files?: CombinedFile[];
-      agents?: any[];
-      isFinal?: boolean;
-    }[]
-  >([
-    // Empty initially per user request
-  ]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [currentStatus, setCurrentStatus] = useState<string | null>(null);
-  const [progress, setProgress] = useState<number | null>(null);
-  const [logs, setLogs] = useState<string | null>(null);
-  const [showLogs, setShowLogs] = useState(false);
-  const abortControllerRef = useRef<AbortController | null>(null);
-  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
 
+  const [availableModels, setAvailableModels] = useState<
+    {
+      id: string;
+      name: string;
+      vendor?: string;
+      quota?: string | number;
+      resetTime?: string;
+    }[]
+  >([]);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isFallback, setIsFallback] = useState(false);
+
+  const [exhaustedModels, setExhaustedModels] = useState<Set<string>>(
+    new Set(),
+  );
+  const [config, setConfig] = useState({
+    model: "MODEL_PLACEHOLDER_M84",
+  });
+
+  const [loadedQueries, setLoadedQueries] = useState<string[]>([]);
+  const [currentQueryIndex, setCurrentQueryIndex] = useState<number>(-1);
+  const [isPlaying, setIsPlaying] = useState<boolean>(false);
+  const [queriesFileExists, setQueriesFileExists] = useState<boolean>(false);
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { repoContext: repoCtx } = useSelectionStore((s) => s.selection);
-  const setRepoContext = useSelectionStore((s) => s.setRepoContext);
+
+  // Trigger next query in automated execution list
+  useEffect(() => {
+    if (!isPlaying || isLoading) return;
+
+    // Previous query has finished (isLoading became false)
+    // Check if there are more queries to run
+    const nextIndex = currentQueryIndex + 1;
+    if (nextIndex < loadedQueries.length) {
+      const timer = setTimeout(() => {
+        const query = loadedQueries[nextIndex];
+        const combinedQuery = `${SYSTEM_PROMPT}\n\n${query}`;
+
+        setMessages((prev) => [
+          ...prev,
+          { role: "user", content: query },
+          { role: "assistant", content: "" },
+        ]);
+        setIsLoading(true);
+        setCurrentQueryIndex(nextIndex);
+
+        const vscodeApi = (window as any).vscode;
+        if (vscodeApi) {
+          vscodeApi.postMessage({
+            command: "chat",
+            query: combinedQuery,
+            repoContext: repoCtx ?? repoData?.repoContext,
+            config,
+          });
+        }
+      }, 800); // 800ms delay between queries for visual flow
+
+      return () => clearTimeout(timer);
+    } else {
+      // All queries processed!
+      setIsPlaying(false);
+    }
+  }, [
+    isPlaying,
+    isLoading,
+    currentQueryIndex,
+    loadedQueries,
+    repoCtx,
+    repoData,
+    config,
+  ]);
+
+  const handleCreateQueriesFile = () => {
+    const vscodeApi = (window as any).vscode;
+    if (vscodeApi) {
+      vscodeApi.postMessage({ command: "createQueriesFile" });
+    }
+  };
 
   useEffect(() => {
-    if (repoData.repoContext) setRepoContext(repoData.repoContext);
-  }, [repoData.repoContext, setRepoContext]);
+    const vscodeApi = (window as any).vscode;
+    if (vscodeApi) {
+      vscodeApi.postMessage({ command: "readQueriesFile" });
+      const timer = setInterval(() => {
+        vscodeApi.postMessage({ command: "readQueriesFile" });
+      }, 3000);
+      return () => clearInterval(timer);
+    }
+  }, []);
+
+  const handlePlayPause = () => {
+    if (loadedQueries.length === 0) return;
+
+    if (isPlaying) {
+      setIsPlaying(false);
+    } else {
+      let startIndex = currentQueryIndex + 1;
+      if (startIndex >= loadedQueries.length || startIndex < 0) {
+        startIndex = 0;
+      }
+
+      setIsPlaying(true);
+
+      const query = loadedQueries[startIndex];
+      const combinedQuery = `${SYSTEM_PROMPT}\n\n${query}`;
+
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content: query },
+        { role: "assistant", content: "" },
+      ]);
+      setIsLoading(true);
+      setCurrentQueryIndex(startIndex);
+
+      const vscodeApi = (window as any).vscode;
+      if (vscodeApi) {
+        vscodeApi.postMessage({
+          command: "chat",
+          query: combinedQuery,
+          repoContext: repoCtx ?? repoData?.repoContext,
+          config,
+        });
+      }
+    }
+  };
+
+  const handleClearChat = () => {
+    setMessages([]);
+    setIsPlaying(false);
+    setCurrentQueryIndex(-1);
+    setIsLoading(false);
+  };
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const stopAll = useCallback(() => {
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current);
-      pollIntervalRef.current = null;
+  useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "auto";
+      textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 200)}px`;
     }
-    abortControllerRef.current?.abort();
-    abortControllerRef.current = null;
-    setIsLoading(false);
-    setCurrentStatus(null);
-    setProgress(null);
-    setMessages((prev) =>
-      prev.map((m, i) =>
-        i === prev.length - 1 && m.streaming ? { ...m, streaming: false } : m,
-      ),
-    );
-  }, []);
+  }, [input]);
 
-  const handleSend = useCallback(
-    async (e?: React.FormEvent) => {
-      e?.preventDefault();
-      const userMessage = input.trim();
-      if (!userMessage || isLoading) return;
-
-      setInput("");
-      setMessages((prev) => [
-        ...prev,
-        { role: "user", content: userMessage },
-        { role: "assistant", content: "", streaming: true },
-      ]);
-      setIsLoading(true);
-      setCurrentStatus("Init Architect Engine...");
-      setProgress(null);
-
-      setMessages((prev) => {
-        const updated = [...prev];
-        updated[updated.length - 1] = {
-          ...updated[updated.length - 1],
-          history: [],
-          files: [],
-        };
-        return updated;
-      });
-
-      const controller = new AbortController();
-      abortControllerRef.current = controller;
-
-      try {
-        const startResponse = await fetch("/api/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            query: userMessage,
-            repoContext: repoCtx ?? repoData.repoContext,
-            owner: repoData.metadata.owner,
-            repo: repoData.metadata.name,
-            tree: repoData.tree,
-            defaultBranch: repoData.metadata.defaultBranch,
-          }),
-          signal: controller.signal,
-        });
-
-        if (!startResponse.ok) {
-          const data = await startResponse.json();
-          throw new Error(data.error || "API error");
-        }
-
-        const { taskId } = await startResponse.json();
-
-        pollIntervalRef.current = setInterval(async () => {
-          if (controller.signal.aborted) {
-            clearInterval(pollIntervalRef.current!);
-            pollIntervalRef.current = null;
-            return;
-          }
-
-          try {
-            const pollResponse = await fetch(`/api/chat?taskId=${taskId}`, {
-              signal: controller.signal,
-            });
-            const job = await pollResponse.json();
-
-            if (job.statusText) {
-              setCurrentStatus(job.statusText);
-            }
-            if (job.progress !== undefined) {
-              setProgress(job.progress);
-            } else {
-              setProgress(null);
-            }
-            if (job.logs) {
-              setLogs(job.logs);
-            }
-
-            if (job.partialResult || job.history || job.files) {
-              setMessages((prev) => {
-                const updated = [...prev];
-                const lastIdx = updated.length - 1;
-                updated[lastIdx] = {
-                  ...updated[lastIdx],
-                  content: job.partialResult ?? updated[lastIdx].content,
-                  history: job.history ?? updated[lastIdx].history,
-                  files: job.files ?? updated[lastIdx].files,
-                  agents: job.agents ?? updated[lastIdx].agents,
-                  streaming: job.status !== "done" && job.status !== "error",
-                };
-                return updated;
-              });
-            }
-
-            if (job.status === "done") {
-              clearInterval(pollIntervalRef.current!);
-              pollIntervalRef.current = null;
-              abortControllerRef.current = null;
-              setMessages((prev) => {
-                const updated = [...prev];
-                const lastIdx = updated.length - 1;
-                updated[lastIdx] = {
-                  ...updated[lastIdx],
-                  role: "assistant",
-                  content: job.result,
-                  streaming: false,
-                  isFinal: true,
-                  history: job.history ?? updated[lastIdx].history,
-                  files: job.files ?? updated[lastIdx].files,
-                };
-                return updated;
-              });
-              setIsLoading(false);
-              setCurrentStatus(null);
-              setProgress(null);
-              setLogs(null);
-            } else if (job.status === "error") {
-              clearInterval(pollIntervalRef.current!);
-              pollIntervalRef.current = null;
-              abortControllerRef.current = null;
-              setMessages((prev) => {
-                const updated = [...prev];
-                updated[updated.length - 1] = {
-                  role: "assistant",
-                  content: `**Error:** ${job.error || "Generation failed"}`,
-                  streaming: false,
-                };
-                return updated;
-              });
-              setIsLoading(false);
-              setCurrentStatus(null);
-              setProgress(null);
-              setLogs(null);
-            }
-          } catch (pollErr: any) {
-            if (pollErr.name !== "AbortError") {
-              console.error("Polling error:", pollErr);
-              clearInterval(pollIntervalRef.current!);
-              pollIntervalRef.current = null;
-              abortControllerRef.current = null;
-              setIsLoading(false);
-              setCurrentStatus(null);
-              setProgress(null);
-            }
-          }
-        }, 1000);
-      } catch (err: any) {
-        if (err?.name !== "AbortError") {
-          abortControllerRef.current = null;
-          setMessages((prev) => {
-            const updated = [...prev];
-            updated[updated.length - 1] = {
-              role: "assistant",
-              content: `**Error:** ${err.message}`,
-              streaming: false,
-            };
-            return updated;
-          });
-          setIsLoading(false);
-          setCurrentStatus(null);
-          setProgress(null);
-        }
-      }
-    },
-    [input, isLoading, repoCtx, repoData, stopAll],
-  );
-
-  const handleStop = () => stopAll();
-  const handleClear = () => {
-    if (isLoading) handleStop();
-    setMessages([]);
+  const refreshModels = () => {
+    const vscodeApi = (window as any).vscode;
+    if (vscodeApi) {
+      setIsRefreshing(true);
+      vscodeApi.postMessage({ command: "getModels" });
+      // Reset timeout
+      setTimeout(() => setIsRefreshing(false), 3000);
+    }
   };
 
-  const repoName = repoCtx?.meta.name ?? repoData.metadata.name;
+  // Handle incoming messages from the VS Code host
+  useEffect(() => {
+    const handler = (event: MessageEvent) => {
+      const message = event.data;
+      if (
+        message.command === "chatResponse" ||
+        message.command === "chatStream"
+      ) {
+        setMessages((prev) => {
+          const lastMsg = prev[prev.length - 1];
+          if (lastMsg && lastMsg.role === "assistant") {
+            return [
+              ...prev.slice(0, -1),
+              {
+                role: "assistant",
+                content: message.text,
+                steps: message.steps,
+              },
+            ];
+          }
+          return [
+            ...prev,
+            { role: "assistant", content: message.text, steps: message.steps },
+          ];
+        });
+        if (message.command === "chatResponse") {
+          setIsLoading(false);
+        }
+      } else if (message.command === "chatError") {
+        setMessages((prev) => {
+          const lastMsg = prev[prev.length - 1];
+          if (
+            lastMsg &&
+            lastMsg.role === "assistant" &&
+            lastMsg.content === ""
+          ) {
+            return [
+              ...prev.slice(0, -1),
+              { role: "assistant", content: `**Error:** ${message.text}` },
+            ];
+          }
+          return [
+            ...prev,
+            { role: "assistant", content: `**Error:** ${message.text}` },
+          ];
+        });
+        if (
+          message.text.toLowerCase().includes("exhausted") ||
+          message.text.toLowerCase().includes("quota")
+        ) {
+          setExhaustedModels((prev) => new Set(prev).add(config.model));
+        }
+        setIsLoading(false);
+      } else if (message.command === "setModels") {
+        const models = message.models || [];
+        setAvailableModels(models);
+        setIsRefreshing(false);
+        setIsFallback(!!message.isFallback);
+
+        if (models.length > 0) {
+          setConfig((prev) => {
+            const currentExists = models.some((m: any) => m.id === prev.model);
+            if (
+              !prev.model ||
+              !currentExists ||
+              prev.model === "MODEL_PLACEHOLDER_M84"
+            ) {
+              const geminiFlash = models.find(
+                (m: any) =>
+                  m.id === "MODEL_PLACEHOLDER_M84" ||
+                  m.name.toLowerCase().includes("flash"),
+              );
+              return { ...prev, model: geminiFlash?.id || models[0].id };
+            }
+            return prev;
+          });
+        }
+      } else if (message.command === "queriesFileResponse") {
+        setQueriesFileExists(message.exists);
+        setLoadedQueries(message.queries || []);
+      }
+    };
+
+    window.addEventListener("message", handler);
+    refreshModels();
+
+    return () => window.removeEventListener("message", handler);
+  }, [config.model]);
 
   return (
-    <div className="w-[300px] shrink-0 flex flex-col bg-gray-900 border border-gray-700 rounded-xl overflow-hidden h-full shadow-2xl">
-      <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between bg-gray-950/50">
-        <div className="flex items-center gap-1.5">
-          <Cpu size={12} className="text-zinc-500" />
-          <span className="text-[11px] font-mono font-bold text-gray-400 uppercase tracking-widest pt-0.5">
-            AI Agent
-          </span>
-        </div>
-        <span className="flex items-center gap-1 text-[11px] font-mono text-zinc-400 truncate max-w-[180px] border border-gray-700 py-0.5 px-2 rounded-full">
-          <Github size={11} className="shrink-0 text-purple-400" />
-          {repoName}
-        </span>
-      </div>
-
-      <div className="flex-1 overflow-y-auto p-3 space-y-3">
-        {messages.length === 0 && (
-          <p className="text-xs font-mono text-zinc-600 text-center mt-6 leading-relaxed">
-            Ask anything about this repo.
-          </p>
-        )}
-
-        {messages.map((msg, i) => (
-          <div
-            key={i}
-            className={`flex flex-col w-full ${msg.role === "user" ? "items-end" : "items-start"}`}
-          >
-            <div
-              className={`w-full py-1 text-xs leading-relaxed overflow-auto ${
-                msg.role === "user"
-                  ? "bg-blue-600/10 border border-blue-500/20 text-blue-100 whitespace-pre-wrap p-2 rounded-lg ml-auto max-w-[90%]"
-                  : "text-zinc-400"
-              }`}
-            >
-              {msg.role === "assistant" ? (
-                <div className="flex flex-col gap-1">
-                  <div className="flex flex-col">
-                    {msg.isFinal ? (
-                      <>
-                        <HistoryToggle
-                          steps={msg.history || []}
-                          files={msg.files || []}
-                        />
-                        {msg.content !== "" && (
-                          <MarkdownRenderer content={msg.content} />
-                        )}
-                      </>
-                    ) : (
-                      <>
-                        {msg.history && msg.history.length > 0 && (
-                          <StepHistory steps={msg.history} />
-                        )}
-                        {msg.files && msg.files.length > 0 && (
-                          <CombinedFilesView files={msg.files} />
-                        )}
-                        {msg.agents && msg.agents.length > 0 && (
-                          <AgentStatusGrid agents={msg.agents} />
-                        )}
-                        {msg.content !== "" && (
-                          <MarkdownRenderer content={msg.content} />
-                        )}
-
-                        {msg.streaming && (
-                          <div className="flex flex-col gap-1.5 mt-1 pt-1.5">
-                            <div className="flex items-center gap-1.5 text-zinc-500">
-                              <Loader2
-                                size={10}
-                                className="animate-spin text-zinc-500 shrink-0"
-                              />
-                              <span className="text-[11px] animate-pulse truncate text-zinc-400">
-                                {currentStatus ||
-                                  (msg.content === ""
-                                    ? "Initializing..."
-                                    : "Generating...")}
-                              </span>
-                            </div>
-                            {progress !== null && (
-                              <div className="h-1 w-full bg-zinc-800 rounded-full overflow-hidden">
-                                <div
-                                  className="h-full bg-zinc-500 transition-all duration-300 ease-out"
-                                  style={{ width: `${progress}%` }}
-                                />
-                              </div>
-                            )}
-                            {logs && (
-                              <div className="mt-1">
-                                <button
-                                  onClick={() => setShowLogs(!showLogs)}
-                                  className="text-[9px] text-zinc-600 hover:text-zinc-400 uppercase font-bold tracking-tighter"
-                                >
-                                  {showLogs ? "Hide Logs" : "Show Logs"}
-                                </button>
-                                {showLogs && (
-                                  <pre className="mt-1 p-2 bg-black/40 rounded border border-zinc-800/50 text-[9px] text-zinc-500 font-mono overflow-x-auto max-h-[150px] whitespace-pre-wrap">
-                                    {logs}
-                                  </pre>
-                                )}
-                              </div>
-                            )}
-                          </div>
-                        )}
-                      </>
-                    )}
-                  </div>
-                </div>
-              ) : (
-                msg.content
-              )}
+    <div className="w-full flex flex-col bg-[var(--color-antigravity-bg)] h-full overflow-hidden">
+      {/* Top Part: Only bottom border, no side/top borders as main wrapper handled it */}
+      <div className="flex-none bg-[var(--color-antigravity-panel)]/40 border-b border-[var(--color-antigravity-border)] relative z-10">
+        <div className="px-3 h-[35px] flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="relative group w-fit">
+              <select
+                value={config.model}
+                onChange={(e) =>
+                  setConfig({ ...config, model: e.target.value })
+                }
+                className="w-full min-w-[90px] max-w-[180px] bg-white/[0.03] border border-[var(--color-antigravity-border)] rounded-md px-2.5 pr-7 h-6 text-[10px] font-medium tracking-tight text-[var(--color-antigravity-text-secondary)] outline-none focus:border-[var(--color-antigravity-accent)]/50 appearance-none cursor-pointer transition-all hover:bg-white/[0.06] hover:text-[var(--color-antigravity-text-primary)] disabled:opacity-50 truncate"
+                disabled={availableModels.length === 0}
+              >
+                {availableModels.length === 0 ? (
+                  <option disabled>Engines offline...</option>
+                ) : (
+                  availableModels.map((model) => {
+                    const formatQuota = (q: any) => {
+                      const num = Number(q);
+                      if (!isNaN(num)) return ` (${(num * 100).toFixed(0)}%)`;
+                      return "";
+                    };
+                    return (
+                      <option
+                        key={model.id}
+                        value={model.id}
+                        className="bg-zinc-900 text-zinc-300"
+                      >
+                        {model.name}
+                        {formatQuota(model.quota)}
+                      </option>
+                    );
+                  })
+                )}
+              </select>
+              <div className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none opacity-30 group-hover:opacity-60 transition-opacity">
+                <ChevronDown size={10} />
+              </div>
             </div>
           </div>
-        ))}
 
-        <div ref={messagesEndRef} />
+          <div className="flex items-center gap-0.5 shrink-0">
+            <button
+              onClick={handleClearChat}
+              className="p-1.5 rounded-md text-[var(--color-antigravity-text-secondary)] hover:text-[var(--color-antigravity-text-primary)] hover:bg-white/[0.05] transition-all"
+              title="Clear Chat History"
+            >
+              <Trash2 size={12} />
+            </button>
+          </div>
+        </div>
       </div>
 
-      <form
-        onSubmit={handleSend}
-        className="p-2.5 bg-gray-950 border-t border-gray-700 flex items-center gap-2"
-      >
-        {messages.length > 0 && !isLoading && (
-          <button
-            type="button"
-            onClick={handleClear}
-            title="Clear chat"
-            className="shrink-0 w-8 h-8 flex items-center justify-center text-gray-600 hover:text-red-400 border border-gray-800 rounded-lg hover:bg-red-400/5 transition-all"
-          >
-            <Trash2 size={14} />
-          </button>
+      <div className="flex-1 overflow-y-auto custom-scrollbar bg-[var(--color-antigravity-bg)]/30">
+        {messages.length === 0 && (
+          <div className="flex flex-col items-center justify-center h-full opacity-[0.03] select-none pointer-events-none">
+            <Bot size={56} strokeWidth={0.5} />
+            <p className="text-[9px] font-mono mt-4 tracking-[0.5em] uppercase">
+              Neural Link Ready
+            </p>
+          </div>
         )}
-        <div className="relative flex-1">
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            disabled={isLoading}
-            placeholder={isLoading ? "Generating..." : "Ask about this repo..."}
-            className="w-full bg-gray-950 border border-gray-700 text-xs font-mono text-zinc-300 pl-3 pr-8 py-2.5 rounded-lg outline-none focus:border-zinc-500/40 transition-all disabled:opacity-50"
-          />
-          {isLoading ? (
-            <button
-              type="button"
-              onClick={handleStop}
-              title="Stop"
-              className="absolute right-2.5 top-3.5 text-red-400 hover:text-red-300 transition-colors"
+
+        <div className="flex flex-col">
+          {messages.map((msg, i) => (
+            <div
+              key={i}
+              className={`border-b border-white/[0.02] transition-colors duration-500 ${msg.role === "user" ? "bg-white/[0.015]" : "bg-transparent hover:bg-white/[0.005]"}`}
             >
-              <Square size={12} className="fill-current" />
-            </button>
-          ) : (
-            <button
-              type="submit"
-              disabled={!input.trim()}
-              className="absolute right-2.5 top-3.5 text-gray-500 hover:text-zinc-400 disabled:hover:text-gray-500 disabled:opacity-30 transition-colors"
-            >
-              <Send size={12} />
-            </button>
-          )}
+              <div className="px-4 py-3.5 max-w-full">
+                <div className="text-[11.5px] text-[var(--color-antigravity-text-primary)]/90 leading-[1.6] font-normal selection:bg-[var(--color-antigravity-accent)]/20">
+                  {msg.role === "assistant" &&
+                  (!msg.content || (isLoading && i === messages.length - 1)) ? (
+                    <div className="py-2 px-3 bg-white/[0.02] border border-white/[0.05] rounded-lg relative overflow-hidden group/loading">
+                      {/* Neural Pulse Scanning Effect */}
+                      <div className="absolute inset-0 bg-gradient-to-r from-transparent via-[var(--color-antigravity-accent)]/5 to-transparent -translate-x-full animate-[scan_2s_ease-in-out_infinite]" />
+
+                      <div className="flex flex-col gap-1.5 relative z-10">
+                        <div className="font-mono text-[10px] text-[var(--color-antigravity-text-secondary)]/60 flex items-center gap-2 overflow-hidden whitespace-nowrap">
+                          <span className="opacity-40 shrink-0">[$]</span>
+                          <span className="truncate">
+                            {msg.steps && msg.steps.length > 0
+                              ? msg.steps[msg.steps.length - 1]?.plannerResponse
+                                  ?.thinking || "Executing logic flow..."
+                              : "Initializing context engine..."}
+                          </span>
+                          <span className="animate-pulse">_</span>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <MarkdownRenderer content={msg.content} />
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
         </div>
-      </form>
+        <div ref={messagesEndRef} className="h-4" />
+      </div>
+
+      <div className="w-full bg-[var(--color-antigravity-panel)]/40 backdrop-blur-xl border-t border-[var(--color-antigravity-border)] flex flex-col relative z-20">
+        {/* Progress Bar (0 height, overlayed at the very top of input area) */}
+        {queriesFileExists && loadedQueries.length > 0 && (
+          <div className="absolute top-0 left-0 right-0 h-[2px] bg-white/[0.03]">
+            <div
+              className="h-full bg-[var(--color-antigravity-accent)] transition-all duration-500"
+              style={{
+                width: `${
+                  loadedQueries.length > 0
+                    ? ((currentQueryIndex >= 0 ? currentQueryIndex + 1 : 0) /
+                        loadedQueries.length) *
+                      100
+                    : 0
+                }%`,
+              }}
+            />
+          </div>
+        )}
+
+        <div className="p-1.5 flex items-center gap-1.5 w-full">
+          {/* Permanent File Indicator / Action Wrapper */}
+          <div
+            onClick={queriesFileExists ? undefined : handleCreateQueriesFile}
+            className={`flex-1 flex items-center justify-between bg-white/[0.02] border border-[var(--color-antigravity-border)] rounded-md px-2 py-1 h-[28px] transition-all min-w-0 ${
+              queriesFileExists
+                ? ""
+                : "hover:bg-white/[0.05] hover:border-[var(--color-antigravity-accent)]/30 cursor-pointer"
+            }`}
+          >
+            <div className="flex items-center gap-2 min-w-0">
+              <FileText
+                size={12}
+                className="text-[var(--color-antigravity-text-secondary)] opacity-60 shrink-0"
+              />
+              <span className="text-[10px] font-medium text-[var(--color-antigravity-text-secondary)] truncate">
+                {queriesFileExists
+                  ? ".repoorbit/queries.md"
+                  : ".repoorbit/queries.md (Deleted)"}
+              </span>
+              {queriesFileExists && loadedQueries.length > 0 && (
+                <span className="text-[9px] text-[var(--color-antigravity-text-secondary)] opacity-40 shrink-0 font-mono">
+                  ({currentQueryIndex >= 0 ? currentQueryIndex + 1 : 0}/
+                  {loadedQueries.length})
+                </span>
+              )}
+            </div>
+
+            {queriesFileExists ? (
+              <span className="text-[9px] text-[var(--color-antigravity-text-secondary)] opacity-60 font-mono shrink-0">
+                Queries: {loadedQueries.length}
+              </span>
+            ) : (
+              <span className="text-[9px] text-[var(--color-antigravity-accent)] font-mono shrink-0 hover:text-[var(--color-antigravity-text-primary)]">
+                Restore File
+              </span>
+            )}
+          </div>
+
+          {/* Play/Pause Button */}
+          <button
+            onClick={handlePlayPause}
+            disabled={!queriesFileExists || loadedQueries.length === 0}
+            className={`h-[28px] px-2.5 rounded-md border transition-all flex items-center justify-center shrink-0 ${
+              !queriesFileExists || loadedQueries.length === 0
+                ? "bg-white/[0.01] border-white/[0.02] text-white/10 cursor-not-allowed"
+                : isPlaying
+                  ? "bg-white/[0.06] border-[var(--color-antigravity-border)] text-[var(--color-antigravity-text-primary)] hover:bg-white/[0.1]"
+                  : "bg-white/[0.02] border-[var(--color-antigravity-border)] text-[var(--color-antigravity-text-secondary)] hover:text-[var(--color-antigravity-text-primary)] hover:bg-white/[0.05]"
+            }`}
+            title={isPlaying ? "Pause execution" : "Start playing queries"}
+          >
+            {isPlaying ? (
+              <Pause size={12} className="fill-current" />
+            ) : (
+              <Play size={12} className="fill-current ml-0.5" />
+            )}
+          </button>
+        </div>
+      </div>
     </div>
   );
 };

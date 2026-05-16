@@ -45,14 +45,21 @@ export const useSelectionStore = create<
       return { filesMetadata: nextFiles, importGraph: nextGraph };
     }),
 
-  addFileMetadata: (file) =>
-    set((state) => ({
-      filesMetadata: [...state.filesMetadata, file],
-      importGraph: {
-        ...state.importGraph,
-        [file.path]: file.resolvedImports,
-      },
-    })),
+    addFileMetadata: (file) =>
+      set((state) => ({
+        filesMetadata: [...state.filesMetadata, file],
+        importGraph: {
+          ...state.importGraph,
+          [file.path]: file.resolvedImports,
+        },
+      })),
+  
+    updateFileMetadata: (path: string, update: Partial<LightFileMetadata> & Record<string, any>) =>
+      set((state) => ({
+        filesMetadata: state.filesMetadata.map(f => 
+          f.path === path ? { ...f, ...update } : f
+        )
+      })),
 
   setCommitsByAuthor: (commitsByAuthor) =>
     set((state) => {

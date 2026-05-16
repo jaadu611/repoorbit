@@ -1,0 +1,13 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "type": "npm",
+            "script": "ext:package",
+            "group": "build",
+            "problemMatcher": [],
+            "label": "npm: ext:package",
+            "detail": "Builds both the UI and the extension host"
+        }
+    ]
+}

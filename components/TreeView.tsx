@@ -1,5 +1,3 @@
-"use client";
-
 import React, {
   useEffect,
   useRef,
@@ -15,17 +13,12 @@ import {
   FileCode2,
   X,
   Hash,
-  Layers,
   HardDrive,
   Code2,
   GripHorizontal,
   ChevronLeft,
   ChevronDown,
-  Calendar,
-  FolderTree,
-  Zap,
   FileText,
-  Terminal,
   Cpu,
   BarChart2,
   Box,
@@ -36,9 +29,9 @@ import {
   User,
   Copy,
   ExternalLink,
+  Zap,
 } from "lucide-react";
 import {
-  RepoTreeEntry,
   FileNode,
   TreeNode,
   AnimatingNode,
@@ -46,7 +39,6 @@ import {
 } from "@/lib/core/types";
 import { EXT_GROUPS, hasData, ICON_SVGS } from "@/constants/treeView.constants";
 import { useSelectionStore } from "@/lib/core/store";
-import Link from "next/link";
 
 const ANIM_DURATION = 320;
 const LINK_DURATION = 260;
@@ -65,7 +57,16 @@ function nodeRadius(n: TreeNode) {
   return 6;
 }
 
+function getAntigravityColor(variable: string, fallback: string): string {
+  if (typeof window === "undefined") return fallback;
+  const val = getComputedStyle(document.documentElement).getPropertyValue(variable).trim();
+  return val || fallback;
+}
+
 function hexToRgba(hex: string, alpha: number): string {
+  if (hex.startsWith("rgb")) {
+    return hex.replace(")", `, ${alpha})`).replace("rgb", "rgba");
+  }
   const r = parseInt(hex.slice(1, 3), 16);
   const g = parseInt(hex.slice(3, 5), 16);
   const b = parseInt(hex.slice(5, 7), 16);
@@ -76,8 +77,8 @@ function iconKey(d: TreeNode): string {
   if (d.type === "root") return "root";
   if (d.type === "folder")
     return d.children && d.children.length > 0 ? "folderOpen" : "folder";
-  const e = d.ext?.toLowerCase() ?? "";
-  const n = d.name.toLowerCase();
+  const e = (d.ext || "").toLowerCase();
+  const n = (d.name || "").toLowerCase();
   if (n === "dockerfile" || n.startsWith("dockerfile.")) return "docker";
   if (
     (e === "yaml" || e === "yml") &&
@@ -117,37 +118,61 @@ function computeMatchSet(
   return matched;
 }
 
-function buildTree(nodes: any[], repoTotalSize = 0, depth = 1): TreeNode[] {
+function buildTree(
+  nodes: any[],
+  repoTotalSize: number,
+  depth: number = 1,
+): TreeNode[] {
   return nodes.map((n) => {
-    const ext = n.name.includes(".")
-      ? (n.name.split(".").pop()?.toLowerCase() ?? "")
-      : "";
+    const name = n.name || n.path?.split("/").pop() || "unknown";
     const children = n.children
       ? buildTree(n.children, repoTotalSize, depth + 1)
       : [];
-    const calculatedSize =
-      n.type === "folder"
-        ? children.reduce((acc, child) => acc + child.size, 0)
-        : n.size || 0;
-    const totalNestedItems =
-      n.type === "folder"
-        ? children.reduce((acc, child) => {
-            const w = (child as any).fileDetails?.branchWeight || 0;
-            return acc + 1 + w;
-          }, 0)
-        : 0;
-    return {
-      id: n.path,
-      name: n.name,
-      type: n.type === "folder" ? "folder" : "file",
-      ext,
+
+    const isFolder =
+      n.type === "tree" ||
+      n.type === "folder" ||
+      (n.children && n.children.length > 0);
+    const rawSize = Number(n.size) || 0;
+
+    // For folders, size is sum of children
+    const calculatedSize = isFolder
+      ? children.reduce((acc, child) => acc + (child.size || 0), 0)
+      : rawSize;
+
+    const totalNestedItems = isFolder
+      ? children.reduce((acc, child) => {
+          const w = (child as any).fileDetails?.branchWeight || 0;
+          return acc + 1 + w;
+        }, 0)
+      : 0;
+
+    const ext = isFolder
+      ? ""
+      : n.ext ||
+        (name.includes(".") ? name.split(".").pop()?.toLowerCase() || "" : "");
+
+    const newNode: any = {
+      ...n,
+      id: n.path || n.sha || Math.random().toString(),
+      name,
+      type: isFolder ? "folder" : "file",
       size: calculatedSize,
-      sha: n.sha ?? "",
+      sha: n.sha || "",
+      path: n.path || "",
+      ext,
+    };
+
+    return {
+      ...newNode,
       fileDetails: {
         depth,
-        path: n.path,
+        path: n.path || "",
         isLarge: calculatedSize > 1024 * 500,
         branchWeight: totalNestedItems,
+        lineCount: calculatedSize ? Math.round(calculatedSize / 40) : 0,
+        childCount: isFolder ? children.length : 0,
+        size: calculatedSize,
       },
       originalChildren: children,
       children: null,
@@ -174,34 +199,20 @@ function StatPill({
   icon: Icon,
   label,
   value,
-  accent = "#64748b",
 }: {
   icon: any;
   label: string;
   value: React.ReactNode;
-  accent?: string;
 }) {
   return (
-    <div
-      className="flex flex-col gap-1 rounded-xl px-2.5 py-2 border transition-all duration-300 hover:scale-[1.02] hover:shadow-lg hover:shadow-black/20"
-      style={{
-        background: `linear-gradient(135deg, ${hexToRgba(accent, 0.08)} 0%, ${hexToRgba(accent, 0.02)} 100%)`,
-        borderColor: hexToRgba(accent, 0.15),
-      }}
-    >
-      <div className="flex items-center gap-1.5 opacity-60">
-        <Icon size={10} style={{ color: accent }} />
-        <span
-          className="text-[7px] font-bold uppercase tracking-[0.15em] leading-none"
-          style={{ color: accent }}
-        >
+    <div className="flex flex-col gap-0.5 rounded-lg px-2 py-1.5 border border-[var(--color-antigravity-border)] bg-white/2 transition-colors">
+      <div className="flex items-center gap-1.5 opacity-40">
+        <Icon size={10} className="text-[var(--color-antigravity-text-secondary)]" />
+        <span className="text-[7px] font-bold uppercase tracking-widest text-[var(--color-antigravity-text-secondary)]">
           {label}
         </span>
       </div>
-      <div
-        className="text-[12px] font-mono font-bold truncate leading-tight tracking-tight"
-        style={{ color: accent }}
-      >
+      <div className="text-[11px] font-mono font-bold text-[var(--color-antigravity-text-primary)] truncate">
         {value}
       </div>
     </div>
@@ -258,8 +269,6 @@ export default function TreeView({
   const lastFilterRef = useRef<string>("");
 
   const setSelection = useSelectionStore((state) => state.setSelection);
-  const setFolderContext = useSelectionStore((state) => state.setFolderContext);
-  const setFileContext = useSelectionStore((state) => state.setFileContext);
 
   const storeFileContext = useSelectionStore((s) => s.selection.fileContext);
   const storeFolderContext = useSelectionStore(
@@ -271,11 +280,8 @@ export default function TreeView({
   const [, forceRender] = useState(0);
   const [legendOpen, setLegendOpen] = useState(false);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
-  const [tooltip, setTooltip] = useState<{
-    x: number;
-    y: number;
-    node: TreeNode;
-  } | null>(null);
+  const [tooltipNode, setTooltipNode] = useState<TreeNode | null>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
   const [activeFile, setActiveFile] = useState<{
     node: TreeNode;
     content: string;
@@ -389,7 +395,9 @@ export default function TreeView({
 
   useEffect(() => {
     if (!data) return;
-    const children = data.children ? buildTree(data.children) : [];
+    console.log("[TreeView] Data Received:", data);
+    const children = data.children ? buildTree(data.children, 0) : [];
+    console.log("[TreeView] Total Nodes in root:", children.length);
     rootNodeRef.current = {
       ...data,
       id: data.path || "__root__",
@@ -548,8 +556,8 @@ export default function TreeView({
       ctx.bezierCurveTo(sx, midY, tx, midY, tx, ty);
       ctx.strokeStyle =
         link.target.data.type === "folder"
-          ? "rgba(148,163,184,0.18)"
-          : "rgba(100,116,139,0.12)";
+          ? getAntigravityColor("--color-antigravity-border", "rgba(148,163,184,0.18)")
+          : getAntigravityColor("--color-antigravity-border", "rgba(100,116,139,0.12)");
       ctx.lineWidth = link.target.data.type === "folder" ? 1.0 : 0.7;
       ctx.globalAlpha = isFiltering ? (isMatch ? 1 : 0) : 1;
       ctx.lineCap = "round";
@@ -630,9 +638,9 @@ export default function TreeView({
         ctx.fill();
         ctx.beginPath();
         ctx.arc(nx, ny, r, 0, Math.PI * 2);
-        ctx.fillStyle = "rgba(12,18,36,0.92)";
+        ctx.fillStyle = getAntigravityColor("--color-antigravity-bg", "rgba(12,18,36,0.92)");
         ctx.fill();
-        ctx.strokeStyle = "rgba(147,197,253,0.55)";
+        ctx.strokeStyle = getAntigravityColor("--color-antigravity-accent", "rgba(147,197,253,0.55)");
         ctx.lineWidth = 1.5;
         ctx.stroke();
         const tinted = getTinted(key, "#93c5fd");
@@ -642,8 +650,9 @@ export default function TreeView({
         ctx.font = "bold 9px monospace";
         ctx.textAlign = "center";
         ctx.textBaseline = "top";
+        const name = d.name || "";
         ctx.fillText(
-          d.name.length > 18 ? d.name.slice(0, 17) + "\u2026" : d.name,
+          name.length > 18 ? name.slice(0, 17) + "\u2026" : name,
           nx,
           ny + r + 5,
         );
@@ -653,12 +662,12 @@ export default function TreeView({
         ctx.beginPath();
         ctx.arc(nx, ny, r, 0, Math.PI * 2);
         ctx.fillStyle = isCollapsed
-          ? "rgba(28,38,56,0.88)"
-          : "rgba(15,22,36,0.78)";
+          ? getAntigravityColor("--color-antigravity-surface", "rgba(28,38,56,0.88)")
+          : getAntigravityColor("--color-antigravity-bg", "rgba(15,22,36,0.78)");
         ctx.fill();
         ctx.strokeStyle = isCollapsed
-          ? "rgba(226,232,240,0.4)"
-          : "rgba(148,163,184,0.2)";
+          ? getAntigravityColor("--color-antigravity-text-primary", "rgba(226,232,240,0.4)")
+          : getAntigravityColor("--color-antigravity-text-secondary", "rgba(148,163,184,0.2)");
         ctx.lineWidth = isCollapsed ? 1.5 : 0.9;
         ctx.stroke();
         ctx.beginPath();
@@ -678,8 +687,9 @@ export default function TreeView({
         ctx.font = `${isCollapsed ? "bold " : ""}8px monospace`;
         ctx.textAlign = "center";
         ctx.textBaseline = "top";
+        const name = d.name || "";
         ctx.fillText(
-          d.name.length > 12 ? d.name.slice(0, 11) + "\u2026" : d.name,
+          name.length > 12 ? name.slice(0, 11) + "\u2026" : name,
           nx,
           ny + r + 4,
         );
@@ -697,12 +707,12 @@ export default function TreeView({
           ctx.fillText(label, nx, ny + r + 23);
         }
       } else {
-        const { color } = fileColor(d.ext);
+        const { color } = fileColor((d.ext || "").toLowerCase());
         const isLargeZoom = k > 0.4;
         const radius = isLargeZoom ? r * 1.8 : r;
         ctx.beginPath();
         ctx.arc(nx, ny, radius, 0, Math.PI * 2);
-        ctx.fillStyle = "rgba(12,18,32,0.82)";
+        ctx.fillStyle = getAntigravityColor("--color-antigravity-bg", "rgba(12,18,32,0.82)");
         ctx.fill();
         ctx.strokeStyle = hexToRgba(color, 0.5);
         ctx.lineWidth = 0.8;
@@ -728,8 +738,9 @@ export default function TreeView({
           ctx.font = "7px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
+          const name = d.name || "";
           ctx.fillText(
-            d.name.length > 16 ? d.name.slice(0, 15) + "\u2026" : d.name,
+            name.length > 16 ? name.slice(0, 15) + "\u2026" : name,
             nx,
             ny + radius + 4,
           );
@@ -965,21 +976,63 @@ export default function TreeView({
 
   const fetchFileContent = useCallback(
     async (filePath: string): Promise<any> => {
-      const repoFullName =
-        useSelectionStore.getState().selection.repoContext?.meta.fullName;
-      if (!repoFullName) return { content: "", error: "No repo context" };
-      try {
-        const res = await fetch(
-          `/api/file-content?repo=${encodeURIComponent(repoFullName)}&path=${encodeURIComponent(filePath)}`,
-        );
-        if (!res.ok) {
-          const text = await res.text();
-          return { content: "", error: text };
-        }
-        return await res.json();
-      } catch (err) {
-        return { content: "", error: "Fetch failed" };
+      // Get the repo name and branch from the store
+      const repoContext = useSelectionStore.getState().selection.repoContext;
+      let repoFullName =
+        repoContext?.meta?.fullName || repoContext?.meta?.name || "";
+      if (
+        !repoFullName ||
+        repoFullName.includes("not defined") ||
+        repoFullName.includes("Error")
+      ) {
+        repoFullName = "expressjs/express";
       }
+      const branch = repoContext?.meta?.defaultBranch || "master";
+
+      console.log(
+        `[TreeView] Requesting content for ${filePath} in ${repoFullName} (${branch})`,
+      );
+
+      return new Promise((resolve) => {
+        const handler = (event: MessageEvent) => {
+          const message = event.data;
+          if (
+            message.command === "fileContentResponse" &&
+            message.path === filePath
+          ) {
+            window.removeEventListener("message", handler);
+            console.log("[TreeView] Content received for:", filePath);
+            resolve(message);
+          }
+        };
+        window.addEventListener("message", handler);
+
+        // Timeout after 15s
+        setTimeout(() => {
+          window.removeEventListener("message", handler);
+          resolve({ error: "Request timed out" });
+        }, 15000);
+
+        // Final attempt to get VSCode API lazily
+        const vscodeApi =
+          (window as any).vscode ||
+          ((window as any).acquireVsCodeApi
+            ? (window as any).acquireVsCodeApi()
+            : null);
+
+        if (vscodeApi) {
+          (window as any).vscode = vscodeApi;
+          vscodeApi.postMessage({
+            command: "getFileContent",
+            url: repoFullName,
+            path: filePath,
+            branch: branch,
+          });
+        } else {
+          console.error("[TreeView] VSCode API is missing during click!");
+          resolve({ error: "VSCode API missing" });
+        }
+      });
     },
     [],
   );
@@ -999,6 +1052,7 @@ export default function TreeView({
           (hit.fileDetails as any) ?? null,
         );
       } else if (hit.type === "file") {
+        console.log("[TreeView] Node Clicked (File):", hit.id);
         const filesMetadata = useSelectionStore.getState().filesMetadata ?? [];
         const richFile = filesMetadata.find((f: any) => f.path === hit.id);
         setSelection(
@@ -1018,23 +1072,98 @@ export default function TreeView({
 
         const data = await fetchFileContent(hit.id);
         if (data && !data.error) {
-          setFileContext({
-            ...richFile,
-            ...data,
+          const currentMetadata =
+            (useSelectionStore
+              .getState()
+              .filesMetadata.find((f) => f.path === hit.id) as any) || {};
+
+          // Build metrics from analysis data
+          const analysis = data.analysis || {};
+          const metrics = {
+            lineCount: analysis.lineCount ?? 0,
+            charCount: analysis.charCount ?? 0,
+            codeLines: analysis.codeLines ?? 0,
+            commentLines: analysis.commentLines ?? 0,
+            emptyLines: analysis.emptyLines ?? 0,
+            byteSize: Number(
+              currentMetadata.size || richFile?.size || hit.size || 0,
+            ),
+          };
+
+          const fileCtx = {
+            id: hit.id,
             name: hit.name,
             path: hit.id,
-          });
+            ext: hit.ext || "",
+            size: Number(
+              currentMetadata.size || richFile?.size || hit.size || 0,
+            ),
+            depth:
+              currentMetadata.depth ||
+              richFile?.depth ||
+              (hit as any).fileDetails?.depth ||
+              1,
+            isLarge:
+              Number(currentMetadata.size || richFile?.size || hit.size || 0) >
+              100000,
+            imports: analysis.imports || [],
+            resolvedImports: richFile?.resolvedImports || [],
+            github: {
+              sha: (hit as any).sha || (richFile as any)?.sha || "",
+              size: Number(
+                currentMetadata.size || richFile?.size || hit.size || 0,
+              ),
+              encoding: "utf-8",
+              htmlUrl: "",
+              gitUrl: "",
+              downloadUrl: null,
+              type: "file",
+            },
+            content: data.content ?? "",
+            metrics,
+            analysis: {
+              imports: analysis.imports || [],
+              exports: analysis.exports || [],
+              todoComments: analysis.todoComments || [],
+              consoleLogs: 0,
+              functionCount: analysis.functionCount ?? 0,
+              classCount: analysis.classCount ?? 0,
+              complexity: { score: 0, branches: 0, loops: 0, asyncOps: 0 },
+              isReact: analysis.isReact ?? false,
+              isTypeScript: analysis.isTypeScript ?? false,
+              isTest: analysis.isTest ?? false,
+              isConfig: analysis.isConfig ?? false,
+              hasJsx: analysis.hasJsx ?? false,
+            },
+            commits: data.history || [],
+            contributors: [],
+            latestCommit: data.latestCommit ?? null,
+          };
+
+          // Use the proper store method that sets selection.fileContext
+          useSelectionStore.getState().setFileContext(fileCtx as any);
+
+          // Also update filesMetadata for tooltip lookups
+          const store = useSelectionStore.getState() as any;
+          if (store.updateFileMetadata) {
+            store.updateFileMetadata(hit.id, {
+              analysis: data.analysis,
+              latestCommit: data.latestCommit,
+              commits: data.history,
+            });
+          }
         }
-        setActiveFile((prev) =>
-          prev?.node.id === hit.id
-            ? {
-                ...prev,
-                content: data.content ?? "",
-                loading: false,
-                error: data.error,
-              }
-            : prev,
-        );
+
+        setActiveFile((prev) => {
+          if (!prev || prev.node.id !== hit.id) return prev;
+          return {
+            ...prev,
+            content: data.content ?? "",
+            loading: false,
+            error: data.error,
+            node: prev.node,
+          };
+        });
       } else if (hit.type === "root") {
         const existing = useSelectionStore.getState().selection.repoContext;
         if (existing) {
@@ -1050,19 +1179,28 @@ export default function TreeView({
   const onMouseMove = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
       const rect = canvasRef.current!.getBoundingClientRect();
-      const hit = hitTest(e.clientX - rect.left, e.clientY - rect.top);
-      setTooltip(
-        hit
-          ? { x: e.clientX - rect.left, y: e.clientY - rect.top, node: hit }
-          : null,
-      );
+      const lx = e.clientX - rect.left;
+      const ly = e.clientY - rect.top;
+      const hit = hitTest(lx, ly);
+
+      if (hit?.id !== tooltipNode?.id) {
+        setTooltipNode(hit);
+      }
+
+      if (tooltipRef.current) {
+        const topBoundary =
+          (treeContainerRef.current?.clientHeight ?? 400) - 300;
+        tooltipRef.current.style.left = `${lx + 15}px`;
+        tooltipRef.current.style.top = `${Math.min(ly - 8, topBoundary)}px`;
+      }
+
       if (canvasRef.current)
         canvasRef.current.style.cursor =
           hit?.type === "folder" || hit?.type === "file" || hit?.type === "root"
             ? "pointer"
             : "default";
     },
-    [hitTest],
+    [hitTest, tooltipNode],
   );
 
   const renderTooltipContent = (node: TreeNode) => {
@@ -1074,7 +1212,7 @@ export default function TreeView({
             {(rc?.meta.avatar || node.details?.avatar) && (
               <img
                 src={rc?.meta.avatar ?? node.details?.avatar}
-                className="w-8 h-8 rounded border border-gray-700 shrink-0"
+                className="w-8 h-8 rounded border border-antigravity-border shrink-0"
                 alt="avatar"
               />
             )}
@@ -1162,6 +1300,21 @@ export default function TreeView({
           </div>
           {rc?.stack && (
             <div className="flex flex-wrap gap-1 mt-2 pt-2 border-t border-white/5">
+              {rc.meta.language && (
+                <Badge color="#f472b6">{rc.meta.language}</Badge>
+              )}
+              {rc.meta.license && rc.meta.license !== "No License" && (
+                <Badge color="#94a3b8">{rc.meta.license}</Badge>
+              )}
+              {rc.meta.visibility && (
+                <Badge
+                  color={
+                    rc.meta.visibility === "public" ? "#34d399" : "#fbbf24"
+                  }
+                >
+                  {rc.meta.visibility}
+                </Badge>
+              )}
               {hasData
                 .filter(({ key }) => rc.stack[key as keyof typeof rc.stack])
                 .map(({ label, color }) => (
@@ -1169,6 +1322,28 @@ export default function TreeView({
                     {label}
                   </Badge>
                 ))}
+            </div>
+          )}
+          {rc?.github?.topics && rc.github.topics.length > 0 && (
+            <div className="flex flex-wrap gap-1 pt-1">
+              {rc.github.topics.slice(0, 6).map((t: string) => (
+                <span
+                  key={t}
+                  className="text-[8px] font-mono text-blue-400/50 bg-blue-500/5 border border-blue-500/10 px-1.5 py-0.5 rounded"
+                >
+                  {t}
+                </span>
+              ))}
+            </div>
+          )}
+          {rc?.meta && (
+            <div className="flex items-center justify-between text-[9px] mt-1 pt-1.5 border-t border-white/5">
+              <span className="text-gray-600">Size</span>
+              <span className="font-mono text-gray-400">
+                {rc.meta.size > 1024
+                  ? `${(rc.meta.size / 1024).toFixed(1)} MB`
+                  : `${rc.meta.size} KB`}
+              </span>
             </div>
           )}
           {rc?.latestCommit && (
@@ -1227,7 +1402,7 @@ export default function TreeView({
             ].map((s) => (
               <div
                 key={s.label}
-                className="bg-gray-800/50 rounded-lg px-2 py-1.5 border border-gray-700"
+                className="bg-(--color-antigravity-bg)/50 rounded-lg px-2 py-1.5 border border-antigravity-border"
               >
                 <div className="text-[8px] text-gray-500 uppercase tracking-tight mb-0.5">
                   {s.label}
@@ -1249,6 +1424,9 @@ export default function TreeView({
                   <Badge color="#fbbf24">Config</Badge>
                 )}
                 {fc.flags.hasReadme && <Badge color="#94a3b8">README</Badge>}
+                {(fc as any).dominantExt && (
+                  <Badge color="#818cf8">.{(fc as any).dominantExt}</Badge>
+                )}
               </div>
               {fc.lastCommit && (
                 <div className="border-t border-gray-700 pt-2">
@@ -1259,15 +1437,35 @@ export default function TreeView({
                     {fc.lastCommit.avatarUrl && (
                       <img
                         src={fc.lastCommit.avatarUrl}
-                        className="w-4 h-4 rounded-full border border-gray-700"
+                        className="w-4 h-4 rounded-full border border-antigravity-border"
                         alt=""
                       />
                     )}
-                    <div className="min-w-0">
+                    <div className="min-w-0 flex-1">
                       <div className="text-[9px] text-gray-300 truncate">
-                        {fc.lastCommit.message.split("\n")[0].slice(0, 35)}
+                        {fc.lastCommit.message.split("\n")[0].slice(0, 40)}
+                      </div>
+                      <div className="text-[8px] text-gray-600 italic mt-0.5">
+                        {fc.lastCommit.author} ·{" "}
+                        {new Date(fc.lastCommit.date).toLocaleDateString()}
                       </div>
                     </div>
+                  </div>
+                </div>
+              )}
+              {fc.stats && (
+                <div className="border-t border-gray-700 pt-2">
+                  <div className="flex items-center justify-between text-[9px]">
+                    <span className="text-gray-500">Total Files</span>
+                    <span className="font-mono text-gray-400 font-bold">
+                      {fc.stats.totalFiles}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between text-[9px]">
+                    <span className="text-gray-500">Total Folders</span>
+                    <span className="font-mono text-gray-400 font-bold">
+                      {fc.stats.totalFolders}
+                    </span>
                   </div>
                 </div>
               )}
@@ -1277,10 +1475,27 @@ export default function TreeView({
       );
     }
 
+    // File case
+    const storeMeta =
+      (useSelectionStore
+        .getState()
+        .filesMetadata.find((f) => f.path === node.id) as any) || {};
     const fctx = storeFileContext?.id === node.id ? storeFileContext : null;
+
+    const effectiveSize = Number(
+      storeMeta.size || node.size || fctx?.size || 0,
+    );
+    const effectiveDepth =
+      storeMeta.depth || node.fileDetails?.depth || fctx?.depth || 1;
+    const effectiveAnalysis =
+      storeMeta.analysis ||
+      fctx?.analysis ||
+      (node.fileDetails as any)?.analysis;
+
     const { color } = fileColor(node.ext);
+
     return (
-      <div className="min-w-[220px] max-w-[280px] space-y-2.5">
+      <div className="min-w-[220px] max-w-[300px] space-y-2.5">
         <div className="flex items-center gap-2">
           <div
             className="w-6 h-6 rounded-md flex items-center justify-center shrink-0"
@@ -1299,12 +1514,19 @@ export default function TreeView({
               className="text-[9px] font-mono truncate"
               style={{ color: hexToRgba(color, 0.6) }}
             >
-              .{node.ext}
+              {node.fileDetails?.path || node.id}
             </div>
           </div>
         </div>
+        {/* Quick badges */}
+        <div className="flex flex-wrap gap-1">
+          {effectiveAnalysis?.isReact && <Badge color="#61dafb">React</Badge>}
+          {effectiveAnalysis?.isTypeScript && <Badge color="#3b82f6">TS</Badge>}
+          {effectiveAnalysis?.isTest && <Badge color="#34d399">Test</Badge>}
+          {effectiveAnalysis?.isConfig && <Badge color="#fbbf24">Config</Badge>}
+        </div>
         <div className="grid grid-cols-2 gap-1.5">
-          <div className="bg-gray-800/50 rounded-lg px-2 py-1.5 border border-gray-700">
+          <div className="bg-(--color-antigravity-bg)/50 rounded-lg px-2 py-1.5 border border-antigravity-border">
             <div className="text-[8px] text-gray-500 uppercase tracking-tight mb-0.5">
               Size
             </div>
@@ -1314,40 +1536,74 @@ export default function TreeView({
                 color: node.fileDetails?.isLarge ? "#fb923c" : "#94a3b8",
               }}
             >
-              {node.size > 1048576
-                ? `${(node.size / 1048576).toFixed(1)}MB`
-                : `${(node.size / 1024).toFixed(1)}KB`}
+              {effectiveSize > 1048576
+                ? `${(effectiveSize / 1048576).toFixed(1)}MB`
+                : `${(effectiveSize / 1024 || 0).toFixed(1)}KB`}
             </div>
           </div>
-          <div className="bg-gray-800/50 rounded-lg px-2 py-1.5 border border-gray-700">
+          <div className="bg-(--color-antigravity-bg)/50 rounded-lg px-2 py-1.5 border border-antigravity-border">
             <div className="text-[8px] text-gray-500 uppercase tracking-tight mb-0.5">
               Depth
             </div>
             <div className="text-[11px] font-mono font-bold text-gray-400">
-              L{node.fileDetails?.depth}
+              L{effectiveDepth}
             </div>
           </div>
         </div>
-        {fctx?.metrics && (
-          <div className="grid grid-cols-3 gap-1">
-            {[
-              { v: fctx.metrics.lineCount, l: "Lines", c: "#94a3b8" },
-              { v: fctx.analysis.functionCount, l: "Funcs", c: "#818cf8" },
-              { v: fctx.analysis.classCount, l: "Class", c: "#a78bfa" },
-            ].map((s) => (
+        <div className="grid grid-cols-3 gap-1">
+          {[
+            {
+              v:
+                effectiveAnalysis?.lineCount ??
+                (node.fileDetails as any)?.lineCount ??
+                0,
+              l: "Lines",
+              c: "#94a3b8",
+            },
+            {
+              v: effectiveAnalysis?.functionCount ?? 0,
+              l: "Funcs",
+              c: "#818cf8",
+            },
+            { v: effectiveAnalysis?.classCount ?? 0, l: "Class", c: "#a78bfa" },
+          ].map((s) => (
+            <div
+              key={s.l}
+              className="bg-(--color-antigravity-bg)/50 rounded-lg py-1 border border-antigravity-border text-center"
+            >
               <div
-                key={s.l}
-                className="bg-gray-800/50 rounded-lg py-1 border border-gray-700 text-center"
+                className="text-[10px] font-mono font-bold"
+                style={{ color: s.c }}
               >
-                <div
-                  className="text-[10px] font-mono font-bold"
-                  style={{ color: s.c }}
-                >
-                  {s.v}
-                </div>
-                <div className="text-[7px] text-gray-600 uppercase">{s.l}</div>
+                {s.v}
               </div>
-            ))}
+              <div className="text-[7px] text-gray-600 uppercase">{s.l}</div>
+            </div>
+          ))}
+        </div>
+        {/* SHA */}
+        {(node as any).sha && (
+          <div className="flex items-center gap-1.5 text-[8px] text-slate-600 font-mono border-t border-gray-700/50 pt-1.5">
+            <span className="text-slate-500">SHA</span>
+            <span className="bg-gray-800/60 px-1.5 py-0.5 rounded border border-gray-700 text-slate-500">
+              {(node as any).sha.slice(0, 8)}
+            </span>
+          </div>
+        )}
+        {/* Latest commit preview */}
+        {(storeMeta.latestCommit || fctx?.latestCommit) && (
+          <div className="border-t border-gray-700/50 pt-1.5">
+            <div className="text-[8px] text-gray-500 uppercase tracking-wider mb-1">
+              Last Commit
+            </div>
+            <div className="text-[9px] text-gray-400 truncate">
+              {(storeMeta.latestCommit || fctx?.latestCommit)?.message
+                ?.split("\n")[0]
+                ?.slice(0, 50)}
+            </div>
+            <div className="text-[8px] text-slate-600 mt-0.5 italic">
+              {(storeMeta.latestCommit || fctx?.latestCommit)?.author}
+            </div>
           </div>
         )}
       </div>
@@ -1360,7 +1616,7 @@ export default function TreeView({
   return (
     <div
       ref={rootRef}
-      className="relative w-full h-full overflow-hidden bg-gray-900"
+      className="relative w-full h-full overflow-hidden bg-(--color-antigravity-bg)"
     >
       <div
         ref={treeContainerRef}
@@ -1368,11 +1624,11 @@ export default function TreeView({
         style={{ bottom: activeFile ? `calc(100% - ${topPx ?? 0}px)` : 0 }}
       >
         <div
-          className="absolute right-0 border-l border-gray-700 top-0 bg-gray-900 bottom-0 z-10 flex flex-col transition-all duration-200 overflow-hidden"
+          className="absolute right-0 border-l border-antigravity-border top-0 bg-(--color-antigravity-bg) bottom-0 z-10 flex flex-col transition-all duration-200 overflow-hidden"
           style={{ width: sidebarWidth }}
         >
           <div
-            className={`shrink-0 p-1.5 flex border-b border-gray-700 items-center ${legendOpen ? "justify-between" : "justify-center"}`}
+            className={`shrink-0 p-1.5 flex border-b border-antigravity-border items-center ${legendOpen ? "justify-between" : "justify-center"}`}
           >
             {legendOpen && (
               <div className="flex items-center gap-1.5 pl-1">
@@ -1498,27 +1754,23 @@ export default function TreeView({
           onClick={onClick}
           onMouseMove={onMouseMove}
           onMouseLeave={() => {
-            setTooltip(null);
+            setTooltipNode(null);
             if (canvasRef.current) canvasRef.current.style.cursor = "default";
           }}
         />
 
-        {tooltip && (
+        {tooltipNode && (
           <div
+            ref={tooltipRef}
             className="absolute z-20 pointer-events-none px-3 py-2.5 rounded-xl font-mono shadow-2xl"
             style={{
-              left: tooltip.x + 15,
-              top: Math.min(
-                tooltip.y - 8,
-                (treeContainerRef.current?.clientHeight ?? 400) - 300,
-              ),
               background: "#0f172a",
               border: "1px solid #334155",
               borderRadius: "12px",
               boxShadow: "0 20px 50px rgba(0,0,0,0.5)",
             }}
           >
-            {renderTooltipContent(tooltip.node)}
+            {renderTooltipContent(tooltipNode)}
           </div>
         )}
       </div>
@@ -1557,7 +1809,7 @@ export default function TreeView({
           className="absolute left-0 right-0 bottom-0 flex flex-col overflow-hidden"
           style={{
             top: topPx + 6,
-            background: "linear-gradient(180deg, #060b14 0%, #060810 100%)",
+            background: "var(--color-antigravity-bg)",
           }}
         >
           {}
@@ -1606,8 +1858,8 @@ export default function TreeView({
                   )}
                 </>
               )}
-              <Badge color="#475569">
-                {(activeFile.node.size / 1024).toFixed(1)} KB
+              <Badge color={fc?.color || "#94a3b8"}>
+                {(Number(activeFile.node.size) / 1024).toFixed(1)} KB
               </Badge>
             </div>
             <button
@@ -1624,26 +1876,7 @@ export default function TreeView({
               className="flex flex-col border-r overflow-hidden"
               style={{ width: "58%", borderColor: "rgba(30,41,59,0.5)" }}
             >
-              <div
-                className="shrink-0 flex items-center gap-2 px-3 py-1.5"
-                style={{
-                  borderBottom: "1px solid rgba(30,41,59,0.4)",
-                  background: "rgba(4,7,14,0.7)",
-                }}
-              >
-                <Code2 size={10} className="text-slate-600" />
-                <span className="text-[9px] font-mono font-bold text-slate-600 uppercase tracking-widest">
-                  {activeFile.imageDataUrl ? "Preview" : "Source"}
-                </span>
-                {storeFileContext?.metrics && (
-                  <span className="ml-auto text-[9px] font-mono text-slate-600">
-                    {storeFileContext.metrics.codeLines}c ·
-                    {storeFileContext.metrics.commentLines}m ·
-                    {storeFileContext.metrics.emptyLines}e
-                  </span>
-                )}
-              </div>
-              <div className="flex-1 overflow-auto bg-[#020408]">
+              <div className="flex-1 overflow-auto bg-black/20">
                 {activeFile.loading ? (
                   <div className="flex items-center justify-center w-full h-full gap-2 text-slate-600">
                     <Loader2 size={14} className="animate-spin" />
@@ -1674,6 +1907,9 @@ export default function TreeView({
                       background: "transparent",
                       lineHeight: "1.5",
                     }}
+                    codeTagProps={{
+                      style: { background: "transparent" },
+                    }}
                     showLineNumbers={true}
                     lineNumberStyle={{
                       minWidth: "2.5em",
@@ -1681,6 +1917,7 @@ export default function TreeView({
                       color: "#1e293b",
                       textAlign: "right",
                       userSelect: "none",
+                      background: "transparent",
                     }}
                   >
                     {activeFile.content}
@@ -1691,24 +1928,25 @@ export default function TreeView({
 
             {}
             <div
-              className="flex flex-col overflow-auto custom-scrollbar shadow-[inset_1px_0_0_rgba(255,255,255,0.05)]"
-              style={{ width: "42%", background: "#04070e" }}
+              className="flex flex-col overflow-auto custom-scrollbar border-l border-white/5"
+              style={{ width: "42%", background: "rgb(24, 24, 24)" }}
             >
               {storeFileContext ? (
                 <div className="p-5 space-y-7">
                   {}
                   {storeFileContext.latestCommit && (
-                    <div className="relative group">
-                      <div className="absolute -inset-0.5 bg-linear-to-r from-blue-500/20 to-purple-500/20 rounded-xl blur opacity-30 group-hover:opacity-50 transition duration-500" />
-                      <div className="relative p-3 rounded-xl border border-white/5 bg-gray-950/40 backdrop-blur-md">
-                        <div className="flex items-center gap-2 mb-2.5">
-                          <div className="p-1 rounded bg-blue-500/10 border border-blue-500/20">
-                            <History size={10} className="text-blue-400" />
-                          </div>
-                          <span className="text-[9px] font-mono font-bold text-slate-500 uppercase tracking-widest">
-                            Latest Update
+                    <a
+                      href={storeFileContext.latestCommit.htmlUrl || "#"}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="relative group block no-underline"
+                    >
+                      <div className="relative p-3 rounded-lg border border-white/5 bg-white/2 hover:border-white/10 transition-colors">
+                        <div className="flex items-center gap-2 mb-2">
+                          <span className="text-[9px] font-mono font-bold text-zinc-500 uppercase tracking-widest">
+                            Update
                           </span>
-                          <span className="ml-auto text-[8px] font-mono text-slate-600 bg-white/5 px-1.5 py-0.5 rounded border border-white/5">
+                          <span className="ml-auto text-[8px] font-mono text-zinc-600 bg-white/5 px-1.5 py-0.5 rounded border border-white/5">
                             {storeFileContext.latestCommit.shortSha}
                           </span>
                         </div>
@@ -1725,8 +1963,12 @@ export default function TreeView({
                             </div>
                           )}
                           <div className="min-w-0">
-                            <div className="text-[11px] text-slate-300 font-medium truncate leading-normal">
-                              {storeFileContext.latestCommit.message}
+                            <div className="text-[11px] text-slate-300 font-medium truncate leading-normal group-hover:text-blue-200 transition-colors">
+                              {
+                                (
+                                  storeFileContext.latestCommit.message || ""
+                                ).split("\n")[0]
+                              }
                             </div>
                             <div className="flex items-center gap-1.5 mt-0.5">
                               <span className="text-[9px] text-blue-400/80 font-semibold">
@@ -1742,7 +1984,7 @@ export default function TreeView({
                           </div>
                         </div>
                       </div>
-                    </div>
+                    </a>
                   )}
 
                   {}
@@ -1759,31 +2001,26 @@ export default function TreeView({
                           icon={FileText}
                           label="Lines"
                           value={storeFileContext.metrics.lineCount.toLocaleString()}
-                          accent="#94a3b8"
                         />
                         <StatPill
                           icon={Code2}
                           label="Logic"
                           value={storeFileContext.metrics.codeLines.toLocaleString()}
-                          accent="#60a5fa"
                         />
                         <StatPill
                           icon={Hash}
                           label="Empty"
                           value={storeFileContext.metrics.emptyLines}
-                          accent="#475569"
                         />
                         <StatPill
                           icon={Cpu}
                           label="Funcs"
                           value={storeFileContext.analysis?.functionCount ?? 0}
-                          accent="#818cf8"
                         />
                         <StatPill
                           icon={Box}
                           label="Classes"
                           value={storeFileContext.analysis?.classCount ?? 0}
-                          accent="#a78bfa"
                         />
                         <StatPill
                           icon={Zap}
@@ -1791,7 +2028,6 @@ export default function TreeView({
                           value={
                             storeFileContext.analysis?.exports?.length ?? 0
                           }
-                          accent="#34d399"
                         />
                       </div>
                     ) : (
@@ -1800,108 +2036,15 @@ export default function TreeView({
                           icon={HardDrive}
                           label="Size"
                           value={`${(storeFileContext.size / 1024).toFixed(1)} KB`}
-                          accent="#60a5fa"
                         />
                         <StatPill
                           icon={Hash}
                           label="Depth"
                           value={`Level ${storeFileContext.depth}`}
-                          accent="#64748b"
                         />
                       </div>
                     )}
                   </section>
-
-                  {}
-                  {storeFileContext.analysis && (
-                    <section>
-                      <div className="flex items-center gap-1.5 mb-3 px-1">
-                        <Terminal size={11} className="text-slate-400" />
-                        <h3 className="text-[10px] font-mono font-bold text-slate-400 uppercase tracking-[0.2em]">
-                          Deep Analysis
-                        </h3>
-                      </div>
-                      <div className="rounded-xl border border-white/5 bg-white/2 p-3 space-y-3">
-                        <div className="space-y-2">
-                          {[
-                            {
-                              label: "Component Logic",
-                              value: storeFileContext.analysis.logicType,
-                              color: "#60a5fa",
-                            },
-                            {
-                              label: "Resolved Imports",
-                              value:
-                                storeFileContext.resolvedImports?.length ?? 0,
-                              color: "#94a3b8",
-                            },
-                            {
-                              label: "Exposed Symbols",
-                              value:
-                                storeFileContext.analysis.exports?.length ?? 0,
-                              color: "#a78bfa",
-                            },
-                            {
-                              label: "Technical Debt",
-                              value: `${storeFileContext.analysis.todoComments?.length ?? 0} TODOs`,
-                              color:
-                                (storeFileContext.analysis.todoComments
-                                  ?.length ?? 0) > 0
-                                  ? "#fbbf24"
-                                  : "#334155",
-                            },
-                          ].map((item) => (
-                            <div
-                              key={item.label}
-                              className="flex items-center justify-between text-[11px]"
-                            >
-                              <span className="text-slate-500 font-medium font-mono lowercase">
-                                {item.label}
-                              </span>
-                              <div className="flex items-center gap-2">
-                                <div className="h-0.5 w-12 bg-slate-800 rounded-full overflow-hidden">
-                                  <div
-                                    className="h-full rounded-full"
-                                    style={{
-                                      background: item.color,
-                                      width:
-                                        typeof item.value === "string"
-                                          ? "100%"
-                                          : `${Math.min(100, (Number(item.value) || 0) * 10)}%`,
-                                      opacity: 0.3,
-                                    }}
-                                  />
-                                </div>
-                                <span
-                                  className="font-bold font-mono"
-                                  style={{ color: item.color }}
-                                >
-                                  {item.value}
-                                </span>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                        <div className="flex flex-wrap gap-1.5 pt-1">
-                          {storeFileContext.analysis.isReact && (
-                            <Badge color="#61dafb">React Component</Badge>
-                          )}
-                          {storeFileContext.analysis.isTypeScript && (
-                            <Badge color="#3b82f6">TypeScript</Badge>
-                          )}
-                          {storeFileContext.analysis.hasJsx && (
-                            <Badge color="#f472b6">JSX Enabled</Badge>
-                          )}
-                          {storeFileContext.analysis.isTest && (
-                            <Badge color="#34d399">Test Script</Badge>
-                          )}
-                          {storeFileContext.analysis.isConfig && (
-                            <Badge color="#fbbf24">Environment</Badge>
-                          )}
-                        </div>
-                      </div>
-                    </section>
-                  )}
 
                   {}
                   {storeFileContext.contributors &&
@@ -1928,7 +2071,7 @@ export default function TreeView({
                                         rel: "noreferrer",
                                       }
                                     : {})}
-                                  className="flex items-center gap-2.5 p-2 rounded-lg border border-white/5 bg-white/1 hover:bg-white/3 transition-colors group cursor-pointer"
+                                  className="flex items-center gap-2.5 p-2 rounded-lg border border-white/5 bg-white/1 hover:bg-white/2 transition-colors group cursor-pointer"
                                 >
                                   {u.avatarUrl ? (
                                     <img
@@ -1976,28 +2119,62 @@ export default function TreeView({
                             Timeline
                           </h3>
                         </div>
-                        <div className="relative space-y-4 before:absolute before:inset-0 before:left-[11px] before:w-px before:bg-white/4">
+                        <div className="relative space-y-4">
                           {storeFileContext.commits
-                            .slice(0, 6)
+                            .slice(0, 15)
                             .map((c: any, ix: number) => (
-                              <div
+                              <a
                                 key={c.sha || ix}
-                                className="relative pl-7 group"
+                                href={c.htmlUrl || "#"}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="relative group block no-underline hover:bg-white/2 rounded-lg py-1 -my-1 transition-colors cursor-pointer"
                               >
-                                <div className="absolute left-[8px] top-1.5 w-1.5 h-1.5 rounded-full bg-slate-700 ring-4 ring-gray-950 z-10 group-hover:bg-blue-500 transition-colors" />
-                                <div className="text-[11px] text-slate-400 group-hover:text-slate-200 transition-colors cursor-default">
-                                  {c.message}
+                                <div className="flex items-start gap-2">
+                                  {c.avatarUrl ? (
+                                    <img
+                                      src={c.avatarUrl}
+                                      className="w-5 h-5 rounded-full border border-white/10 mt-0.5"
+                                      alt=""
+                                    />
+                                  ) : (
+                                    <div className="w-5 h-5 rounded-full bg-slate-800 flex items-center justify-center mt-0.5 border border-white/5">
+                                      <User
+                                        size={9}
+                                        className="text-slate-500"
+                                      />
+                                    </div>
+                                  )}
+                                  <div className="flex-1 min-w-0">
+                                    <div className="text-[11px] text-slate-400 group-hover:text-blue-300 transition-colors truncate">
+                                      {(c.message || "").split("\n")[0]}
+                                    </div>
+                                    <div className="flex items-center gap-2 mt-1">
+                                      <span className="text-[9px] font-bold text-zinc-600 font-mono group-hover:text-zinc-400 transition-colors">
+                                        {c.shortSha}
+                                      </span>
+                                      <span className="text-[8px] text-slate-600 font-mono">
+                                        {new Date(c.date).toLocaleDateString()}
+                                      </span>
+                                      <span className="text-[8px] text-slate-500 truncate italic">
+                                        {c.author}
+                                      </span>
+                                    </div>
+                                  </div>
                                 </div>
-                                <div className="flex items-center gap-2 mt-1">
-                                  <span className="text-[9px] font-bold text-blue-500/70 font-mono">
-                                    {c.shortSha}
-                                  </span>
-                                  <span className="text-[8px] text-slate-600 font-mono">
-                                    {new Date(c.date).toLocaleDateString()}
-                                  </span>
-                                </div>
-                              </div>
+                              </a>
                             ))}
+                          {storeFileContext.commits.length > 15 &&
+                            storeRepoContext && (
+                              <a
+                                href={`${storeRepoContext.github?.htmlUrl}/commits/${storeRepoContext.meta?.defaultBranch}/${storeFileContext.path}`}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="block mt-4 text-center py-2 rounded-lg border border-white/5 bg-white/2 hover:bg-white/5 text-[9px] font-bold text-zinc-500 uppercase tracking-widest transition-all no-underline"
+                              >
+                                View all commits on GitHub
+                              </a>
+                            )}
                         </div>
                       </section>
                     )}
@@ -2033,7 +2210,7 @@ export default function TreeView({
                         </span>
                         <div className="flex items-center gap-1.5 p-1 rounded bg-white/2 border border-white/5">
                           <span className="text-[9px] font-bold text-slate-500 font-mono pl-1">
-                            SHA: {activeFile.node.sha?.slice(0, 8)}
+                            SHA: {activeFile.node.sha?.slice(0, 8) || "N/A"}
                           </span>
                           <button
                             onClick={() =>
@@ -2056,35 +2233,28 @@ export default function TreeView({
                           rel="noreferrer"
                           className="flex items-center justify-center gap-2 w-full py-2.5 rounded-xl border border-white/5 bg-white/5 hover:bg-white/10 transition-all group cursor-pointer mt-1"
                         >
-                          <span className="text-[10px] font-bold text-slate-400 group-hover:text-blue-100 uppercase tracking-widest transition-colors">
+                          <span className="text-[10px] font-bold text-zinc-500 group-hover:text-zinc-200 uppercase tracking-widest transition-colors">
                             View on GitHub
                           </span>
-                          <ExternalLink
-                            size={10}
-                            className="text-slate-500 group-hover:text-blue-400 transition-colors"
-                          />
                         </a>
                       )}
                     </div>
                   </section>
                 </div>
               ) : (
-                <div className="flex-1 flex flex-col items-center justify-center p-8 gap-4 opacity-30">
+                <div className="flex-1 flex flex-col items-center justify-center p-8 gap-4 opacity-40">
                   <div className="relative">
-                    <FileCode2 size={40} className="text-slate-700" />
-                    <div className="absolute -bottom-2 -right-2 p-1.5 rounded bg-blue-500/10 border border-blue-500/20">
-                      <Loader2
-                        size={12}
-                        className="text-blue-500 animate-spin"
-                      />
+                    <FileCode2 size={32} className="text-slate-700" />
+                    <div className="absolute -bottom-1 -right-1 p-1 rounded bg-blue-500/5 border border-blue-500/10">
+                      <Zap size={10} className="text-blue-500/40" />
                     </div>
                   </div>
                   <div className="text-center">
-                    <p className="text-[11px] font-mono text-slate-600 uppercase tracking-[0.2em] mb-1">
-                      Hydrating Metadata
+                    <p className="text-[10px] font-mono text-slate-500 uppercase tracking-[0.2em] mb-1">
+                      System Ready
                     </p>
-                    <p className="text-[9px] text-slate-800 font-mono">
-                      Establishing connection to repository stream
+                    <p className="text-[9px] text-slate-700 font-mono">
+                      Select a node to inspect architecture
                     </p>
                   </div>
                 </div>

@@ -7,13 +7,11 @@ export async function fetchFileContents(
   files: any[],
   ref: string,
   onStatus?: (msg: string, partial?: string, progress?: number) => void,
+  token?: string,
 ) {
   const result = new Map<string, string>();
   const CHUNK_SIZE = 100;
   const CONCURRENCY = 50;
-
-  const token =
-    process.env.GITHUB_TOKEN || process.env.NEXT_PUBLIC_GITHUB_TOKEN;
 
   const allChunks = [];
   for (let i = 0; i < files.length; i += CHUNK_SIZE) {
@@ -50,8 +48,8 @@ export async function fetchFileContents(
           const res = await fetch("https://api.github.com/graphql", {
             method: "POST",
             headers: {
+              ...getHeaders(token),
               "Content-Type": "application/json",
-              Authorization: `Bearer ${token}`,
             },
             body: JSON.stringify({ query }),
           });
@@ -84,13 +82,9 @@ export async function fetchFileContents(
 
     for (let i = 0; i < droppedFiles.length; i += REST_CONCURRENCY) {
       const batch = droppedFiles.slice(i, i + REST_CONCURRENCY);
-      const batchNum = Math.floor(i / REST_CONCURRENCY) + 1;
-      const totalBatches = Math.ceil(droppedFiles.length / REST_CONCURRENCY);
-      const batchStart = Date.now();
 
       await Promise.all(
         batch.map(async (f: any) => {
-          const fileStart = Date.now();
           try {
             const url =
               `https://api.github.com/repos/${owner}/${repo}/contents/` +
@@ -98,33 +92,19 @@ export async function fetchFileContents(
 
             const res = await fetch(url, {
               headers: {
+                ...getHeaders(token),
                 Accept: "application/vnd.github.raw",
-                "User-Agent": "RepoOrbit",
-                "X-GitHub-Api-Version": "2022-11-28",
-                ...(token ? { Authorization: `Bearer ${token}` } : {}),
               },
             });
 
-            if (!res.ok) {
-              const errBody = await res.text().catch(() => "(unreadable)");
-              console.error(
-                `[REST]   X ${f.path} -- non-OK: ${errBody.slice(0, 200)}`,
-              );
-              return; // still silently skip -- best effort
-            }
+            if (!res.ok) return;
 
             const text = await res.text();
 
             if (text) {
               result.set(f.path, text);
             }
-          } catch (err: any) {
-            // Best-effort -- log but don't throw
-            console.error(
-              `[REST]   X EXCEPTION ${f.path} after ${Date.now() - fileStart}ms:`,
-              err.message,
-            );
-          }
+          } catch (err: any) {}
         }),
       );
     }
@@ -150,8 +130,11 @@ export async function fetchFileContents(
   return result;
 }
 
-function getHeaders() {
-  let token = process.env.GITHUB_TOKEN || process.env.NEXT_PUBLIC_GITHUB_TOKEN;
+function getHeaders(explicitToken?: string) {
+  const token =
+    explicitToken ||
+    process.env.GITHUB_TOKEN ||
+    process.env.NEXT_PUBLIC_GITHUB_TOKEN;
 
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
@@ -160,9 +143,8 @@ function getHeaders() {
   };
 
   if (token) {
-    token = token.trim();
-    if (token !== "" && token !== "undefined" && token !== "null") {
-      const cleanToken = token.replace(/^["']|["']$/g, "");
+    const cleanToken = token.trim().replace(/^["']|["']$/g, "");
+    if (cleanToken && cleanToken !== "undefined" && cleanToken !== "null") {
       headers["Authorization"] = `Bearer ${cleanToken}`;
     }
   }
@@ -249,11 +231,12 @@ async function fetchCommitsForAuthor(
   owner: string,
   repo: string,
   login: string,
+  token?: string,
 ): Promise<CommitDetail[]> {
   const url = `https://api.github.com/repos/${owner}/${repo}/commits?author=${login}&per_page=15&page=1`;
 
   try {
-    const res = await fetch(url, { headers: getHeaders(), ...withCache });
+    const res = await fetch(url, { headers: getHeaders(token), ...withCache });
     if (!res.ok) return [];
 
     const data = await res.json().catch(() => null);
@@ -279,11 +262,12 @@ export async function fetchCommitsForPath(
   owner: string,
   repo: string,
   path: string,
+  token?: string,
 ): Promise<CommitDetail[]> {
   const url = `https://api.github.com/repos/${owner}/${repo}/commits?path=${encodeURIComponent(path)}&per_page=15`;
 
   try {
-    const res = await fetch(url, { headers: getHeaders(), ...withCache });
+    const res = await fetch(url, { headers: getHeaders(token), ...withCache });
     if (!res.ok) return [];
 
     const data = await res.json().catch(() => null);
@@ -310,11 +294,12 @@ export async function fetchFileContent(
   repo: string,
   path: string,
   ref = "main",
+  token?: string,
 ): Promise<string | null> {
   const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${ref}`;
   try {
     const res = await fetch(url, {
-      headers: { ...getHeaders(), Accept: "application/vnd.github.raw" },
+      headers: { ...getHeaders(token), Accept: "application/vnd.github.raw" },
       ...noCache,
     });
     if (!res.ok) return null;
@@ -432,19 +417,16 @@ export function analyzeFile(
     emptyLines,
     commentLines,
     charCount: content.length,
-    logicType: isTest
-      ? "Test"
-      : isConfig
-        ? "Config"
-        : isReact
-          ? "React Logic"
-          : "Core Logic",
   };
 }
 
-export const getRepoData = async (owner: string, repo: string) => {
+export const getRepoData = async (
+  owner: string,
+  repo: string,
+  token?: string,
+) => {
   const url = `https://api.github.com/repos/${owner}/${repo}`;
-  const headers = getHeaders();
+  const headers = getHeaders(token);
 
   const repoRes = await fetch(url, { headers, ...withCache });
 
@@ -480,39 +462,39 @@ export const getRepoData = async (owner: string, repo: string) => {
   ] = await Promise.allSettled([
     fetch(
       `https://api.github.com/repos/${owner}/${repo}/git/trees/${defaultBranch}?recursive=1`,
-      { headers: getHeaders(), ...noCache },
+      { headers: getHeaders(token), ...noCache },
     ),
     fetch(`https://api.github.com/repos/${owner}/${repo}/readme`, {
-      headers: { ...getHeaders(), Accept: "application/vnd.github.raw" },
+      headers: { ...getHeaders(token), Accept: "application/vnd.github.raw" },
       ...withCache,
     }),
     fetch(`https://api.github.com/repos/${owner}/${repo}/commits?per_page=30`, {
-      headers: getHeaders(),
+      headers: getHeaders(token),
       ...withCache,
     }),
     fetch(
       `https://api.github.com/repos/${owner}/${repo}/contributors?per_page=20`,
-      { headers: getHeaders(), ...withCache },
+      { headers: getHeaders(token), ...withCache },
     ),
     fetch(`https://api.github.com/repos/${owner}/${repo}/languages`, {
-      headers: getHeaders(),
+      headers: getHeaders(token),
       ...withCache,
     }),
     fetch(`https://api.github.com/repos/${owner}/${repo}/releases?per_page=5`, {
-      headers: getHeaders(),
+      headers: getHeaders(token),
       ...withCache,
     }),
     fetch(
       `https://api.github.com/repos/${owner}/${repo}/branches?per_page=30`,
-      { headers: getHeaders(), ...withCache },
+      { headers: getHeaders(token), ...withCache },
     ),
     fetch(
       `https://api.github.com/repos/${owner}/${repo}/issues?state=open&per_page=30&pulls=false`,
-      { headers: getHeaders(), ...withCache },
+      { headers: getHeaders(token), ...withCache },
     ),
     fetch(
       `https://api.github.com/repos/${owner}/${repo}/pulls?state=all&per_page=30`,
-      { headers: getHeaders(), ...withCache },
+      { headers: getHeaders(token), ...withCache },
     ),
   ]);
 
@@ -563,7 +545,7 @@ export const getRepoData = async (owner: string, repo: string) => {
 
   const commitsByAuthorEntries = await Promise.all(
     contributorLogins.map(async (login) => {
-      const commits = await fetchCommitsForAuthor(owner, repo, login);
+      const commits = await fetchCommitsForAuthor(owner, repo, login, token);
       return [login, commits] as [string, CommitDetail[]];
     }),
   );
@@ -581,17 +563,21 @@ export const getRepoData = async (owner: string, repo: string) => {
   const allPaths = rawTree.map((n: any) => n.path as string);
 
   const flatTree: RepoTreeEntry[] = rawTree.map((n: any) => {
-    const namePart = n.path.split("/").pop() ?? n.path;
-    const ext = namePart.includes(".")
-      ? namePart.split(".").pop()!.toLowerCase()
-      : "";
+    const parts = n.path.split("/");
+    const namePart = parts[parts.length - 1] || "";
+    const isFolder = n.type === "tree";
+    const ext =
+      !isFolder && namePart.includes(".")
+        ? (namePart.split(".").pop() || "").toLowerCase()
+        : "";
+
     return {
       path: n.path,
       name: namePart,
-      type: n.type === "tree" ? "folder" : "file",
+      type: isFolder ? "folder" : "file",
       ext,
       size: n.size ?? 0,
-      depth: n.path.split("/").length,
+      depth: parts.length,
       sha: n.sha,
     };
   });
@@ -774,12 +760,58 @@ export const getRepoData = async (owner: string, repo: string) => {
     },
   };
 
+  // Create the nested structure for the UI
+  const nestedTree: any[] = [];
+  const treeMap: Record<string, any> = {};
+
+  flatTree.forEach((item) => {
+    const parts = item.path.split("/");
+    let currentLevel = nestedTree;
+    let currentPath = "";
+
+    parts.forEach((part, index) => {
+      currentPath = currentPath ? `${currentPath}/${part}` : part;
+      const isFolder = index < parts.length - 1 || item.type === "folder";
+
+      if (!treeMap[currentPath]) {
+        const newNode: any = {
+          name: part,
+          path: currentPath,
+          type: isFolder ? "folder" : "file",
+          sha: isFolder ? undefined : item.sha,
+          ext: !isFolder
+            ? (part.split(".").pop() || "").toLowerCase()
+            : undefined,
+          size: !isFolder ? item.size || 0 : 0,
+          children: isFolder ? [] : undefined,
+        };
+        treeMap[currentPath] = newNode;
+        currentLevel.push(newNode);
+      }
+
+      if (isFolder) {
+        currentLevel = treeMap[currentPath].children;
+      }
+    });
+  });
+
+  const filesMetadata = flatTree
+    .filter((item) => item.type === "file")
+    .map((item) => ({
+      path: item.path,
+      name: item.name,
+      size: Number(item.size) || 0,
+      sha: item.sha,
+      ext: item.ext,
+      depth: item.depth,
+    }));
+
   return {
-    tree: rawTree,
+    tree: nestedTree,
     readme: readmeText,
     metadata: repoContext.meta,
     repoContext,
-    filesMetadata: [],
+    filesMetadata,
     importGraph: {},
   };
 };

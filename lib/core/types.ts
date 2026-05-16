@@ -263,7 +263,6 @@ export interface FileContext {
       loops: number;
       asyncOps: number;
     };
-    logicType: string;
     isReact: boolean;
     isTypeScript: boolean;
     isTest: boolean;
@@ -381,7 +380,6 @@ export interface FullRepoData {
       isTest: boolean;
       isConfig: boolean;
       hasJsx: boolean;
-      logicType: string;
     };
   }[];
   importGraph: Record<string, { imports: string[]; imported_by: string[] }>;
@@ -648,7 +646,6 @@ export interface LightFileMetadata {
     isTest: boolean;
     isConfig: boolean;
     hasJsx: boolean;
-    logicType: string;
   };
 }
 

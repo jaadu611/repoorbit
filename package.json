@@ -2,18 +2,38 @@
   "name": "repoorbit",
   "version": "0.1.0",
   "private": true,
+  "main": "./dist-extension/extension_v4_final.js",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "repoorbit.openWorkspace",
+        "title": "Open RepoOrbit Workspace",
+        "category": "RepoOrbit"
+      },
+      {
+        "command": "repoorbit.updateToken",
+        "title": "Update GitHub Token",
+        "category": "RepoOrbit"
+      }
+    ]
+  },
   "scripts": {
-    "dev": "bash start.sh",
-    "build": "next build",
-    "start": "next start",
-    "lint": "eslint"
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "eslint",
+    "ext:build-ui": "vite build",
+    "ext:build-host": "esbuild src/extension.ts --bundle --outfile=dist-extension/extension_v4_final.js --external:vscode --platform=node",
+    "ext:package": "npm run ext:build-ui && npm run ext:build-host"
   },
   "dependencies": {
     "d3": "^7.9.0",
     "lucide-react": "^0.575.0",
-    "next": "16.1.6",
     "openai": "^6.37.0",
-    "playwright": "^1.58.2",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "react-markdown": "^10.1.0",
@@ -24,7 +44,7 @@
   "devDependencies": {
     "@babel/parser": "^7.29.2",
     "@babel/traverse": "^7.29.0",
-    "@tailwindcss/postcss": "^4",
+    "@tailwindcss/vite": "^4",
     "@types/babel__core": "^7.20.5",
     "@types/babel__traverse": "^7.28.0",
     "@types/d3": "^7.4.3",
@@ -32,10 +52,12 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@types/react-syntax-highlighter": "^15.5.13",
-    "concurrently": "^9.2.1",
+    "@types/vscode": "^1.90.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "esbuild": "^0.25.0",
     "eslint": "^9",
-    "eslint-config-next": "16.1.6",
     "tailwindcss": "^4",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vite": "^6.1.1"
   }
 }

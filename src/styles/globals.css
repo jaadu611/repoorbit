@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+@theme {
+  --color-antigravity-bg: rgb(18, 18, 18);
+  --color-antigravity-panel: rgb(24, 24, 24);
+  --color-antigravity-surface: rgb(32, 32, 32);
+  --color-antigravity-border: rgb(43, 43, 43);
+  --color-antigravity-accent: #3b82f6;
+  --color-antigravity-highlight: rgba(59, 130, 246, 0.1);
+  --color-antigravity-text-primary: #e2e8f0;
+  --color-antigravity-text-secondary: #94a3b8;
+  --color-antigravity-code-bg: #0d0d0d;
+}
+
+* {
+  scrollbar-width: none;
+  box-sizing: border-box;
+}
+
+::-webkit-scrollbar {
+  display: none;
+}
+
+body {
+  background-color: var(--color-antigravity-bg);
+  color: var(--color-antigravity-text-primary);
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+.custom-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.05) transparent;
+}
+
+/* Antigravity Glass Effect */
+.glass-panel {
+  background: rgba(24, 24, 24, 0.7);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgb(43, 43, 43);
+}
+
+.edge-to-edge {
+  width: 100%;
+  height: 100%;
+}
+
+/* Subtle Glows */
+.antigravity-glow {
+  box-shadow: 0 0 40px rgba(59, 130, 246, 0.05);
+}
+@keyframes scan {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(100%); }
+}
