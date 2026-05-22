@@ -2,7 +2,7 @@
   "name": "repoorbit",
   "displayName": "RepoOrbit App",
   "description": "Run self-healing query pipelines and review diffs inside your local workspace.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "JAADU611",
   "icon": "logo.png",
   "repository": {
