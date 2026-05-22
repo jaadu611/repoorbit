@@ -1,5 +1,5 @@
 {
-  "name": "repoorbit",
+  "name": "repoorbit-vs",
   "displayName": "RepoOrbit",
   "description": "Run self-healing query pipelines and review diffs inside your local workspace.",
   "version": "0.1.0",
