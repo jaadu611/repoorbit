@@ -1,0 +1,11 @@
+.vscode/**
+.git/**
+.gitignore
+src/**
+node_modules/**
+tsconfig.json
+tsconfig.tsbuildinfo
+vite.config.ts
+*.vsix
+commands_debug.json
+index.html

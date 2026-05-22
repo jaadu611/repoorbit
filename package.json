@@ -1,7 +1,13 @@
 {
   "name": "repoorbit",
+  "displayName": "RepoOrbit",
+  "description": "Run self-healing query pipelines and review diffs inside your local workspace.",
   "version": "0.1.0",
-  "private": true,
+  "publisher": "JAADU611",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jaadu611/repoorbit.git"
+  },
   "main": "./dist-extension/extension_v4_final.js",
   "engines": {
     "vscode": "^1.90.0"
