@@ -46,3 +46,6 @@ notebooklm_sources/
 
 # docker
 docker-compose.override.yml
+
+# VS Code packaging
+*.vsix
