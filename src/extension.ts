@@ -850,8 +850,18 @@ class SidebarWebviewViewProvider implements vscode.WebviewViewProvider {
       }
     });
 
-    // Auto-launch the main editor workspace panel when the sidebar view is opened/resolved
-    vscode.commands.executeCommand('repoorbit.openWorkspace');
+    webviewView.onDidChangeVisibility(() => {
+      if (webviewView.visible) {
+        vscode.commands.executeCommand('repoorbit.openWorkspace');
+        vscode.commands.executeCommand('workbench.action.closeSidebar');
+      }
+    });
+
+    // Auto-launch the main editor workspace panel and close the sidebar immediately
+    if (webviewView.visible) {
+      vscode.commands.executeCommand('repoorbit.openWorkspace');
+      vscode.commands.executeCommand('workbench.action.closeSidebar');
+    }
   }
 
   private _getHtmlForWebview(webview: vscode.Webview) {
@@ -865,100 +875,66 @@ class SidebarWebviewViewProvider implements vscode.WebviewViewProvider {
       background-color: transparent;
       color: var(--vscode-foreground);
       font-family: var(--vscode-font-family);
-      padding: 20px 16px;
+      padding: 30px 16px;
       display: flex;
       flex-direction: column;
       align-items: center;
-      justify-content: flex-start;
+      justify-content: center;
       height: 100vh;
       box-sizing: border-box;
       text-align: center;
+      overflow: hidden;
     }
-    .logo-container {
-      margin-top: 20px;
-      margin-bottom: 20px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      width: 60px;
-      height: 60px;
-      border-radius: 16px;
-      background: linear-gradient(135deg, rgba(37,99,235,0.15) 0%, rgba(124,58,237,0.1) 100%);
-      border: 1px border var(--vscode-button-border, rgba(255,255,255,0.1));
-      box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+    .spinner {
+      width: 24px;
+      height: 24px;
+      border: 2px solid rgba(49,134,255,0.15);
+      border-top-color: var(--vscode-textLink-foreground, #3186ff);
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin-bottom: 16px;
     }
-    .logo {
-      font-size: 28px;
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
     }
     h2 {
-      font-size: 13px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.15em;
-      margin: 0 0 6px 0;
-      color: var(--vscode-editor-foreground, #fff);
-      background: linear-gradient(90deg, #fff 0%, var(--vscode-textLink-foreground, #3186ff) 100%);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-    }
-    .subtitle {
-      font-size: 9px;
+      font-size: 11px;
+      font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.1em;
+      margin: 0 0 8px 0;
       color: var(--vscode-descriptionForeground);
-      opacity: 0.5;
-      margin-bottom: 16px;
-      font-weight: 600;
     }
     p {
-      font-size: 11px;
+      font-size: 10px;
       color: var(--vscode-descriptionForeground);
-      margin: 0 0 28px 0;
-      line-height: 1.5;
+      opacity: 0.6;
+      margin: 0 0 20px 0;
     }
     .btn {
-      background: linear-gradient(135deg, #3186ff, #7c3aed);
-      color: white;
-      border: none;
-      padding: 10px 16px;
-      font-size: 10px;
-      font-weight: 700;
+      background: transparent;
+      color: var(--vscode-textLink-foreground, #3186ff);
+      border: 1px solid var(--vscode-textLink-foreground, #3186ff);
+      padding: 6px 12px;
+      font-size: 9px;
+      font-weight: 600;
       text-transform: uppercase;
-      letter-spacing: 0.1em;
-      border-radius: 6px;
+      letter-spacing: 0.05em;
+      border-radius: 4px;
       cursor: pointer;
-      box-shadow: 0 4px 15px rgba(49,134,255,0.25);
-      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-      width: 100%;
-      outline: none;
+      transition: all 0.15s ease;
     }
     .btn:hover {
-      transform: translateY(-1px);
-      box-shadow: 0 6px 20px rgba(49,134,255,0.35);
-      filter: brightness(1.1);
-    }
-    .btn:active {
-      transform: translateY(1px);
-    }
-    .footer {
-      position: absolute;
-      bottom: 24px;
-      font-size: 9px;
-      color: var(--vscode-descriptionForeground);
-      opacity: 0.5;
-      font-family: var(--vscode-editor-font-family, monospace);
+      background: rgba(49,134,255,0.1);
     }
   </style>
 </head>
 <body>
-  <div class="logo-container">
-    <div class="logo">🚀</div>
-  </div>
-  <h2>RepoOrbit</h2>
-  <div class="subtitle">Control Center</div>
-  <p>Run automated, self-healing query pipelines and review diffs inside your local workspace.</p>
-  <button class="btn" onclick="openWorkspace()">Open Workspace Tab</button>
-  <div class="footer">v0.1.0</div>
+  <div class="spinner"></div>
+  <h2>Launching Workspace</h2>
+  <p>Redirecting to the main editor viewport...</p>
+  <button class="btn" onclick="openWorkspace()">Open Manually</button>
 
   <script>
     const vscode = acquireVsCodeApi();
