@@ -27,7 +27,7 @@
         {
           "id": "repoorbit-sidebar-container",
           "title": "RepoOrbit",
-          "icon": "$(rocket)"
+          "icon": "logo.png"
         }
       ]
     },
