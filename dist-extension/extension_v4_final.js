@@ -652,6 +652,7 @@ var activeState = {
   defaultBranch: "",
   config: { model: "MODEL_PLACEHOLDER_M84" }
 };
+var currentWebview = void 0;
 async function discoverLS() {
   try {
     const psOutput = (0, import_child_process.execSync)("ps -ax -o pid=,command=", { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 });
@@ -954,6 +955,286 @@ ${thinking}
   }
   return lastText || "AI response timed out.";
 }
+async function handleWebviewMessage(webview, message, context) {
+  console.log("[RepoOrbit] Message Received:", message.command);
+  switch (message.command) {
+    case "getModels":
+      try {
+        const models = await fetchModelsHybrid();
+        webview.postMessage({ command: "setModels", models });
+      } catch (err) {
+        webview.postMessage({ command: "setModels", models: [], error: err.message });
+      }
+      return;
+    case "chat":
+      try {
+        const { query, config, repoContext } = message;
+        const modelId = config.model;
+        console.log(`[RepoOrbit] AI Chat Request [Model: ${modelId}]:`, query);
+        activeState.isLoading = true;
+        activeState.config = config;
+        try {
+          const responseText = await sendAntigravityChatDirect(
+            query,
+            modelId,
+            repoContext,
+            (update) => {
+              if (activeState.messages.length > 0) {
+                const lastMsg = activeState.messages[activeState.messages.length - 1];
+                if (lastMsg && lastMsg.role === "assistant") {
+                  lastMsg.content = update.text;
+                  lastMsg.steps = update.steps;
+                } else {
+                  activeState.messages.push({
+                    role: "assistant",
+                    content: update.text,
+                    steps: update.steps
+                  });
+                }
+              } else {
+                activeState.messages.push({
+                  role: "assistant",
+                  content: update.text,
+                  steps: update.steps
+                });
+              }
+              currentWebview?.postMessage({
+                command: "chatStream",
+                text: update.text,
+                steps: update.steps
+              });
+            }
+          );
+          if (activeState.messages.length > 0) {
+            const lastMsg = activeState.messages[activeState.messages.length - 1];
+            if (lastMsg && lastMsg.role === "assistant") {
+              lastMsg.content = responseText;
+            }
+          }
+          activeState.isLoading = false;
+          webview.postMessage({ command: "chatResponse", text: responseText });
+          return;
+        } catch (lsErr) {
+          console.warn("[RepoOrbit] Direct Cascade Flow failed:", lsErr.message);
+          if (lsErr.message.includes("exhausted") || lsErr.message.includes("quota") || lsErr.message.includes("capacity")) {
+            activeState.isLoading = false;
+            webview.postMessage({ command: "chatError", text: lsErr.message });
+            return;
+          }
+          console.log("[RepoOrbit] Trying fallbacks for non-quota error...");
+        }
+        if (vscode.lm) {
+          try {
+            const models = await vscode.lm.selectChatModels({ family: modelId.includes("gemini") ? "gemini" : void 0 });
+            const model = models.find((m) => m.id === modelId) || models[0];
+            if (model) {
+              const request = [new vscode.LanguageModelUserMessage(query)];
+              const lmResponse = await model.sendRequest(request, {}, new vscode.CancellationTokenSource().token);
+              let fullText = "";
+              for await (const fragment of lmResponse.text) {
+                fullText += fragment;
+              }
+              if (activeState.messages.length > 0) {
+                const lastMsg = activeState.messages[activeState.messages.length - 1];
+                if (lastMsg && lastMsg.role === "assistant") {
+                  lastMsg.content = fullText;
+                }
+              }
+              activeState.isLoading = false;
+              webview.postMessage({ command: "chatResponse", text: fullText });
+              return;
+            }
+          } catch (lmErr) {
+            console.warn("[RepoOrbit] vscode.lm fallback failed:", lmErr);
+          }
+        }
+        const cmds = await vscode.commands.getCommands(true);
+        const chatCmd = cmds.find((c) => c.includes("antigravity") && c.includes("chat")) || cmds.find((c) => c.includes("chat.focus"));
+        if (chatCmd) {
+          console.log("[RepoOrbit] Forwarding to discovered command:", chatCmd);
+          await vscode.commands.executeCommand(chatCmd, query);
+          const fallbackMsg = "\u{1F680} Direct API call failed. Prompt forwarded to the native Antigravity Chat panel.";
+          if (activeState.messages.length > 0) {
+            const lastMsg = activeState.messages[activeState.messages.length - 1];
+            if (lastMsg && lastMsg.role === "assistant") {
+              lastMsg.content = fallbackMsg;
+            }
+          }
+          activeState.isLoading = false;
+          webview.postMessage({
+            command: "chatResponse",
+            text: fallbackMsg
+          });
+        } else {
+          throw new Error("All chat providers failed and no native chat command found.");
+        }
+      } catch (err) {
+        activeState.isLoading = false;
+        webview.postMessage({ command: "setError", text: `Chat Error: ${err.message}` });
+      }
+      return;
+    case "analyzeRepo":
+      try {
+        const { owner, repo } = parseRepoInput((message.url || "").trim());
+        const storedToken = context.globalState.get("github_token");
+        const repoData = await getRepoData(owner, repo, storedToken);
+        webview.postMessage({
+          command: "setRepoData",
+          treeRoot: { name: repoData.metadata.name, path: "", type: "folder", children: repoData.tree },
+          fullRepoData: repoData
+        });
+      } catch (err) {
+        webview.postMessage({ command: "setError", text: err.message });
+      }
+      return;
+    case "getFileContent":
+      try {
+        const { owner, repo } = parseRepoInput((message.url || "").trim());
+        const storedToken = context.globalState.get("github_token");
+        const [content, commits] = await Promise.all([
+          fetchFileContent(owner, repo, message.path, message.branch || "main", storedToken),
+          fetchCommitsForPath(owner, repo, message.path, storedToken)
+        ]);
+        webview.postMessage({
+          command: "fileContentResponse",
+          path: message.path,
+          content,
+          analysis: content ? analyzeFile(message.path, content) : null,
+          latestCommit: commits?.[0] || null,
+          history: commits
+        });
+      } catch (err) {
+        webview.postMessage({ command: "fileContentResponse", path: message.path, error: err.message });
+      }
+      return;
+    case "cloneRepo":
+      try {
+        const { url, path: targetPath } = message;
+        let fullPath = targetPath;
+        if (!path2.isAbsolute(targetPath)) {
+          const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+          if (workspaceFolder) {
+            fullPath = path2.join(workspaceFolder, targetPath);
+          } else {
+            fullPath = path2.join(process.cwd(), targetPath);
+          }
+        }
+        console.log(`[RepoOrbit] Cloning ${url} into ${fullPath}...`);
+        let cloneDest = fullPath;
+        const parentDir = path2.dirname(cloneDest);
+        if (!fs.existsSync(parentDir)) {
+          fs.mkdirSync(parentDir, { recursive: true });
+        }
+        (0, import_child_process.execSync)(`git clone ${url} "${cloneDest}"`, { stdio: "inherit" });
+        try {
+          const agentsRulesDir = path2.join(cloneDest, ".agents", "rules");
+          if (!fs.existsSync(agentsRulesDir)) {
+            fs.mkdirSync(agentsRulesDir, { recursive: true });
+          }
+          const masterPath = path2.join(agentsRulesDir, "MASTER.md");
+          if (!fs.existsSync(masterPath)) {
+            fs.writeFileSync(masterPath, MASTER_MD_CONTENT);
+          }
+          const repoorbitDir = path2.join(cloneDest, ".repoorbit");
+          if (!fs.existsSync(repoorbitDir)) {
+            fs.mkdirSync(repoorbitDir, { recursive: true });
+          }
+          const queriesPath = path2.join(repoorbitDir, "queries.md");
+          if (!fs.existsSync(queriesPath)) {
+            fs.writeFileSync(queriesPath, DEFAULT_QUERIES_CONTENT);
+          }
+        } catch (bootstrapErr) {
+          console.error("[RepoOrbit] Failed to bootstrap rules/queries:", bootstrapErr);
+        }
+        vscode.window.showInformationMessage(`RepoOrbit: Cloned ${url} successfully!`);
+        webview.postMessage({ command: "cloneSuccess", path: cloneDest });
+      } catch (err) {
+        console.error("[RepoOrbit] Clone failed:", err);
+        webview.postMessage({ command: "setError", text: `Clone Failed: ${err.message}` });
+      }
+      return;
+    case "readQueriesFile":
+      try {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!workspaceFolder) {
+          webview.postMessage({ command: "queriesFileResponse", exists: false, queries: [] });
+          return;
+        }
+        const filePath = path2.join(workspaceFolder, ".repoorbit", "queries.md");
+        if (!fs.existsSync(filePath)) {
+          webview.postMessage({ command: "queriesFileResponse", exists: false, queries: [] });
+          return;
+        }
+        const content = fs.readFileSync(filePath, "utf8");
+        const lines = content.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0).filter((line) => !line.startsWith("#")).map((line) => line.replace(/^[-*+]\s+/, "").replace(/^\d+\.\s+/, "")).filter((line) => line.length > 0);
+        webview.postMessage({ command: "queriesFileResponse", exists: true, queries: lines });
+      } catch (err) {
+        webview.postMessage({ command: "queriesFileResponse", exists: false, queries: [] });
+      }
+      return;
+    case "createQueriesFile":
+      try {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!workspaceFolder) return;
+        const repoorbitDir = path2.join(workspaceFolder, ".repoorbit");
+        if (!fs.existsSync(repoorbitDir)) {
+          fs.mkdirSync(repoorbitDir, { recursive: true });
+        }
+        const queriesPath = path2.join(repoorbitDir, "queries.md");
+        if (!fs.existsSync(queriesPath)) {
+          fs.writeFileSync(queriesPath, DEFAULT_QUERIES_CONTENT);
+        }
+        const content = fs.readFileSync(queriesPath, "utf8");
+        const lines = content.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0).filter((line) => !line.startsWith("#")).map((line) => line.replace(/^[-*+]\s+/, "").replace(/^\d+\.\s+/, "")).filter((line) => line.length > 0);
+        webview.postMessage({ command: "queriesFileResponse", exists: true, queries: lines });
+      } catch (err) {
+        console.error(err);
+      }
+      return;
+    case "checkWorkspaceStatus":
+      try {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!workspaceFolder) {
+          webview.postMessage({ command: "workspaceStatus", isEmpty: true });
+          return;
+        }
+        const files = fs.readdirSync(workspaceFolder);
+        const meaningfulFiles = files.filter((f) => ![".git", ".DS_Store", ".vscode", ".antigravity"].includes(f));
+        webview.postMessage({ command: "workspaceStatus", isEmpty: meaningfulFiles.length === 0 });
+      } catch (err) {
+        webview.postMessage({ command: "workspaceStatus", isEmpty: false });
+      }
+      return;
+    case "saveToken":
+      await context.globalState.update("github_token", message.token);
+      vscode.window.showInformationMessage("RepoOrbit: Token saved!");
+      return;
+    case "syncState":
+      if (message.state) {
+        activeState = { ...activeState, ...message.state };
+      }
+      return;
+    case "getStoredState":
+      webview.postMessage({ command: "restoreState", state: activeState });
+      return;
+    case "clearChat":
+      activeState = {
+        messages: [],
+        isPlaying: false,
+        currentQueryIndex: -1,
+        retryCount: 0,
+        isLoading: false,
+        repoUrl: activeState.repoUrl,
+        forkOwner: "",
+        upstreamOwner: "",
+        upstreamRepo: "",
+        branchName: "",
+        defaultBranch: "",
+        config: activeState.config
+      };
+      return;
+  }
+}
 async function activate(context) {
   console.log("[RepoOrbit] Extension activated");
   const isFileGitIgnoredCmd = vscode.commands.registerCommand("antigravity.isFileGitIgnored", async (uri) => {
@@ -972,7 +1253,6 @@ async function activate(context) {
   let token = context.globalState.get("github_token");
   if (!token) {
   }
-  let currentPanel = void 0;
   const updateTokenCmd = vscode.commands.registerCommand("repoorbit.updateToken", async () => {
     const newToken = await vscode.window.showInputBox({
       prompt: "Enter new GitHub Personal Access Token",
@@ -985,307 +1265,14 @@ async function activate(context) {
     }
   });
   const openWorkspaceCmd = vscode.commands.registerCommand("repoorbit.openWorkspace", () => {
-    if (currentPanel) {
-      currentPanel.reveal(vscode.ViewColumn.One);
-      return;
-    }
-    currentPanel = vscode.window.createWebviewPanel("repoorbit", "RepoOrbit Workspace", vscode.ViewColumn.One, {
-      enableScripts: true,
-      retainContextWhenHidden: true,
-      // Preserve state when tab is not active
-      localResourceRoots: [vscode.Uri.file(path2.join(context.extensionPath, "dist-webview"))]
-    });
-    currentPanel.onDidDispose(() => {
-      currentPanel = void 0;
-    }, null, context.subscriptions);
-    currentPanel.webview.html = getWebviewContent(
-      currentPanel.webview,
-      context.extensionUri,
-      context.extensionMode === vscode.ExtensionMode.Development
-    );
-    currentPanel.webview.onDidReceiveMessage(async (message) => {
-      if (!currentPanel) return;
-      console.log("[RepoOrbit] Message Received:", message.command);
-      switch (message.command) {
-        case "getModels":
-          try {
-            const models = await fetchModelsHybrid();
-            currentPanel.webview.postMessage({ command: "setModels", models });
-          } catch (err) {
-            currentPanel.webview.postMessage({ command: "setModels", models: [], error: err.message });
-          }
-          return;
-        case "chat":
-          try {
-            const { query, config, repoContext } = message;
-            const modelId = config.model;
-            console.log(`[RepoOrbit] AI Chat Request [Model: ${modelId}]:`, query);
-            activeState.isLoading = true;
-            activeState.config = config;
-            try {
-              const responseText = await sendAntigravityChatDirect(
-                query,
-                modelId,
-                repoContext,
-                (update) => {
-                  if (activeState.messages.length > 0) {
-                    const lastMsg = activeState.messages[activeState.messages.length - 1];
-                    if (lastMsg && lastMsg.role === "assistant") {
-                      lastMsg.content = update.text;
-                      lastMsg.steps = update.steps;
-                    } else {
-                      activeState.messages.push({
-                        role: "assistant",
-                        content: update.text,
-                        steps: update.steps
-                      });
-                    }
-                  } else {
-                    activeState.messages.push({
-                      role: "assistant",
-                      content: update.text,
-                      steps: update.steps
-                    });
-                  }
-                  currentPanel?.webview.postMessage({
-                    command: "chatStream",
-                    text: update.text,
-                    steps: update.steps
-                  });
-                }
-              );
-              if (activeState.messages.length > 0) {
-                const lastMsg = activeState.messages[activeState.messages.length - 1];
-                if (lastMsg && lastMsg.role === "assistant") {
-                  lastMsg.content = responseText;
-                }
-              }
-              activeState.isLoading = false;
-              currentPanel.webview.postMessage({ command: "chatResponse", text: responseText });
-              return;
-            } catch (lsErr) {
-              console.warn("[RepoOrbit] Direct Cascade Flow failed:", lsErr.message);
-              if (lsErr.message.includes("exhausted") || lsErr.message.includes("quota") || lsErr.message.includes("capacity")) {
-                activeState.isLoading = false;
-                currentPanel.webview.postMessage({ command: "chatError", text: lsErr.message });
-                return;
-              }
-              console.log("[RepoOrbit] Trying fallbacks for non-quota error...");
-            }
-            if (vscode.lm) {
-              try {
-                const models = await vscode.lm.selectChatModels({ family: modelId.includes("gemini") ? "gemini" : void 0 });
-                const model = models.find((m) => m.id === modelId) || models[0];
-                if (model) {
-                  const request = [new vscode.LanguageModelUserMessage(query)];
-                  const lmResponse = await model.sendRequest(request, {}, new vscode.CancellationTokenSource().token);
-                  let fullText = "";
-                  for await (const fragment of lmResponse.text) {
-                    fullText += fragment;
-                  }
-                  if (activeState.messages.length > 0) {
-                    const lastMsg = activeState.messages[activeState.messages.length - 1];
-                    if (lastMsg && lastMsg.role === "assistant") {
-                      lastMsg.content = fullText;
-                    }
-                  }
-                  activeState.isLoading = false;
-                  currentPanel.webview.postMessage({ command: "chatResponse", text: fullText });
-                  return;
-                }
-              } catch (lmErr) {
-                console.warn("[RepoOrbit] vscode.lm fallback failed:", lmErr);
-              }
-            }
-            const cmds = await vscode.commands.getCommands(true);
-            const chatCmd = cmds.find((c) => c.includes("antigravity") && c.includes("chat")) || cmds.find((c) => c.includes("chat.focus"));
-            if (chatCmd) {
-              console.log("[RepoOrbit] Forwarding to discovered command:", chatCmd);
-              await vscode.commands.executeCommand(chatCmd, query);
-              const fallbackMsg = "\u{1F680} Direct API call failed. Prompt forwarded to the native Antigravity Chat panel.";
-              if (activeState.messages.length > 0) {
-                const lastMsg = activeState.messages[activeState.messages.length - 1];
-                if (lastMsg && lastMsg.role === "assistant") {
-                  lastMsg.content = fallbackMsg;
-                }
-              }
-              activeState.isLoading = false;
-              currentPanel.webview.postMessage({
-                command: "chatResponse",
-                text: fallbackMsg
-              });
-            } else {
-              throw new Error("All chat providers failed and no native chat command found.");
-            }
-          } catch (err) {
-            activeState.isLoading = false;
-            currentPanel.webview.postMessage({ command: "setError", text: `Chat Error: ${err.message}` });
-          }
-          return;
-        case "analyzeRepo":
-          try {
-            const { owner, repo } = parseRepoInput((message.url || "").trim());
-            const storedToken = context.globalState.get("github_token");
-            const repoData = await getRepoData(owner, repo, storedToken);
-            currentPanel.webview.postMessage({
-              command: "setRepoData",
-              treeRoot: { name: repoData.metadata.name, path: "", type: "folder", children: repoData.tree },
-              fullRepoData: repoData
-            });
-          } catch (err) {
-            currentPanel.webview.postMessage({ command: "setError", text: err.message });
-          }
-          return;
-        case "getFileContent":
-          try {
-            const { owner, repo } = parseRepoInput((message.url || "").trim());
-            const storedToken = context.globalState.get("github_token");
-            const [content, commits] = await Promise.all([
-              fetchFileContent(owner, repo, message.path, message.branch || "main", storedToken),
-              fetchCommitsForPath(owner, repo, message.path, storedToken)
-            ]);
-            currentPanel.webview.postMessage({
-              command: "fileContentResponse",
-              path: message.path,
-              content,
-              analysis: content ? analyzeFile(message.path, content) : null,
-              latestCommit: commits?.[0] || null,
-              history: commits
-            });
-          } catch (err) {
-            currentPanel.webview.postMessage({ command: "fileContentResponse", path: message.path, error: err.message });
-          }
-          return;
-        case "cloneRepo":
-          try {
-            const { url, path: targetPath } = message;
-            let fullPath = targetPath;
-            if (!path2.isAbsolute(targetPath)) {
-              const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-              if (workspaceFolder) {
-                fullPath = path2.join(workspaceFolder, targetPath);
-              } else {
-                fullPath = path2.join(process.cwd(), targetPath);
-              }
-            }
-            console.log(`[RepoOrbit] Cloning ${url} into ${fullPath}...`);
-            let cloneDest = fullPath;
-            const parentDir = path2.dirname(cloneDest);
-            if (!fs.existsSync(parentDir)) {
-              fs.mkdirSync(parentDir, { recursive: true });
-            }
-            (0, import_child_process.execSync)(`git clone ${url} "${cloneDest}"`, { stdio: "inherit" });
-            try {
-              const agentsRulesDir = path2.join(cloneDest, ".agents", "rules");
-              if (!fs.existsSync(agentsRulesDir)) {
-                fs.mkdirSync(agentsRulesDir, { recursive: true });
-              }
-              const masterPath = path2.join(agentsRulesDir, "MASTER.md");
-              if (!fs.existsSync(masterPath)) {
-                fs.writeFileSync(masterPath, MASTER_MD_CONTENT);
-              }
-              const repoorbitDir = path2.join(cloneDest, ".repoorbit");
-              if (!fs.existsSync(repoorbitDir)) {
-                fs.mkdirSync(repoorbitDir, { recursive: true });
-              }
-              const queriesPath = path2.join(repoorbitDir, "queries.md");
-              if (!fs.existsSync(queriesPath)) {
-                fs.writeFileSync(queriesPath, DEFAULT_QUERIES_CONTENT);
-              }
-            } catch (bootstrapErr) {
-              console.error("[RepoOrbit] Failed to bootstrap rules/queries:", bootstrapErr);
-            }
-            vscode.window.showInformationMessage(`RepoOrbit: Cloned ${url} successfully!`);
-            currentPanel.webview.postMessage({ command: "cloneSuccess", path: cloneDest });
-          } catch (err) {
-            console.error("[RepoOrbit] Clone failed:", err);
-            currentPanel.webview.postMessage({ command: "setError", text: `Clone Failed: ${err.message}` });
-          }
-          return;
-        case "readQueriesFile":
-          try {
-            const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-            if (!workspaceFolder) {
-              currentPanel.webview.postMessage({ command: "queriesFileResponse", exists: false, queries: [] });
-              return;
-            }
-            const filePath = path2.join(workspaceFolder, ".repoorbit", "queries.md");
-            if (!fs.existsSync(filePath)) {
-              currentPanel.webview.postMessage({ command: "queriesFileResponse", exists: false, queries: [] });
-              return;
-            }
-            const content = fs.readFileSync(filePath, "utf8");
-            const lines = content.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0).filter((line) => !line.startsWith("#")).map((line) => line.replace(/^[-*+]\s+/, "").replace(/^\d+\.\s+/, "")).filter((line) => line.length > 0);
-            currentPanel.webview.postMessage({ command: "queriesFileResponse", exists: true, queries: lines });
-          } catch (err) {
-            currentPanel.webview.postMessage({ command: "queriesFileResponse", exists: false, queries: [] });
-          }
-          return;
-        case "createQueriesFile":
-          try {
-            const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-            if (!workspaceFolder) return;
-            const repoorbitDir = path2.join(workspaceFolder, ".repoorbit");
-            if (!fs.existsSync(repoorbitDir)) {
-              fs.mkdirSync(repoorbitDir, { recursive: true });
-            }
-            const queriesPath = path2.join(repoorbitDir, "queries.md");
-            if (!fs.existsSync(queriesPath)) {
-              fs.writeFileSync(queriesPath, DEFAULT_QUERIES_CONTENT);
-            }
-            const content = fs.readFileSync(queriesPath, "utf8");
-            const lines = content.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0).filter((line) => !line.startsWith("#")).map((line) => line.replace(/^[-*+]\s+/, "").replace(/^\d+\.\s+/, "")).filter((line) => line.length > 0);
-            currentPanel.webview.postMessage({ command: "queriesFileResponse", exists: true, queries: lines });
-          } catch (err) {
-            console.error(err);
-          }
-          return;
-        case "checkWorkspaceStatus":
-          try {
-            const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-            if (!workspaceFolder) {
-              currentPanel.webview.postMessage({ command: "workspaceStatus", isEmpty: true });
-              return;
-            }
-            const files = fs.readdirSync(workspaceFolder);
-            const meaningfulFiles = files.filter((f) => ![".git", ".DS_Store", ".vscode", ".antigravity"].includes(f));
-            currentPanel.webview.postMessage({ command: "workspaceStatus", isEmpty: meaningfulFiles.length === 0 });
-          } catch (err) {
-            currentPanel.webview.postMessage({ command: "workspaceStatus", isEmpty: false });
-          }
-          return;
-        case "saveToken":
-          await context.globalState.update("github_token", message.token);
-          vscode.window.showInformationMessage("RepoOrbit: Token saved!");
-          return;
-        case "syncState":
-          if (message.state) {
-            activeState = { ...activeState, ...message.state };
-          }
-          return;
-        case "getStoredState":
-          currentPanel.webview.postMessage({ command: "restoreState", state: activeState });
-          return;
-        case "clearChat":
-          activeState = {
-            messages: [],
-            isPlaying: false,
-            currentQueryIndex: -1,
-            retryCount: 0,
-            isLoading: false,
-            repoUrl: activeState.repoUrl,
-            forkOwner: "",
-            upstreamOwner: "",
-            upstreamRepo: "",
-            branchName: "",
-            defaultBranch: "",
-            config: activeState.config
-          };
-          return;
-      }
-    });
+    vscode.commands.executeCommand("workbench.view.extension.repoorbit-sidebar-container");
+    vscode.commands.executeCommand("repoorbit.sidebarView.focus");
   });
-  const sidebarProvider = new SidebarWebviewViewProvider(context.extensionUri);
+  const sidebarProvider = new SidebarWebviewViewProvider(
+    context.extensionUri,
+    context.extensionMode === vscode.ExtensionMode.Development,
+    context
+  );
   const sidebarViewReg = vscode.window.registerWebviewViewProvider(
     SidebarWebviewViewProvider.viewType,
     sidebarProvider
@@ -1293,8 +1280,10 @@ async function activate(context) {
   context.subscriptions.push(updateTokenCmd, openWorkspaceCmd, sidebarViewReg);
 }
 var SidebarWebviewViewProvider = class {
-  constructor(_extensionUri) {
+  constructor(_extensionUri, _isDev, _context) {
     this._extensionUri = _extensionUri;
+    this._isDev = _isDev;
+    this._context = _context;
   }
   static {
     this.viewType = "repoorbit.sidebarView";
@@ -1303,107 +1292,22 @@ var SidebarWebviewViewProvider = class {
     this._view = webviewView;
     webviewView.webview.options = {
       enableScripts: true,
-      localResourceRoots: [this._extensionUri]
+      localResourceRoots: [vscode.Uri.file(path2.join(this._extensionUri.fsPath, "dist-webview"))]
     };
-    webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
-    webviewView.webview.onDidReceiveMessage((data) => {
-      switch (data.command) {
-        case "openWorkspace":
-          vscode.commands.executeCommand("repoorbit.openWorkspace");
-          break;
+    webviewView.webview.html = getWebviewContent(
+      webviewView.webview,
+      this._extensionUri,
+      this._isDev
+    );
+    currentWebview = webviewView.webview;
+    webviewView.webview.onDidReceiveMessage(async (message) => {
+      await handleWebviewMessage(webviewView.webview, message, this._context);
+    });
+    webviewView.onDidDispose(() => {
+      if (currentWebview === webviewView.webview) {
+        currentWebview = void 0;
       }
     });
-    webviewView.onDidChangeVisibility(() => {
-      if (webviewView.visible) {
-        vscode.commands.executeCommand("repoorbit.openWorkspace");
-        vscode.commands.executeCommand("workbench.action.closeSidebar");
-      }
-    });
-    if (webviewView.visible) {
-      vscode.commands.executeCommand("repoorbit.openWorkspace");
-      vscode.commands.executeCommand("workbench.action.closeSidebar");
-    }
-  }
-  _getHtmlForWebview(webview) {
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    body {
-      background-color: transparent;
-      color: var(--vscode-foreground);
-      font-family: var(--vscode-font-family);
-      padding: 30px 16px;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      height: 100vh;
-      box-sizing: border-box;
-      text-align: center;
-      overflow: hidden;
-    }
-    .spinner {
-      width: 24px;
-      height: 24px;
-      border: 2px solid rgba(49,134,255,0.15);
-      border-top-color: var(--vscode-textLink-foreground, #3186ff);
-      border-radius: 50%;
-      animation: spin 1s linear infinite;
-      margin-bottom: 16px;
-    }
-    @keyframes spin {
-      0% { transform: rotate(0deg); }
-      100% { transform: rotate(360deg); }
-    }
-    h2 {
-      font-size: 11px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.1em;
-      margin: 0 0 8px 0;
-      color: var(--vscode-descriptionForeground);
-    }
-    p {
-      font-size: 10px;
-      color: var(--vscode-descriptionForeground);
-      opacity: 0.6;
-      margin: 0 0 20px 0;
-    }
-    .btn {
-      background: transparent;
-      color: var(--vscode-textLink-foreground, #3186ff);
-      border: 1px solid var(--vscode-textLink-foreground, #3186ff);
-      padding: 6px 12px;
-      font-size: 9px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      border-radius: 4px;
-      cursor: pointer;
-      transition: all 0.15s ease;
-    }
-    .btn:hover {
-      background: rgba(49,134,255,0.1);
-    }
-  </style>
-</head>
-<body>
-  <div class="spinner"></div>
-  <h2>Launching Workspace</h2>
-  <p>Redirecting to the main editor viewport...</p>
-  <button class="btn" onclick="openWorkspace()">Open Manually</button>
-
-  <script>
-    const vscode = acquireVsCodeApi();
-    function openWorkspace() {
-      vscode.postMessage({ command: 'openWorkspace' });
-    }
-  </script>
-</body>
-</html>`;
   }
 };
 function getWebviewContent(webview, extensionUri, isDev) {

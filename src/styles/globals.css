@@ -49,12 +49,18 @@
   display: none;
 }
 
-body {
-  background-color: var(--color-antigravity-bg);
-  color: var(--color-antigravity-text-primary);
+html,
+body,
+#root {
+  height: 100%;
   margin: 0;
   padding: 0;
   overflow: hidden;
+}
+
+body {
+  background-color: var(--color-antigravity-bg);
+  color: var(--color-antigravity-text-primary);
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
 }
 

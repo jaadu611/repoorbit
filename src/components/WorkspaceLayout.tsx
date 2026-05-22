@@ -15,6 +15,8 @@ import {
   Terminal,
   Globe,
   Cpu,
+  FolderOpen,
+  Send,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -486,6 +488,7 @@ export default function WorkspaceLayout({
   const [clonePath, setClonePath] = useState("./");
   const [isCloning, setIsCloning] = useState(false);
   const [isWorkspaceEmpty, setIsWorkspaceEmpty] = useState(false);
+  const [textareaHeight, setTextareaHeight] = useState(28);
   const [error, setError] = useState<string | null>(initialError);
 
   const [forkOwner, setForkOwner] = useState<string>("");
@@ -711,7 +714,13 @@ export default function WorkspaceLayout({
   useEffect(() => {
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
-      textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 200)}px`;
+      const sh = textareaRef.current.scrollHeight;
+      const borderHeight = 2;
+      const targetHeight = !input.trim()
+        ? 28
+        : Math.max(Math.min(sh + borderHeight, 200), 28);
+      textareaRef.current.style.height = `${targetHeight}px`;
+      setTextareaHeight(targetHeight);
     }
   }, [input]);
 
@@ -944,16 +953,23 @@ export default function WorkspaceLayout({
           const restored = message.state;
           if (restored) {
             if (restored.messages) setMessages(restored.messages);
-            if (typeof restored.isPlaying === 'boolean') setIsPlaying(restored.isPlaying);
-            if (typeof restored.currentQueryIndex === 'number') setCurrentQueryIndex(restored.currentQueryIndex);
-            if (typeof restored.retryCount === 'number') setRetryCount(restored.retryCount);
-            if (typeof restored.isLoading === 'boolean') setIsLoading(restored.isLoading);
-            if (typeof restored.repoUrl === 'string') setRepoUrl(restored.repoUrl);
+            if (typeof restored.isPlaying === "boolean")
+              setIsPlaying(restored.isPlaying);
+            if (typeof restored.currentQueryIndex === "number")
+              setCurrentQueryIndex(restored.currentQueryIndex);
+            if (typeof restored.retryCount === "number")
+              setRetryCount(restored.retryCount);
+            if (typeof restored.isLoading === "boolean")
+              setIsLoading(restored.isLoading);
+            if (typeof restored.repoUrl === "string")
+              setRepoUrl(restored.repoUrl);
             if (restored.forkOwner) setForkOwner(restored.forkOwner);
-            if (restored.upstreamOwner) setUpstreamOwner(restored.upstreamOwner);
+            if (restored.upstreamOwner)
+              setUpstreamOwner(restored.upstreamOwner);
             if (restored.upstreamRepo) setUpstreamRepo(restored.upstreamRepo);
             if (restored.branchName) setBranchName(restored.branchName);
-            if (restored.defaultBranch) setDefaultBranch(restored.defaultBranch);
+            if (restored.defaultBranch)
+              setDefaultBranch(restored.defaultBranch);
             if (restored.config) setConfig(restored.config);
           }
           setIsRestored(true);
@@ -969,215 +985,213 @@ export default function WorkspaceLayout({
   return (
     <div
       id="workspace-viewport"
-      className="h-screen w-screen bg-[var(--color-antigravity-bg)] text-[var(--color-antigravity-text-primary)] flex overflow-hidden font-sans pt-1 relative"
+      className="h-full w-full bg-[var(--color-antigravity-bg)] text-[var(--color-antigravity-text-primary)] flex overflow-hidden font-sans pt-1 relative"
     >
       <div
         className="w-full flex flex-col bg-[var(--color-antigravity-bg)] h-full overflow-hidden neural-grid relative vendor-glow"
         data-vendor={activeVendor}
       >
         {/* Top Part: Title, Repository search, and Model Selector */}
-        <div className="flex-none bg-[var(--color-antigravity-panel)]/40 border-b border-[var(--color-antigravity-border)] relative z-30">
-          <div className="px-3 h-10 flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2.5 min-w-0 flex-1">
-              <Terminal
-                size={12}
-                className="text-[var(--color-antigravity-accent)] shrink-0"
-              />
+        <div className="flex-none bg-[var(--color-antigravity-panel)]/40 border-b border-[var(--color-antigravity-border)] relative z-30 p-2 flex flex-col gap-2">
+          {/* Row 1: Repository Input */}
+          <div className="flex items-center gap-2 bg-[var(--vscode-input-background,rgba(0,0,0,0.15))] border border-[var(--vscode-input-border,var(--color-antigravity-border))] rounded-md px-2.5 h-7 focus-within:border-[var(--color-antigravity-accent)]/45 transition-all">
+            <Globe
+              size={11}
+              className="text-[var(--vscode-input-placeholderForeground,var(--color-antigravity-text-secondary))] shrink-0"
+            />
+            <input
+              value={repoUrl}
+              onChange={(e) => setRepoUrl(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  const val = repoUrl.trim();
+                  if (val) {
+                    const parts = val.replace(/\/$/, "").split("/");
+                    setShowCloneModal(true);
+                  }
+                }
+              }}
+              type="text"
+              placeholder="github.com/owner/repo"
+              className="flex-grow bg-transparent outline-none font-mono text-[10px] text-[var(--vscode-input-foreground,var(--color-antigravity-text-primary))] placeholder:text-[var(--vscode-input-placeholderForeground,var(--color-antigravity-text-secondary))]/60 h-full"
+            />
+          </div>
 
-              <div className="flex items-center gap-2 bg-[var(--vscode-input-background,rgba(0,0,0,0.15))] border border-[var(--vscode-input-border,var(--color-antigravity-border))] rounded-md px-2.5 h-6 max-w-[450px] w-full focus-within:border-[var(--color-antigravity-accent)]/45 transition-all">
-                <Globe
-                  size={11}
-                  className="text-[var(--vscode-input-placeholderForeground,var(--color-antigravity-text-secondary))] shrink-0"
-                />
-                <input
-                  value={repoUrl}
-                  onChange={(e) => setRepoUrl(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      const val = repoUrl.trim();
-                      if (val) {
-                        const parts = val.replace(/\/$/, "").split("/");
-                        setShowCloneModal(true);
-                      }
-                    }
-                  }}
-                  type="text"
-                  placeholder="github.com/owner/repo"
-                  className="flex-grow bg-transparent outline-none font-mono text-[10px] text-[var(--vscode-input-foreground,var(--color-antigravity-text-primary))] placeholder:text-[var(--vscode-input-placeholderForeground,var(--color-antigravity-text-secondary))]/60 h-full"
-                />
-              </div>
-            </div>
-
-            <div className="flex items-center gap-2 shrink-0">
-              {/* Custom Model Dropdown Selector */}
-              <div className="relative" ref={dropdownRef}>
-                <button
-                  type="button"
-                  onClick={() => setIsDropdownOpen(!isDropdownOpen)}
-                  disabled={availableModels.length === 0}
-                  className="flex items-center gap-2 px-2.5 py-1 bg-white/[0.03] border border-[var(--color-antigravity-border)] rounded-md h-6.5 text-[10px] font-medium tracking-tight text-[var(--color-antigravity-text-secondary)] hover:bg-white/[0.06] hover:text-[var(--color-antigravity-text-primary)] hover:border-[var(--color-antigravity-accent)]/30 active:scale-97 transition-all cursor-pointer select-none disabled:opacity-50"
-                >
+          {/* Row 2: Model Selector and clear action */}
+          <div className="flex items-center justify-between gap-2 min-w-0">
+            <div className="relative flex-1 min-w-0" ref={dropdownRef}>
+              <button
+                type="button"
+                onClick={() => setIsDropdownOpen(!isDropdownOpen)}
+                disabled={availableModels.length === 0}
+                className="w-full flex items-center justify-between px-2.5 py-1 bg-white/[0.03] border border-[var(--color-antigravity-border)] rounded-md h-6.5 text-[10px] font-medium tracking-tight text-[var(--color-antigravity-text-secondary)] hover:bg-white/[0.06] hover:text-[var(--color-antigravity-text-primary)] hover:border-[var(--color-antigravity-accent)]/30 active:scale-97 transition-all cursor-pointer select-none disabled:opacity-50 min-w-0"
+              >
+                <div className="flex items-center gap-1.5 min-w-0 flex-1">
                   <VendorIcon
                     vendor={activeVendor}
                     className="w-3.5 h-3.5 shrink-0"
                   />
-                  <span className="truncate max-w-[100px]">
+                  <span className="truncate flex-1 text-left">
                     {activeModel ? activeModel.name : "Engines offline..."}
                   </span>
-                  <ChevronDown
-                    size={10}
-                    className={`opacity-60 transition-transform duration-200 ${isDropdownOpen ? "rotate-180" : ""}`}
-                  />
-                </button>
-
-                {isDropdownOpen && (
-                  <div className="absolute right-0 mt-1.5 w-60 rounded-lg glass-dropdown p-1.5 z-50 flex flex-col gap-0.5 border border-white/[0.08]">
-                    <div className="px-2.5 py-1 mb-1 border-b border-white/[0.04]">
-                      <p className="text-[8px] font-bold text-zinc-500 uppercase tracking-wider">
-                        Available Inference Engines
-                      </p>
-                    </div>
-                    <div className="max-h-56 overflow-y-auto custom-scrollbar flex flex-col gap-0.5">
-                      {availableModels.map((model) => {
-                        const vendor =
-                          model.vendor?.toLowerCase() ||
-                          (model.id.toLowerCase().includes("gemini")
-                            ? "google"
-                            : model.id.toLowerCase().includes("claude")
-                              ? "anthropic"
-                              : model.id.toLowerCase().includes("gpt")
-                                ? "openai"
-                                : "unknown");
-                        const isSelected = model.id === config.model;
-                        const quotaNum = Number(model.quota);
-                        const showQuota = !isNaN(quotaNum);
-
-                        return (
-                          <button
-                            key={model.id}
-                            type="button"
-                            onClick={() => {
-                              setConfig({ ...config, model: model.id });
-                              setIsDropdownOpen(false);
-                            }}
-                            className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-[10px] text-left transition-all ${
-                              isSelected
-                                ? "bg-[var(--color-antigravity-highlight)] text-[var(--color-antigravity-text-primary)] font-medium"
-                                : "text-zinc-400 hover:bg-white/[0.04] hover:text-[var(--color-antigravity-text-primary)]"
-                            }`}
-                          >
-                            <div className="flex items-center gap-2 min-w-0">
-                              <VendorIcon
-                                vendor={vendor}
-                                className="w-3.5 h-3.5 shrink-0"
-                              />
-                              <span className="truncate">{model.name}</span>
-                            </div>
-                            {showQuota && (
-                              <div className="flex items-center gap-1.5 shrink-0 ml-2">
-                                <div className="w-10 h-1 bg-white/5 rounded-full overflow-hidden border border-white/5">
-                                  <div
-                                    className={`h-full rounded-full ${
-                                      quotaNum > 0.5
-                                        ? "bg-emerald-500"
-                                        : quotaNum > 0.2
-                                          ? "bg-amber-500"
-                                          : "bg-red-500"
-                                    }`}
-                                    style={{ width: `${quotaNum * 100}%` }}
-                                  />
-                                </div>
-                                <span className="text-[8px] font-mono opacity-50">
-                                  {(quotaNum * 100).toFixed(0)}%
-                                </span>
-                              </div>
-                            )}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              <button
-                onClick={handleClearChat}
-                className="p-1 rounded-md text-[var(--color-antigravity-text-secondary)] hover:text-[var(--color-antigravity-text-primary)] hover:bg-white/[0.05] transition-all"
-                title="Clear Chat History"
-              >
-                <Trash2 size={12} />
+                </div>
+                <ChevronDown
+                  size={10}
+                  className={`opacity-60 transition-transform duration-200 shrink-0 ${isDropdownOpen ? "rotate-180" : ""}`}
+                />
               </button>
+
+              {isDropdownOpen && (
+                <div className="absolute left-0 right-0 mt-1.5 rounded-lg glass-dropdown p-1.5 z-50 flex flex-col gap-0.5 border border-white/[0.08] shadow-2xl">
+                  <div className="max-h-56 overflow-y-auto custom-scrollbar flex flex-col gap-0.5">
+                    {availableModels.map((model) => {
+                      const vendor =
+                        model.vendor?.toLowerCase() ||
+                        (model.id.toLowerCase().includes("gemini")
+                          ? "google"
+                          : model.id.toLowerCase().includes("claude")
+                            ? "anthropic"
+                            : model.id.toLowerCase().includes("gpt")
+                              ? "openai"
+                              : "unknown");
+                      const isSelected = model.id === config.model;
+                      const quotaNum = Number(model.quota);
+                      const showQuota = !isNaN(quotaNum);
+
+                      return (
+                        <button
+                          key={model.id}
+                          type="button"
+                          onClick={() => {
+                            setConfig({ ...config, model: model.id });
+                            setIsDropdownOpen(false);
+                          }}
+                          className={`w-full flex flex-col items-stretch px-2.5 py-1.5 rounded-md text-[10px] text-left transition-all min-w-0 ${
+                            isSelected
+                              ? "bg-[var(--color-antigravity-highlight)] text-[var(--color-antigravity-text-primary)] font-medium"
+                              : "text-zinc-400 hover:bg-white/[0.04] hover:text-[var(--color-antigravity-text-primary)]"
+                          }`}
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <VendorIcon
+                              vendor={vendor}
+                              className="w-3.5 h-3.5 shrink-0"
+                            />
+                            <span className="truncate flex-1">
+                              {model.name}
+                            </span>
+                          </div>
+                          {showQuota && (
+                            <div className="flex items-center gap-1.5 mt-1 pl-[22px] w-full">
+                              <div className="flex-grow max-w-[80px] h-1 bg-white/5 rounded-full overflow-hidden border border-white/5">
+                                <div
+                                  className={`h-full rounded-full ${
+                                    quotaNum > 0.5
+                                      ? "bg-emerald-500"
+                                      : quotaNum > 0.2
+                                        ? "bg-amber-500"
+                                        : "bg-red-500"
+                                  }`}
+                                  style={{ width: `${quotaNum * 100}%` }}
+                                />
+                              </div>
+                              <span className="text-[7.5px] font-mono opacity-50 shrink-0">
+                                {(quotaNum * 100).toFixed(0)}%
+                              </span>
+                            </div>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
+
+            <button
+              onClick={handleClearChat}
+              className="p-1 rounded-md text-[var(--color-antigravity-text-secondary)] hover:text-[var(--color-antigravity-text-primary)] hover:bg-white/[0.05] transition-all shrink-0"
+              title="Clear Chat History"
+            >
+              <Trash2 size={12} />
+            </button>
           </div>
         </div>
 
         <div className="flex-1 overflow-y-auto custom-scrollbar bg-[var(--color-antigravity-bg)]/30">
-          {messages.length === 0 && (
+          {isWorkspaceEmpty && messages.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full opacity-[0.03] select-none pointer-events-none">
-              <Bot size={56} strokeWidth={0.5} />
-              <p className="text-[9px] font-mono mt-4 tracking-[0.5em] uppercase">
-                Neural Link Ready
-              </p>
+              <FolderOpen size={56} strokeWidth={0.5} />
             </div>
+          ) : (
+            messages.length === 0 && (
+              <div className="flex flex-col items-center justify-center h-full opacity-[0.03] select-none pointer-events-none">
+                <Bot size={56} strokeWidth={0.5} />
+              </div>
+            )
           )}
 
-          <div className="flex flex-col gap-4 p-4">
-            {messages.map((msg, i) => {
-              const isUser = msg.role === "user";
-              return (
-                <div
-                  key={i}
-                  className={`flex w-full ${isUser ? "justify-end" : "justify-start"}`}
-                >
-                  <div
-                    className={`max-w-[92%] text-[11px] leading-[1.6] font-normal selection:bg-[var(--color-antigravity-accent)]/20 transition-all ${
-                      isUser
-                        ? "bg-[var(--color-antigravity-highlight)] border border-[var(--color-antigravity-accent)]/20 px-4 py-3 rounded-2xl rounded-tr-sm text-[var(--color-antigravity-text-primary)] shadow-md shadow-black/10"
-                        : "w-full bg-[var(--color-antigravity-panel)]/30 border border-[var(--color-antigravity-border)] px-4 py-4 rounded-2xl rounded-tl-sm text-[var(--color-antigravity-text-primary)] hover:border-white/[0.06] transition-colors"
-                    }`}
-                  >
-                    {!isUser && (
-                      <div className="flex items-center gap-1.5 mb-2 pb-1.5 border-b border-white/[0.02]">
-                        <VendorIcon
-                          vendor={activeVendor}
-                          className="w-3 h-3 shrink-0"
-                        />
-                        <span className="text-[8px] font-mono font-bold uppercase tracking-wider text-zinc-500">
-                          {activeModel?.name || "Assistant"}
-                        </span>
-                      </div>
-                    )}
-
-                    {msg.role === "assistant" &&
-                    (!msg.content ||
-                      (isLoading && i === messages.length - 1)) ? (
-                      <div className="py-2.5 px-3 bg-white/[0.02] border border-white/[0.04] rounded-lg relative overflow-hidden group/loading">
-                        <div className="flex flex-col gap-1.5 relative z-10">
-                          <div className="font-mono text-[9px] text-[var(--color-antigravity-text-secondary)]/70 flex items-center gap-2 overflow-hidden whitespace-nowrap">
-                            <span>
-                              {msg.steps && msg.steps.length > 0
-                                ? msg.steps[msg.steps.length - 1]
-                                    ?.plannerResponse?.thinking ||
-                                  "Executing logic flow..."
-                                : "Thinking..."}
+          {messages.length > 0 && (
+            <>
+              <div className="flex flex-col gap-4 p-4">
+                {messages.map((msg, i) => {
+                  const isUser = msg.role === "user";
+                  return (
+                    <div
+                      key={i}
+                      className={`flex w-full ${isUser ? "justify-end" : "justify-start"}`}
+                    >
+                      <div
+                        className={`max-w-[92%] text-[11px] leading-[1.6] font-normal selection:bg-[var(--color-antigravity-accent)]/20 transition-all ${
+                          isUser
+                            ? "bg-[var(--color-antigravity-highlight)] border border-[var(--color-antigravity-accent)]/20 px-4 py-3 rounded-2xl rounded-tr-sm text-[var(--color-antigravity-text-primary)] shadow-md shadow-black/10"
+                            : "w-full bg-[var(--color-antigravity-panel)]/30 border border-[var(--color-antigravity-border)] px-4 py-4 rounded-2xl rounded-tl-sm text-[var(--color-antigravity-text-primary)] hover:border-white/[0.06] transition-colors"
+                        }`}
+                      >
+                        {!isUser && (
+                          <div className="flex items-center gap-1.5 mb-2 pb-1.5 border-b border-white/[0.02]">
+                            <VendorIcon
+                              vendor={activeVendor}
+                              className="w-3 h-3 shrink-0"
+                            />
+                            <span className="text-[8px] font-mono font-bold uppercase tracking-wider text-zinc-500">
+                              {activeModel?.name || "Assistant"}
                             </span>
                           </div>
-                        </div>
+                        )}
+
+                        {msg.role === "assistant" &&
+                        (!msg.content ||
+                          (isLoading && i === messages.length - 1)) ? (
+                          <div className="py-2.5 px-3 bg-white/[0.02] border border-white/[0.04] rounded-lg relative overflow-hidden group/loading">
+                            <div className="flex flex-col gap-1.5 relative z-10">
+                              <div className="font-mono text-[9px] text-[var(--color-antigravity-text-secondary)]/70 flex items-center gap-2 overflow-hidden whitespace-nowrap">
+                                <span>
+                                  {msg.steps && msg.steps.length > 0
+                                    ? msg.steps[msg.steps.length - 1]
+                                        ?.plannerResponse?.thinking ||
+                                      "Executing logic flow..."
+                                    : "Thinking..."}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        ) : (
+                          <MarkdownRenderer content={msg.content} />
+                        )}
                       </div>
-                    ) : (
-                      <MarkdownRenderer content={msg.content} />
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-          <div ref={messagesEndRef} className="h-4" />
+                    </div>
+                  );
+                })}
+              </div>
+              <div ref={messagesEndRef} className="h-4" />
+            </>
+          )}
         </div>
 
-        <div className="w-full bg-[var(--color-antigravity-panel)]/40 backdrop-blur-xl border-t border-[var(--color-antigravity-border)] flex flex-col relative z-20">
+        <div className="w-full bg-[var(--color-antigravity-panel)]/40 backdrop-blur-xl border-t border-[var(--color-antigravity-border)] flex flex-col relative z-20 flex-none">
           {queriesFileExists && loadedQueries.length > 0 && (
             <div className="absolute top-0 left-0 right-0 h-[2px] bg-white/[0.03]">
               <div
@@ -1248,7 +1262,7 @@ export default function WorkspaceLayout({
 
           <form
             onSubmit={handleSendManualMessage}
-            className="px-3 pb-2 pt-2.5 flex items-end gap-2 bg-[var(--vscode-sideBar-background,rgba(0,0,0,0.05))] relative z-20 border-b border-white/[0.03]"
+            className="px-3 pb-2 pt-2 flex items-end gap-2 bg-[var(--vscode-sideBar-background,rgba(0,0,0,0.05))] relative z-20 border-b border-white/[0.03] flex-none"
           >
             <textarea
               ref={textareaRef}
@@ -1262,14 +1276,16 @@ export default function WorkspaceLayout({
                 }
               }}
               placeholder="Type a custom query..."
-              className="flex-grow bg-[var(--vscode-input-background,rgba(0,0,0,0.15))] border border-[var(--vscode-input-border,var(--color-antigravity-border))] rounded-md px-3 py-1.5 text-[11px] font-mono text-[var(--vscode-input-foreground,var(--color-antigravity-text-primary))] placeholder:text-[var(--vscode-input-placeholderForeground,var(--color-antigravity-text-secondary))]/55 outline-none focus:border-[var(--color-antigravity-accent)]/30 transition-all resize-none min-h-[30px] max-h-[160px]"
+              className="flex-grow bg-[var(--vscode-input-background,rgba(0,0,0,0.15))] border border-[var(--vscode-input-border,var(--color-antigravity-border))] rounded-md px-3 py-1 text-[11px] font-mono text-[var(--vscode-input-foreground,var(--color-antigravity-text-primary))] placeholder:text-[var(--vscode-input-placeholderForeground,var(--color-antigravity-text-secondary))]/55 outline-none focus:border-[var(--color-antigravity-accent)]/30 transition-all resize-none h-[28px] min-h-[28px] max-h-[160px] overflow-y-auto"
             />
             <button
               type="submit"
               disabled={isLoading || !input.trim()}
-              className="h-[30px] px-3.5 rounded-md bg-[var(--color-antigravity-accent)] hover:opacity-90 disabled:opacity-30 disabled:cursor-not-allowed text-white text-[10px] font-mono uppercase tracking-widest transition-all shrink-0 cursor-pointer"
+              style={{ height: `${textareaHeight}px` }}
+              className="w-[28px] rounded-md bg-[var(--color-antigravity-accent)] hover:opacity-90 disabled:opacity-30 disabled:cursor-not-allowed text-white flex items-center justify-center shrink-0 cursor-pointer transition-all"
+              title="Send Message"
             >
-              Send
+              <Send size={12} className="stroke-[2]" />
             </button>
           </form>
 
@@ -1359,39 +1375,46 @@ export default function WorkspaceLayout({
       {/* Clone Modal Overlay */}
       {showCloneModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-md animate-in fade-in duration-300">
-          <div className="relative bg-[var(--color-antigravity-panel)]/90 border border-white/[0.08] p-6 rounded-2xl shadow-[0_0_50px_rgba(49,134,255,0.15)] w-[420px] animate-in zoom-in-95 duration-200 overflow-hidden">
-            {/* Ambient Background Glow */}
-            <div className="absolute -top-10 -right-10 w-32 h-32 bg-[var(--color-antigravity-accent)]/10 rounded-full blur-3xl pointer-events-none" />
-            <div className="absolute -bottom-10 -left-10 w-32 h-32 bg-violet-600/10 rounded-full blur-3xl pointer-events-none" />
+          <div className="relative bg-[var(--color-antigravity-panel)]/95 border border-white/[0.08] p-5 rounded-2xl shadow-[0_8px_32px_rgba(0,0,0,0.4)] w-[calc(100%-32px)] max-w-[320px] mx-4 animate-in zoom-in-95 duration-200 overflow-hidden flex flex-col gap-4">
+            {/* Ambient Background Glows */}
+            <div className="absolute -top-10 -right-10 w-24 h-24 bg-[var(--color-antigravity-accent)]/10 rounded-full blur-2xl pointer-events-none" />
+            <div className="absolute -bottom-10 -left-10 w-24 h-24 bg-violet-600/10 rounded-full blur-2xl pointer-events-none" />
 
-            <div className="flex items-center gap-4 mb-5">
-              <div className="relative flex items-center justify-center w-11 h-11 rounded-xl bg-gradient-to-tr from-[var(--color-antigravity-accent)]/20 to-violet-500/10 border border-[var(--color-antigravity-accent)]/30 text-[var(--color-antigravity-accent)] shadow-[0_0_15px_rgba(49,134,255,0.15)]">
-                <Cpu size={20} className="stroke-[1.5]" />
+            <div className="flex items-center gap-3 relative z-10">
+              <div className="relative flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-tr from-[var(--color-antigravity-accent)]/20 to-violet-500/10 border border-[var(--color-antigravity-accent)]/30 text-[var(--color-antigravity-accent)] shadow-[0_0_15px_rgba(49,134,255,0.15)]">
+                <Cpu size={18} className="stroke-[1.5]" />
               </div>
               <div>
-                <h3 className="text-xs font-bold uppercase tracking-[0.2em] bg-gradient-to-r from-[var(--color-antigravity-text-primary)] via-white to-zinc-400 bg-clip-text text-transparent">
-                  Initialize Workspace
+                <h3 className="text-xs font-bold uppercase tracking-[0.15em] bg-gradient-to-r from-[var(--color-antigravity-text-primary)] via-white to-zinc-400 bg-clip-text text-transparent">
+                  Bootstrap Project
                 </h3>
-                <p className="text-[9px] text-zinc-500 uppercase tracking-widest font-mono mt-0.5">
+                <p className="text-[8px] text-zinc-500 uppercase tracking-widest font-mono mt-0.5">
                   Action Required
                 </p>
               </div>
             </div>
 
-            <p className="text-[11px] text-zinc-400 mb-6 leading-relaxed font-sans">
-              Detected a repository link. Would you like to <span className="text-[var(--color-antigravity-accent)] font-semibold">clone and bootstrap</span> this project with the Antigravity system, workspace rules, and fallback query pipelines?
+            <p className="text-[10px] text-zinc-400 leading-relaxed font-sans relative z-10">
+              Would you like to{" "}
+              <span className="text-[var(--color-antigravity-accent)] font-semibold">
+                clone and bootstrap
+              </span>{" "}
+              this repository with the Antigravity system, workspace rules, and
+              fallback query pipelines?
             </p>
 
-            <div className="space-y-5">
+            <div className="space-y-4 relative z-10">
               <div>
                 <div className="flex justify-between items-center mb-1.5 px-1">
                   <label className="text-[8px] text-zinc-500 uppercase tracking-widest font-mono">
                     Clone Destination Path
                   </label>
-                  <span className="text-[8px] text-zinc-600 font-mono">Local Path</span>
+                  <span className="text-[8px] text-zinc-600 font-mono">
+                    Local Path
+                  </span>
                 </div>
-                <div className="flex items-center gap-2 bg-black/45 border border-white/[0.06] rounded-lg px-3 py-2 focus-within:border-[var(--color-antigravity-accent)]/60 focus-within:shadow-[0_0_12px_rgba(49,134,255,0.1)] transition-all">
-                  <Terminal size={12} className="text-zinc-500 shrink-0" />
+                <div className="flex items-center gap-2 bg-black/45 border border-white/[0.06] rounded-lg px-2.5 py-1.5 focus-within:border-[var(--color-antigravity-accent)]/60 focus-within:shadow-[0_0_10px_rgba(49,134,255,0.08)] transition-all">
+                  <FolderOpen size={12} className="text-zinc-500 shrink-0" />
                   <input
                     type="text"
                     value={clonePath}
@@ -1402,10 +1425,10 @@ export default function WorkspaceLayout({
                 </div>
               </div>
 
-              <div className="flex gap-2.5 pt-1">
+              <div className="flex gap-2 pt-1.5">
                 <button
                   onClick={() => setShowCloneModal(false)}
-                  className="flex-1 px-4 py-2.5 rounded-lg bg-white/[0.02] hover:bg-white/[0.06] border border-white/[0.06] hover:border-white/[0.12] text-[10px] text-zinc-400 hover:text-white uppercase tracking-widest transition-all font-semibold cursor-pointer active:scale-98"
+                  className="flex-1 h-7.5 rounded-lg bg-white/[0.02] hover:bg-white/[0.06] border border-white/[0.06] hover:border-white/[0.12] text-[9px] text-zinc-400 hover:text-white uppercase tracking-widest transition-all font-semibold cursor-pointer active:scale-98"
                 >
                   Cancel
                 </button>
@@ -1425,15 +1448,15 @@ export default function WorkspaceLayout({
                     }
                   }}
                   disabled={isCloning}
-                  className="flex-1 px-4 py-2.5 rounded-lg bg-gradient-to-r from-[var(--color-antigravity-accent)] to-violet-600 hover:brightness-110 text-[10px] text-white font-bold uppercase tracking-widest transition-all shadow-[0_4px_20px_rgba(49,134,255,0.25)] disabled:opacity-50 active:scale-98 cursor-pointer flex items-center justify-center"
+                  className="flex-1 h-7.5 rounded-lg bg-gradient-to-r from-[var(--color-antigravity-accent)] to-violet-600 hover:brightness-110 text-[9px] text-white font-bold uppercase tracking-widest transition-all shadow-[0_4px_15px_rgba(49,134,255,0.2)] disabled:opacity-50 active:scale-98 cursor-pointer flex items-center justify-center"
                 >
                   {isCloning ? (
-                    <span className="flex items-center gap-2">
+                    <span className="flex items-center gap-1.5">
                       <RefreshCw size={10} className="animate-spin" />
                       Cloning...
                     </span>
                   ) : (
-                    "Clone & Bootstrap"
+                    "Bootstrap"
                   )}
                 </button>
               </div>
