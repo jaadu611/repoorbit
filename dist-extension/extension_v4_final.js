@@ -39,7 +39,7 @@ var path2 = __toESM(require("path"));
 var fs = __toESM(require("fs"));
 var import_child_process = require("child_process");
 
-// lib/core/github.ts
+// src/lib/core/github.ts
 var import_path = __toESM(require("path"));
 function getHeaders(explicitToken) {
   const token = explicitToken || process.env.GITHUB_TOKEN || process.env.NEXT_PUBLIC_GITHUB_TOKEN;
@@ -540,10 +540,118 @@ var getRepoData = async (owner, repo, token) => {
   };
 };
 
+// src/lib/core/constants/master.ts
+var MASTER_MD_CONTENT = `---
+trigger: always_on
+glob: "*"
+description: Global Constitution & Agentic Protocols
+---
+
+# Global Constitution & Agentic Protocols
+
+1. Always follow the established Global Rules
+2. Respect the DNA and style of the existing project.
+3. Always deliver clean, warning-free implementations.
+4. **Scope Validation**: Always check if the raised issue or review comment is related to the codebase itself or is a system/environment issue on the user's machine. If it is an environmental/machine issue, do not change the codebase; always proceed with caution and explain the situation.
+5. **Implementation Planning**: Always proceed with the implementation plan you create. Do NOT wait for user input, approval, or feedback. Directly begin execution after creating/updating the implementation plan.
+
+# GLOBAL CONSTITUTION: AGENTIC PROTOCOLS
+
+## 1. THE "NO-YAPPING" PROTOCOL (Efficiency & Token Economy)
+
+* **CORE COMMAND**: You must be ruthlessly direct and efficient. Your primary goal is to save tokens and minimize conversational noise.
+* **ZERO FILLER**: Never use conversational filler such as "Certainly!", "I have updated the code," or "I hope this helps." If the user's request is clear, jump straight to the solution.
+* **SILENT EXECUTION**: If a task (like creating a file or running a command) can be performed without explanation, **SAY ABSOLUTELY NOTHING**. Perform the action and wait for the next instruction.
+* **HARSH CONSTRAINTS**: No politeness, no apologies, and **NEVER USE EMOJIS**. Use compact, information-dense bullet points only if an explanation is strictly required.
+
+## 2. THE "TRUST BUT VERIFY" PROTOCOL (Operational Safety)
+
+* **ACTION**: Never assume a command or edit succeeded simply because the terminal didn't crash.
+* **MANDATORY VALIDATION**: You MUST run a verification step (e.g., ls, grep, npm test, tsc, or a build check) after **every single update**. Your job is to prove the change is correct, not just hope it is.
+* **REGRESSION PREVENTION**: If a verification command (like a test suite) is available in the project, it is your responsibility to ensure it passes before you consider a task "Done." Fix any regressions immediately before moving to the next step.
+
+## 3. THE "PRESERVATION" PROTOCOL (Code Integrity & Style)
+
+* **GUEST MENTALITY**: You are a guest in this codebase. You must respect the existing "DNA" of the project.
+* **STYLE MATCHING**: Automatically detect and match the project's existing indentation (Tabs vs. Spaces), naming conventions (camelCase, snake_case, etc.), and architectural patterns.
+* **DOCUMENTATION HOLISTIC**: Never remove existing comments, JSDoc, or documentation unless they are directly invalidated by your code changes. If you update a function, update its documentation to match.
+
+## 4. THE "NO GHOST ERRORS" PROTOCOL (Linting & Type Safety)
+
+* **CLEAN ON ARRIVAL**: Your code must be delivered without warnings. A "fix" that introduces linting errors or type warnings is an incomplete fix.
+* **LINTING COMPLIANCE**: If the project has a linter (ESLint, Prettier, etc.) or a type-checker (TypeScript, MyPy), you must run it on your changes.
+* **ZERO WARNINGS**: If your update introduces 5 new warnings while fixing 1 bug, you have failed the protocol. Resolve all secondary issues before reporting completion.
+
+## 5. THE "CONTEXT FIRST" PROTOCOL (Comprehensive Reading)
+
+* **ANTI-BLIND EDITING**: Never edit code "in the dark." You must have a clear mental map of the surrounding logic before changing a single character.
+* **READ DEPTH**: Before making a targeted edit, read the entire file (or at least 100 lines of context above and below the target area).
+* **DEPENDENCY MAPPING**: Identify how the code you are changing interacts with other parts of the system. This prevents "ripple effect" bugs caused by missing context.
+
+## 6. THE "SURGICAL EDIT" PROTOCOL (Minimal Diff Noise)
+
+* **TASK FOCUS**: Stay laser-focused on the task provided. Do not engage in unsolicited refactoring or "cleanups" unless specifically instructed to do so.
+* **MINIMAL DIFFS**: Propose the smallest, most efficient character-sequence change that solves the problem.
+* **REASONING**: If a 3-line change suffices, do not rewrite the entire function. Your goal is to keep the Git history clean and the diffs easy for a human to review.
+
+## 7. THE "LEAST POWER" PROTOCOL (Simplicity & Stability)
+
+* **NATIVE FIRST**: Prefer simpler, native, and standard solutions over complex libraries.
+* **DEPENDENCY DISCIPLINE**: Before adding a new package to package.json, check if an existing tool in the project can already solve the problem. Do not introduce 10MB of external code for a 5-line logic requirement.
+
+## 8. THE "SILENT FAILURE" PROHIBITION (Robust Error Handling)
+
+* **EXPLICIT CATCHING**: Never "swallow" an error. Every try/catch block must have a meaningful handler.
+* **ACTIONABLE LOGGING**: If an error is caught, it must be logged with enough context to be debugged, or re-thrown to the appropriate handler. Empty catch {} blocks are strictly forbidden.
+
+## 9. THE "CLARITY OVER CLEVERNESS" PROTOCOL (Human Readability)
+
+* **FUTURE PROOFING**: Write code that is easy for humans to read, not code that shows off "clever" syntax.
+* **NAMING**: Use descriptive, intentional names for variables and functions. Avoid magic numbers and obscure one-liners that prioritize brevity over clarity.
+
+## 10. THE "IDEMPOTENT ACTION" PROTOCOL (Operational Safety)
+
+* **REPEATABILITY**: Ensure your terminal commands are safe to run multiple times without causing side effects.
+* **FLAGS**: Always use safety flags (e.g., mkdir -p instead of mkdir, rm -f instead of rm) to prevent script-breaking errors during automation.
+
+## 11. THE "BINARY SEARCH" PROTOCOL (Systematic Investigation)
+
+* **METHODICAL HUNTING**: Isolate problems by narrowing down the search space by half each step. Do not use "Shotgun Debugging" (changing many things and hoping one works).
+* **RANKED HYPOTHESES**: When investigating, generate multiple hypotheses and rank them by likelihood before testing them one by one.`;
+
+// src/lib/core/constants/queries.ts
+var DEFAULT_QUERIES_CONTENT = `# How to enter your issues:
+# 
+# 1. Enter each issue or query on its own section.
+# 2. Separate all issues with a line containing ---
+# 
+# Example:
+# 
+# First issue to analyze and fix
+# 
+# ---
+# 
+# Second issue to analyze and fix
+`;
+
 // src/extension.ts
 var modelCache = null;
 var cacheExpiry = 0;
 var CACHE_TTL = 5 * 60 * 1e3;
+var activeState = {
+  messages: [],
+  isPlaying: false,
+  currentQueryIndex: -1,
+  retryCount: 0,
+  isLoading: false,
+  repoUrl: "",
+  forkOwner: "",
+  upstreamOwner: "",
+  upstreamRepo: "",
+  branchName: "",
+  defaultBranch: "",
+  config: { model: "MODEL_PLACEHOLDER_M84" }
+};
 async function discoverLS() {
   try {
     const psOutput = (0, import_child_process.execSync)("ps -ax -o pid=,command=", { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 });
@@ -912,12 +1020,33 @@ async function activate(context) {
             const { query, config, repoContext } = message;
             const modelId = config.model;
             console.log(`[RepoOrbit] AI Chat Request [Model: ${modelId}]:`, query);
+            activeState.isLoading = true;
+            activeState.config = config;
             try {
               const responseText = await sendAntigravityChatDirect(
                 query,
                 modelId,
                 repoContext,
                 (update) => {
+                  if (activeState.messages.length > 0) {
+                    const lastMsg = activeState.messages[activeState.messages.length - 1];
+                    if (lastMsg && lastMsg.role === "assistant") {
+                      lastMsg.content = update.text;
+                      lastMsg.steps = update.steps;
+                    } else {
+                      activeState.messages.push({
+                        role: "assistant",
+                        content: update.text,
+                        steps: update.steps
+                      });
+                    }
+                  } else {
+                    activeState.messages.push({
+                      role: "assistant",
+                      content: update.text,
+                      steps: update.steps
+                    });
+                  }
                   currentPanel?.webview.postMessage({
                     command: "chatStream",
                     text: update.text,
@@ -925,11 +1054,19 @@ async function activate(context) {
                   });
                 }
               );
+              if (activeState.messages.length > 0) {
+                const lastMsg = activeState.messages[activeState.messages.length - 1];
+                if (lastMsg && lastMsg.role === "assistant") {
+                  lastMsg.content = responseText;
+                }
+              }
+              activeState.isLoading = false;
               currentPanel.webview.postMessage({ command: "chatResponse", text: responseText });
               return;
             } catch (lsErr) {
               console.warn("[RepoOrbit] Direct Cascade Flow failed:", lsErr.message);
               if (lsErr.message.includes("exhausted") || lsErr.message.includes("quota") || lsErr.message.includes("capacity")) {
+                activeState.isLoading = false;
                 currentPanel.webview.postMessage({ command: "chatError", text: lsErr.message });
                 return;
               }
@@ -946,6 +1083,13 @@ async function activate(context) {
                   for await (const fragment of lmResponse.text) {
                     fullText += fragment;
                   }
+                  if (activeState.messages.length > 0) {
+                    const lastMsg = activeState.messages[activeState.messages.length - 1];
+                    if (lastMsg && lastMsg.role === "assistant") {
+                      lastMsg.content = fullText;
+                    }
+                  }
+                  activeState.isLoading = false;
                   currentPanel.webview.postMessage({ command: "chatResponse", text: fullText });
                   return;
                 }
@@ -958,14 +1102,23 @@ async function activate(context) {
             if (chatCmd) {
               console.log("[RepoOrbit] Forwarding to discovered command:", chatCmd);
               await vscode.commands.executeCommand(chatCmd, query);
+              const fallbackMsg = "\u{1F680} Direct API call failed. Prompt forwarded to the native Antigravity Chat panel.";
+              if (activeState.messages.length > 0) {
+                const lastMsg = activeState.messages[activeState.messages.length - 1];
+                if (lastMsg && lastMsg.role === "assistant") {
+                  lastMsg.content = fallbackMsg;
+                }
+              }
+              activeState.isLoading = false;
               currentPanel.webview.postMessage({
                 command: "chatResponse",
-                text: "\u{1F680} Direct API call failed. Prompt forwarded to the native Antigravity Chat panel."
+                text: fallbackMsg
               });
             } else {
               throw new Error("All chat providers failed and no native chat command found.");
             }
           } catch (err) {
+            activeState.isLoading = false;
             currentPanel.webview.postMessage({ command: "setError", text: `Chat Error: ${err.message}` });
           }
           return;
@@ -1029,12 +1182,7 @@ async function activate(context) {
               }
               const masterPath = path2.join(agentsRulesDir, "MASTER.md");
               if (!fs.existsSync(masterPath)) {
-                fs.writeFileSync(masterPath, `# Global Constitution & Agentic Protocols
-
-1. Always follow the established Global Rules and Constitution without exception.
-2. Respect the DNA and style of the existing project.
-3. Always deliver clean, warning-free implementations.
-`);
+                fs.writeFileSync(masterPath, MASTER_MD_CONTENT);
               }
               const repoorbitDir = path2.join(cloneDest, ".repoorbit");
               if (!fs.existsSync(repoorbitDir)) {
@@ -1042,11 +1190,7 @@ async function activate(context) {
               }
               const queriesPath = path2.join(repoorbitDir, "queries.md");
               if (!fs.existsSync(queriesPath)) {
-                fs.writeFileSync(queriesPath, `# Queries Queue
-
-- Analyze the directory structure and main components.
-- Check for any logical bugs or potential improvements.
-`);
+                fs.writeFileSync(queriesPath, DEFAULT_QUERIES_CONTENT);
               }
             } catch (bootstrapErr) {
               console.error("[RepoOrbit] Failed to bootstrap rules/queries:", bootstrapErr);
@@ -1087,11 +1231,7 @@ async function activate(context) {
             }
             const queriesPath = path2.join(repoorbitDir, "queries.md");
             if (!fs.existsSync(queriesPath)) {
-              fs.writeFileSync(queriesPath, `# Queries Queue
-
-- Analyze the directory structure and main components.
-- Check for any logical bugs or potential improvements.
-`);
+              fs.writeFileSync(queriesPath, DEFAULT_QUERIES_CONTENT);
             }
             const content = fs.readFileSync(queriesPath, "utf8");
             const lines = content.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0).filter((line) => !line.startsWith("#")).map((line) => line.replace(/^[-*+]\s+/, "").replace(/^\d+\.\s+/, "")).filter((line) => line.length > 0);
@@ -1117,6 +1257,30 @@ async function activate(context) {
         case "saveToken":
           await context.globalState.update("github_token", message.token);
           vscode.window.showInformationMessage("RepoOrbit: Token saved!");
+          return;
+        case "syncState":
+          if (message.state) {
+            activeState = { ...activeState, ...message.state };
+          }
+          return;
+        case "getStoredState":
+          currentPanel.webview.postMessage({ command: "restoreState", state: activeState });
+          return;
+        case "clearChat":
+          activeState = {
+            messages: [],
+            isPlaying: false,
+            currentQueryIndex: -1,
+            retryCount: 0,
+            isLoading: false,
+            repoUrl: activeState.repoUrl,
+            forkOwner: "",
+            upstreamOwner: "",
+            upstreamRepo: "",
+            branchName: "",
+            defaultBranch: "",
+            config: activeState.config
+          };
           return;
       }
     });

@@ -8,12 +8,46 @@ import {
   fetchFileContent,
   fetchCommitsForPath,
   analyzeFile,
-} from '../lib/core/github';
+} from './lib/core/github';
+import {
+  MASTER_MD_CONTENT,
+  DEFAULT_QUERIES_CONTENT,
+} from './lib/core/constants';
 
 // ─── Constants & State ────────────────────────────────────────────────────────
 let modelCache: Array<{ id: string; name: string; vendor?: string; quota?: string | number }> | null = null;
 let cacheExpiry = 0;
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+interface PersistentState {
+  messages: any[];
+  isPlaying: boolean;
+  currentQueryIndex: number;
+  retryCount: number;
+  isLoading: boolean;
+  repoUrl: string;
+  forkOwner: string;
+  upstreamOwner: string;
+  upstreamRepo: string;
+  branchName: string;
+  defaultBranch: string;
+  config: { model: string };
+}
+
+let activeState: PersistentState = {
+  messages: [],
+  isPlaying: false,
+  currentQueryIndex: -1,
+  retryCount: 0,
+  isLoading: false,
+  repoUrl: '',
+  forkOwner: '',
+  upstreamOwner: '',
+  upstreamRepo: '',
+  branchName: '',
+  defaultBranch: '',
+  config: { model: 'MODEL_PLACEHOLDER_M84' }
+};
 
 // ─── LS Discovery ─────────────────────────────────────────────────────────────
 
@@ -453,6 +487,9 @@ export async function activate(context: vscode.ExtensionContext) {
             const modelId = config.model;
             console.log(`[RepoOrbit] AI Chat Request [Model: ${modelId}]:`, query);
 
+            activeState.isLoading = true;
+            activeState.config = config;
+
             // 1. Try Direct Cascade Flow (Best UX, response stays in RepoOrbit)
             try {
               const responseText = await sendAntigravityChatDirect(
@@ -460,6 +497,27 @@ export async function activate(context: vscode.ExtensionContext) {
                 modelId, 
                 repoContext,
                 (update) => {
+                  // Update activeState in host
+                  if (activeState.messages.length > 0) {
+                    const lastMsg = activeState.messages[activeState.messages.length - 1];
+                    if (lastMsg && lastMsg.role === 'assistant') {
+                      lastMsg.content = update.text;
+                      lastMsg.steps = update.steps;
+                    } else {
+                      activeState.messages.push({
+                        role: 'assistant',
+                        content: update.text,
+                        steps: update.steps
+                      });
+                    }
+                  } else {
+                    activeState.messages.push({
+                      role: 'assistant',
+                      content: update.text,
+                      steps: update.steps
+                    });
+                  }
+
                   currentPanel?.webview.postMessage({ 
                     command: 'chatStream', 
                     text: update.text,
@@ -467,6 +525,16 @@ export async function activate(context: vscode.ExtensionContext) {
                   });
                 }
               );
+
+              // Update activeState on complete response
+              if (activeState.messages.length > 0) {
+                const lastMsg = activeState.messages[activeState.messages.length - 1];
+                if (lastMsg && lastMsg.role === 'assistant') {
+                  lastMsg.content = responseText;
+                }
+              }
+              activeState.isLoading = false;
+
               currentPanel.webview.postMessage({ command: 'chatResponse', text: responseText });
               return;
             } catch (lsErr: any) {
@@ -474,6 +542,7 @@ export async function activate(context: vscode.ExtensionContext) {
               
               // If it's a quota/exhaustion error, DO NOT fall back. Just show it.
               if (lsErr.message.includes('exhausted') || lsErr.message.includes('quota') || lsErr.message.includes('capacity')) {
+                activeState.isLoading = false;
                 currentPanel.webview.postMessage({ command: 'chatError', text: lsErr.message });
                 return;
               }
@@ -493,6 +562,16 @@ export async function activate(context: vscode.ExtensionContext) {
                   for await (const fragment of lmResponse.text) {
                     fullText += fragment;
                   }
+                  
+                  // Update activeState in host
+                  if (activeState.messages.length > 0) {
+                    const lastMsg = activeState.messages[activeState.messages.length - 1];
+                    if (lastMsg && lastMsg.role === 'assistant') {
+                      lastMsg.content = fullText;
+                    }
+                  }
+                  activeState.isLoading = false;
+
                   currentPanel.webview.postMessage({ command: 'chatResponse', text: fullText });
                   return;
                 }
@@ -509,14 +588,25 @@ export async function activate(context: vscode.ExtensionContext) {
             if (chatCmd) {
               console.log('[RepoOrbit] Forwarding to discovered command:', chatCmd);
               await vscode.commands.executeCommand(chatCmd, query);
+              
+              const fallbackMsg = '🚀 Direct API call failed. Prompt forwarded to the native Antigravity Chat panel.';
+              if (activeState.messages.length > 0) {
+                const lastMsg = activeState.messages[activeState.messages.length - 1];
+                if (lastMsg && lastMsg.role === 'assistant') {
+                  lastMsg.content = fallbackMsg;
+                }
+              }
+              activeState.isLoading = false;
+
               currentPanel.webview.postMessage({ 
                 command: 'chatResponse', 
-                text: '🚀 Direct API call failed. Prompt forwarded to the native Antigravity Chat panel.' 
+                text: fallbackMsg
               });
             } else {
               throw new Error('All chat providers failed and no native chat command found.');
             }
           } catch (err: any) {
+            activeState.isLoading = false;
             currentPanel.webview.postMessage({ command: 'setError', text: `Chat Error: ${err.message}` });
           }
           return;
@@ -592,7 +682,7 @@ export async function activate(context: vscode.ExtensionContext) {
               }
               const masterPath = path.join(agentsRulesDir, 'MASTER.md');
               if (!fs.existsSync(masterPath)) {
-                fs.writeFileSync(masterPath, `# Global Constitution & Agentic Protocols\n\n1. Always follow the established Global Rules and Constitution without exception.\n2. Respect the DNA and style of the existing project.\n3. Always deliver clean, warning-free implementations.\n`);
+                fs.writeFileSync(masterPath, MASTER_MD_CONTENT);
               }
 
               // Create .repoorbit/queries.md
@@ -602,7 +692,7 @@ export async function activate(context: vscode.ExtensionContext) {
               }
               const queriesPath = path.join(repoorbitDir, 'queries.md');
               if (!fs.existsSync(queriesPath)) {
-                fs.writeFileSync(queriesPath, `# Queries Queue\n\n- Analyze the directory structure and main components.\n- Check for any logical bugs or potential improvements.\n`);
+                fs.writeFileSync(queriesPath, DEFAULT_QUERIES_CONTENT);
               }
             } catch (bootstrapErr) {
               console.error('[RepoOrbit] Failed to bootstrap rules/queries:', bootstrapErr);
@@ -654,7 +744,7 @@ export async function activate(context: vscode.ExtensionContext) {
             }
             const queriesPath = path.join(repoorbitDir, 'queries.md');
             if (!fs.existsSync(queriesPath)) {
-              fs.writeFileSync(queriesPath, `# Queries Queue\n\n- Analyze the directory structure and main components.\n- Check for any logical bugs or potential improvements.\n`);
+              fs.writeFileSync(queriesPath, DEFAULT_QUERIES_CONTENT);
             }
             // Trigger readQueriesFile immediately after creation
             const content = fs.readFileSync(queriesPath, 'utf8');
@@ -691,6 +781,33 @@ export async function activate(context: vscode.ExtensionContext) {
         case 'saveToken':
           await context.globalState.update('github_token', message.token);
           vscode.window.showInformationMessage('RepoOrbit: Token saved!');
+          return;
+
+        case 'syncState':
+          if (message.state) {
+            activeState = { ...activeState, ...message.state };
+          }
+          return;
+
+        case 'getStoredState':
+          currentPanel.webview.postMessage({ command: 'restoreState', state: activeState });
+          return;
+
+        case 'clearChat':
+          activeState = {
+            messages: [],
+            isPlaying: false,
+            currentQueryIndex: -1,
+            retryCount: 0,
+            isLoading: false,
+            repoUrl: activeState.repoUrl,
+            forkOwner: '',
+            upstreamOwner: '',
+            upstreamRepo: '',
+            branchName: '',
+            defaultBranch: '',
+            config: activeState.config
+          };
           return;
       }
     });

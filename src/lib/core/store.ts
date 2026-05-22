@@ -6,7 +6,7 @@ import type {
   SelectionStore,
   CommitDetail,
   LightFileMetadata,
-} from "@/lib/core/types";
+} from "./types";
 
 export const useSelectionStore = create<
   SelectionStore & {
@@ -172,5 +172,3 @@ export const useSelectionStore = create<
       importGraph: {},
     }),
 }));
-
-

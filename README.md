@@ -1,127 +1,113 @@
 # RepoOrbit
 
-## Industrial-Grade AI Orchestration for Massive Codebases
+## Developer-Centric Architecture and Visual Workspace Viewport
 
-RepoOrbit is a high-precision orchestration pipeline designed for generic codebase inquiries, surgical bug hunting, and automated fixing. It bypasses context-window limitations through structural mapping and deterministic multi-model loops, with upcoming support for automated workflow graph generation.
+RepoOrbit is a VS Code Extension and React Webview-based orchestration interface designed for running automated, self-healing query pipelines directly against local workspaces. It integrates code execution channels with automated, closed-loop git diff reviews powered by a configurable code review backend.
 
 ---
 
-## Architecture & Data Flow
+## Architectural Components
 
-The following diagram illustrates the multi-model orchestration path, from initial repository ingestion to final verified disk application.
+The repository is organized into a clean client-host model:
+
+```
+repoorbit/
+├── src/
+│   ├── components/
+│   │   └── WorkspaceLayout.tsx   # Consolidated React Webview Viewport
+│   ├── lib/core/
+│   │   ├── constants/            # Master rules, fallback workflows, default queries
+│   │   ├── github.ts             # GitHub repository input parser
+│   │   ├── prompt.ts             # Core system instructions and prompts
+│   │   ├── store.ts              # Zustand selection store
+│   │   └── types.ts              # Core type definitions
+│   ├── styles/globals.css        # Glassmorphic visual theme definitions
+│   ├── extension.ts              # VS Code Extension Host (git, review, and file operations)
+│   └── main.tsx                  # Webview entrypoint
+├── tsconfig.json                 # TypeScript compiler configuration
+└── vite.config.ts                # Webview build and bundling configuration
+```
+
+### 1. VS Code Extension Host (src/extension.ts)
+Serves as the host layer, executing privileged operations on the local file system and git:
+- **Workspace Discovery**: Periodically audits running processes to detect and bind to the local Language Server.
+- **Repository Management**: Handles git clone commands and directory bootstrapping.
+- **Query File Subscriptions**: Monitors and reads `.repoorbit/queries.md` to stream queue steps to the webview UI.
+- **Persistent Session Store**: Retains session states (`messages`, queue execution indexes, model configurations, and runtime loading status) in the persistent extension host memory. This ensures background chat streaming operations are unaffected by panel closings or reloads.
+- **Code Review Pipeline**:
+  - Dynamically extracts the active git branch name and executes `git diff HEAD` to capture uncommitted changes.
+  - Sends the diff payload, repository coordinates, and target branch to a pluggable review backend.
+  - Handles secure global key storage and secure native password inputs (`vscode.window.showInputBox`).
+  - Performs git commits automatically for ratings >= 4/5 or when maximum retry thresholds are reached.
+  - Writes execution logs directly to `.repoorbit-logs.json`.
+
+### 2. Consolidated Webview Viewport (src/components/WorkspaceLayout.tsx)
+A dark-mode, glassmorphic layout compiling all visual panels, chat flows, and model controls:
+- **State Rehydration**: Automatically requests the cached session state from the host on component mount, preventing UI wipeouts during panel toggle operations.
+- **Model Selector**: Custom dropdown showcasing vendor engines (Gemini, Claude, GPT) alongside active quota meters.
+- **Pipeline Timeline**: A horizontal scrolling visualizer representing loaded, completed, active, and pending query states.
+- **Self-Healing Loop Controller**: Listens to query outputs, evaluates rating thresholds from the review payload, and generates iterative repair prompts automatically.
+- **Markdown Renderer**: Embeds React-Markdown with GitHub Flavored Markdown (GFM) and inline code block wrappers.
+
+---
+
+## Execution and Self-Healing Data Flow
+
+The sequence diagram below describes the cycle from query loading to validation, review, and repository commit:
 
 ```mermaid
-graph TD
-    A[ GitHub Repository ] -->| Structural Analysis | B( GitHub API / Core Logic )
-    B -->| Context Mapping | C[ Notebook Neighborhoods ]
-    
-    C -->| Raw Context | D( Dual Planners: DeepSeek V4 API + Qwen 2.5 )
-    D -->| Draft Plans | E[ Gemini 2.5 Flash Plan Merger ]
-    E -->| Unified Investigation Plan | F[ NotebookLM Evidence Engine ]
-    
-    F -->| Precise Code Evidence | G( Parallel Coders: DeepSeek V4 API + Qwen 2.5 )
-    G -->| Raw Implementations | H[ Architecture Combiner ]
-    
-    H -->| Synthesized Fix | I( Parallel Reviewers: DeepSeek V4 API + Qwen 2.5 )
-    I -->| Raw Feedback | J{ Architecture Combiner }
-    
-    J -->| HAS_ISSUES: YES | G
-    J -->| HAS_ISSUES: NO | K[ Gemma 4-31B Disk Operator ]
-    
-    K -->| Final Answer & Filesystem Apply | L( Parallel Test Generators: 4-Agent Suite )
-    L -->| Test Scenarios | M[ Gemma Test Runner ]
-    
-    M -->| Execution Logs & Build Output | N[ Gemini 2.5 Flash Verifier ]
-    N -->| Final Report | O[ Production-Ready Audit Fix ]
+sequenceDiagram
+    participant UI as WorkspaceLayout (Webview)
+    participant Host as extension.ts (VS Code Host)
+    participant LLM as Model Inference Provider
+    participant Reviewer as Code Review Backend
 
-    style E fill:#f9f,stroke:#333,stroke-width:2px,color:#000
-    style H fill:#f9f,stroke:#333,stroke-width:2px,color:#000
-    style J fill:#f9f,stroke:#333,stroke-width:2px,color:#000
-    style N fill:#f9f,stroke:#333,stroke-width:2px,color:#000
-    style K fill:#bbf,stroke:#333,stroke-width:2px,color:#000
-    style M fill:#bbf,stroke:#333,stroke-width:2px,color:#000
+    Note over UI,Host: Initialization Phase
+    UI->>Host: checkWorkspaceStatus / readQueriesFile
+    Host-->>UI: queriesFileResponse (.repoorbit/queries.md list)
+    
+    Note over UI,Host: Query Queue Execution
+    loop For each loaded query
+        UI->>Host: chat (with query payload)
+        Host->>LLM: Stream inference query
+        LLM-->>Host: chatResponse / chatStream
+        Host-->>UI: chatResponse (Inference complete)
+        
+        Note over UI,Host: Review & Healing Phase
+        UI->>Host: runReview (attempts count)
+        Host->>Host: git diff HEAD & branch lookup
+        Host->>Reviewer: Review request (diff + repo info)
+        Reviewer-->>Host: Review result (rating 1-5 + feedback)
+        Host->>Host: Append to .repoorbit-logs.json
+        Host-->>UI: reviewResponse
+        
+        alt Rating >= 4 OR Attempts == 3
+            Note over Host: Commit changes
+            Host->>Host: git add -A && git commit
+            UI->>UI: Increment query index (Progress next)
+        else Rating < 4 AND Attempts < 3
+            Note over UI: Trigger automated healing
+            UI->>UI: Append healing prompt to chat input
+            UI->>Host: chat (Request fix based on feedback)
+        end
+    end
 ```
 
 ---
 
-## Core Pipeline
+## Development and Build Scripts
 
-| Phase | Responsibility | Model Stack |
-| :--- | :--- | :--- |
-| **Scout** | Structural analysis and relevance scoring of neighborhoods. | GitHub API / Core Logic |
-| **Triage** | Dual-model strategy generation and merging. | DeepSeek / Qwen + Gemini Flash |
-| **Evidence** | Extracting precise code evidence from mapped notebooks. | NotebookLM |
-| **Surgery** | Implementation loop with parallel coders and architectural combination. | DeepSeek R1 / Qwen 2.5 |
-| **Testing** | 4-agent parallel test scenario generation and local execution. | DeepSeek / Qwen + Gemma |
-| **Operator** | Constrained filesystem application and test execution. | Gemma 4-31B |
-| **Verifier** | Architectural review and validation of execution logs. | Gemini 2.5 Flash |
-
----
-
-## Technical Specifications
-
-* **Automation Engine**: Persistent Playwright context utilizing Brave.
-* **Frontend**: Next.js 16 with Turbopack for high-performance dashboarding.
-* **Orchestration**: Custom dashboard providing real-time status of local cores and server state.
-* **Stability**: Integrated stall detection with automated watchdog timers and UI-level recovery.
-* **OpenCode Integration**: Automated UI-level tuning for high-power execution and planning modes.
-
----
-
-## Library Architecture
-
-The codebase follows a domain-driven structure to ensure modularity and ease of maintenance:
-
-* `lib/automation/`: Adapters for DeepSeek, Qwen, Gemini, and OpenCode.
-* `lib/builders/`: Context assembly and dynamic prompt engineering.
-* `lib/core/`: Browser management, GitHub integration, and fundamental types.
-* `lib/prompts/`: Modular system instructions for specialized agent tasks.
-
----
-
-## Quick Start
-
-### 1. Dependencies
-
-Install the OpenCode local engine globally:
-
+### 1. Verification and Compilation
+Verify static typing compliance before compiling:
 ```bash
-npm install -g @google/opencode
+npx tsc --noEmit
 ```
 
-Configure your Google AI API key from [AI Studio](https://aistudio.google.com/):
-
+### 2. Bundling and Packaging
+Compile the full extension host bundle and build the webview production bundles:
 ```bash
-opencode config set GOOGLE_API_KEY=<your_key>
+npm run ext:package
 ```
-
-### 2. Installation
-
-```bash
-git clone https://github.com/jaadu/repoorbit
-cd repoorbit
-npm install
-```
-
-### 3. Environment Configuration
-
-Create a `.env` file in the root directory:
-
-```env
-GITHUB_TOKEN=<your_github_pat>
-NEXT_PUBLIC_GITHUB_TOKEN=<your_github_pat>
-```
-
-### 4. Launch
-
-Execute the full orchestration stack:
-
-```bash
-./start.sh
-```
-
----
-
-**Note**: RepoOrbit utilizes browser-based automation for Qwen to minimize API costs and maximize reasoning capabilities. DeepSeek is powered by the NVIDIA API for high-performance inference. Ensure you have `NVIDIA_API_KEY` set in your environment.
-
-_Engineered for high-fidelity codebase surgery._
+This script executes two sub-commands:
+- `ext:build-ui`: Uses Vite to transpile React components and output bundled assets inside `dist-webview/`.
+- `ext:build-host`: Uses esbuild to package the extension host into a single Node-compatible bundle at `dist-extension/extension_v4_final.js`.
