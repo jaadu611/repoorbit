@@ -1,73 +1,31 @@
-# <p align="center"><img src="logo.png" width="128" alt="RepoOrbit Logo"><br>RepoOrbit</p>
-
-<p align="center">
-  <strong>Run automated, self-healing query pipelines and review diffs inside your local workspace.</strong>
-</p>
-
----
+# RepoOrbit
 
 RepoOrbit is a VS Code Extension and React Webview-based orchestration interface designed for running automated, self-healing query pipelines directly against local workspaces. It integrates code execution channels with automated, closed-loop git diff reviews powered by a configurable code review backend.
 
 ---
 
-## 🚀 Key Features
+## Key Features
 
-*   **Activity Bar Integration** - Fully consolidated sidebar panel for a distraction-free, space-efficient interface.
-*   **Self-Healing Loop** - Listens to query outputs, evaluates rating thresholds, and generates iterative repair prompts automatically.
-*   **Persistent Sessions** - Retains active chat history, queue execution indexes, and model selections across panel toggles and window reloads.
-*   **Code Review Pipeline** - Captures raw uncommitted diffs (`git diff HEAD`), queries a configurable evaluator backend, and commits changes when thresholds are reached.
-*   **Model Selector** - Custom vendor selector displaying Gemini, Claude, and GPT models along with dynamically updated quota progress bars.
-
----
-
-## 🏗️ Architectural Components
-
-The repository is organized into a clean client-host model:
-
-```
-repoorbit/
-├── src/
-│   ├── components/
-│   │   └── WorkspaceLayout.tsx   # Consolidated React Webview Viewport
-│   ├── lib/core/
-│   │   ├── constants/            # Master rules, fallback workflows, default queries
-│   │   ├── github.ts             # GitHub repository input parser
-│   │   ├── prompt.ts             # Core system instructions and prompts
-│   │   ├── store.ts              # Zustand selection store
-│   │   └── types.ts              # Core type definitions
-│   ├── styles/globals.css        # Glassmorphic visual theme definitions
-│   ├── extension.ts              # VS Code Extension Host (git, review, and file operations)
-│   └── main.tsx                  # Webview entrypoint
-├── tsconfig.json                 # TypeScript compiler configuration
-└── vite.config.ts                # Webview build and bundling configuration
-```
-
-### 1. VS Code Extension Host (`src/extension.ts`)
-Serves as the host layer, executing privileged operations on the local file system and git:
-*   **Workspace Discovery**: Periodically audits running processes to detect and bind to the local Language Server.
-*   **Repository Management**: Handles git clone commands and directory bootstrapping.
-*   **Query File Subscriptions**: Monitors and reads `.repoorbit/queries.md` to stream queue steps to the webview UI.
-*   **Persistent Session Store**: Retains session states (`messages`, queue execution indexes, model configurations, and runtime loading status) in the persistent extension host memory. This ensures background chat streaming operations are unaffected by panel closings or reloads.
-*   **Code Review Pipeline**:
-    *   Dynamically extracts the active git branch name and executes `git diff HEAD` to capture uncommitted changes.
-    *   Sends the diff payload, repository coordinates, and target branch to a pluggable review backend.
-    *   Handles secure global key storage and secure native password inputs (`vscode.window.showInputBox`).
-    *   Performs git commits automatically for ratings >= 4/5 or when maximum retry thresholds are reached.
-    *   Writes execution logs directly to `.repoorbit-logs.json`.
-
-### 2. Consolidated Webview Viewport (`src/components/WorkspaceLayout.tsx`)
-A dark-mode, layout compiling all visual panels, chat flows, and model controls:
-*   **State Rehydration**: Automatically requests the cached session state from the host on component mount, preventing UI wipeouts during panel toggle operations.
-*   **Model Selector**: Custom dropdown showcasing vendor engines alongside active quota meters.
-*   **Pipeline Timeline**: A horizontal scrolling visualizer representing loaded, completed, active, and pending query states.
-*   **Self-Healing Loop Controller**: Listens to query outputs, evaluates rating thresholds from the review payload, and generates iterative repair prompts automatically.
-*   **Markdown Renderer**: Embeds React-Markdown with GitHub Flavored Markdown (GFM) and inline code block wrappers.
+* **Activity Bar Integration** - Fully consolidated sidebar panel for a distraction-free, space-efficient interface.
+* **Self-Healing Loop** - Listens to query outputs, evaluates rating thresholds, and generates iterative repair prompts automatically.
+* **Persistent Sessions** - Retains active chat history, queue execution indexes, and model selections across panel toggles and window reloads.
+* **Code Review Pipeline** - Captures raw uncommitted diffs (`git diff HEAD`), queries a configurable evaluator backend, and commits changes when thresholds are reached.
+* **Model Selector** - Custom vendor selector displaying Gemini, Claude, and GPT models along with dynamically updated quota progress bars.
 
 ---
 
-## 🔄 Execution and Self-Healing Data Flow
+## Architectural Components
 
-The sequence diagram below describes the cycle from query loading to validation, review, and repository commit:
+The extension is organized into a clean client-host model:
+
+* **VS Code Extension Host** - Serves as the host layer executing privileged operations on the local file system and git, including workspace discovery, repository management, query file subscriptions, and code review management.
+* **Consolidated Webview Viewport** - A React Webview viewport rendering visual panels, chat flows, timeline visualizer, and model controls.
+
+---
+
+## Execution and Self-Healing Data Flow
+
+The flow below describes the cycle from query loading to validation, review, and repository commit:
 
 ```mermaid
 sequenceDiagram
@@ -106,32 +64,3 @@ sequenceDiagram
         end
     end
 ```
-
----
-
-## 🛠️ Development and Build Scripts
-
-### 1. Verification and Compilation
-Verify static typing compliance before compiling:
-```bash
-npx tsc --noEmit
-```
-
-### 2. Bundling and Packaging
-Compile the full extension host bundle and build the webview production bundles:
-```bash
-npm run ext:package
-```
-This script executes two sub-commands:
-*   `ext:build-ui`: Uses Vite to transpile React components and output bundled assets inside `dist-webview/`.
-*   `ext:build-host`: Uses esbuild to package the extension host into a single Node-compatible bundle at `dist-extension/extension_v4_final.js`.
-
----
-
-## 📦 Publishing the Extension
-
-To generate the `.vsix` installer package:
-```bash
-npx @vscode/vsce package
-```
-This produces `repoorbit-0.1.0.vsix` in your root folder. You can upload this package directly via the [VS Code Marketplace Portal](https://marketplace.visualstudio.com/manage) under publisher ID `JAADU611`.
