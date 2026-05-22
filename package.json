@@ -14,7 +14,25 @@
         "title": "Open RepoOrbit Workspace",
         "category": "RepoOrbit"
       }
-    ]
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "repoorbit-sidebar-container",
+          "title": "RepoOrbit",
+          "icon": "$(rocket)"
+        }
+      ]
+    },
+    "views": {
+      "repoorbit-sidebar-container": [
+        {
+          "type": "webview",
+          "id": "repoorbit.sidebarView",
+          "name": "RepoOrbit"
+        }
+      ]
+    }
   },
   "scripts": {
     "dev": "vite",

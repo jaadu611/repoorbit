@@ -1358,41 +1358,54 @@ export default function WorkspaceLayout({
 
       {/* Clone Modal Overlay */}
       {showCloneModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm animate-in fade-in duration-300">
-          <div className="bg-[var(--color-antigravity-panel)] border border-[var(--color-antigravity-border)] p-6 rounded-xl shadow-2xl w-[400px] animate-in zoom-in-95 duration-200">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="p-2 rounded bg-[var(--color-antigravity-accent)]/10 text-[var(--color-antigravity-accent)]">
-                <Cpu size={20} />
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-md animate-in fade-in duration-300">
+          <div className="relative bg-[var(--color-antigravity-panel)]/90 border border-white/[0.08] p-6 rounded-2xl shadow-[0_0_50px_rgba(49,134,255,0.15)] w-[420px] animate-in zoom-in-95 duration-200 overflow-hidden">
+            {/* Ambient Background Glow */}
+            <div className="absolute -top-10 -right-10 w-32 h-32 bg-[var(--color-antigravity-accent)]/10 rounded-full blur-3xl pointer-events-none" />
+            <div className="absolute -bottom-10 -left-10 w-32 h-32 bg-violet-600/10 rounded-full blur-3xl pointer-events-none" />
+
+            <div className="flex items-center gap-4 mb-5">
+              <div className="relative flex items-center justify-center w-11 h-11 rounded-xl bg-gradient-to-tr from-[var(--color-antigravity-accent)]/20 to-violet-500/10 border border-[var(--color-antigravity-accent)]/30 text-[var(--color-antigravity-accent)] shadow-[0_0_15px_rgba(49,134,255,0.15)]">
+                <Cpu size={20} className="stroke-[1.5]" />
               </div>
-              <h3 className="text-sm font-bold uppercase tracking-widest text-[var(--color-antigravity-text-primary)]">
-                Initialize Workspace
-              </h3>
+              <div>
+                <h3 className="text-xs font-bold uppercase tracking-[0.2em] bg-gradient-to-r from-[var(--color-antigravity-text-primary)] via-white to-zinc-400 bg-clip-text text-transparent">
+                  Initialize Workspace
+                </h3>
+                <p className="text-[9px] text-zinc-500 uppercase tracking-widest font-mono mt-0.5">
+                  Action Required
+                </p>
+              </div>
             </div>
 
-            <p className="text-[11px] text-zinc-500 mb-6 leading-relaxed">
-              Detected a repository link. Would you like to{" "}
-              <span className="text-zinc-300">clone and bootstrap</span> this
-              project with Antigravity skills and workflows?
+            <p className="text-[11px] text-zinc-400 mb-6 leading-relaxed font-sans">
+              Detected a repository link. Would you like to <span className="text-[var(--color-antigravity-accent)] font-semibold">clone and bootstrap</span> this project with the Antigravity system, workspace rules, and fallback query pipelines?
             </p>
 
-            <div className="space-y-4">
+            <div className="space-y-5">
               <div>
-                <label className="text-[8px] text-zinc-700 uppercase tracking-widest block mb-1.5 ml-1">
-                  Clone Path
-                </label>
-                <input
-                  type="text"
-                  value={clonePath}
-                  onChange={(e) => setClonePath(e.target.value)}
-                  className="w-full bg-[var(--vscode-input-background,rgba(0,0,0,0.15))] border border-[var(--vscode-input-border,var(--color-antigravity-border))] rounded px-3 py-2 text-[12px] text-[var(--vscode-input-foreground,var(--color-antigravity-text-primary))] placeholder:text-[var(--vscode-input-placeholderForeground,var(--color-antigravity-text-secondary))]/50 outline-none focus:border-[var(--color-antigravity-accent)]/45 transition-all font-mono"
-                  placeholder="./"
-                />
+                <div className="flex justify-between items-center mb-1.5 px-1">
+                  <label className="text-[8px] text-zinc-500 uppercase tracking-widest font-mono">
+                    Clone Destination Path
+                  </label>
+                  <span className="text-[8px] text-zinc-600 font-mono">Local Path</span>
+                </div>
+                <div className="flex items-center gap-2 bg-black/45 border border-white/[0.06] rounded-lg px-3 py-2 focus-within:border-[var(--color-antigravity-accent)]/60 focus-within:shadow-[0_0_12px_rgba(49,134,255,0.1)] transition-all">
+                  <Terminal size={12} className="text-zinc-500 shrink-0" />
+                  <input
+                    type="text"
+                    value={clonePath}
+                    onChange={(e) => setClonePath(e.target.value)}
+                    className="flex-grow bg-transparent text-[11px] text-[var(--color-antigravity-text-primary)] placeholder:text-zinc-600 outline-none font-mono"
+                    placeholder="./"
+                  />
+                </div>
               </div>
 
-              <div className="flex gap-2 pt-2">
+              <div className="flex gap-2.5 pt-1">
                 <button
                   onClick={() => setShowCloneModal(false)}
-                  className="flex-1 px-4 py-2 rounded bg-white/5 hover:bg-white/10 text-[10px] text-zinc-400 uppercase tracking-widest transition-all border border-[var(--color-antigravity-border)]"
+                  className="flex-1 px-4 py-2.5 rounded-lg bg-white/[0.02] hover:bg-white/[0.06] border border-white/[0.06] hover:border-white/[0.12] text-[10px] text-zinc-400 hover:text-white uppercase tracking-widest transition-all font-semibold cursor-pointer active:scale-98"
                 >
                   Cancel
                 </button>
@@ -1412,9 +1425,16 @@ export default function WorkspaceLayout({
                     }
                   }}
                   disabled={isCloning}
-                  className="flex-1 px-4 py-2 rounded bg-[var(--color-antigravity-accent)] hover:opacity-90 text-[10px] text-white font-bold uppercase tracking-widest transition-all shadow-lg shadow-blue-900/20 disabled:opacity-50"
+                  className="flex-1 px-4 py-2.5 rounded-lg bg-gradient-to-r from-[var(--color-antigravity-accent)] to-violet-600 hover:brightness-110 text-[10px] text-white font-bold uppercase tracking-widest transition-all shadow-[0_4px_20px_rgba(49,134,255,0.25)] disabled:opacity-50 active:scale-98 cursor-pointer flex items-center justify-center"
                 >
-                  {isCloning ? "Cloning..." : "Clone & Boot"}
+                  {isCloning ? (
+                    <span className="flex items-center gap-2">
+                      <RefreshCw size={10} className="animate-spin" />
+                      Cloning...
+                    </span>
+                  ) : (
+                    "Clone & Bootstrap"
+                  )}
                 </button>
               </div>
             </div>
