@@ -13,6 +13,8 @@ import {
   MASTER_MD_CONTENT,
   DEFAULT_QUERIES_CONTENT,
 } from './lib/core/constants';
+import { REVIEWER_SYSTEM_PROMPT } from './lib/core/prompt';
+import { RepoOrbitExecutor } from './lib/core/executor';
 
 // ─── Constants & State ────────────────────────────────────────────────────────
 let modelCache: Array<{ id: string; name: string; vendor?: string; quota?: string | number }> | null = null;
@@ -32,6 +34,7 @@ interface PersistentState {
   branchName: string;
   defaultBranch: string;
   config: { model: string };
+  isCreatingPR?: boolean;
 }
 
 let activeState: PersistentState = {
@@ -46,17 +49,27 @@ let activeState: PersistentState = {
   upstreamRepo: '',
   branchName: '',
   defaultBranch: '',
-  config: { model: 'MODEL_PLACEHOLDER_M84' }
+  config: { model: 'MODEL_PLACEHOLDER_M84' },
+  isCreatingPR: false
 };
 
 let currentWebview: vscode.Webview | undefined = undefined;
+let activeCascadeId: string | null = null;
+let activeReviewCascadeId: string | null = null;
 
 // ─── LS Discovery ─────────────────────────────────────────────────────────────
 
 async function discoverLS() {
   try {
     const psOutput = execSync('ps -ax -o pid=,command=', { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
-    const lsLine = psOutput.split('\n').find(l => l.includes('language_server') && l.includes('antigravity'));
+    const lines = psOutput.split('\n');
+    
+    // Prioritize Antigravity 2.0 standalone language server
+    let lsLine = lines.find(l => l.includes('language_server') && l.includes('antigravity') && l.includes('--standalone'));
+    if (!lsLine) {
+      // Fallback to default IDE language server
+      lsLine = lines.find(l => l.includes('language_server') && l.includes('antigravity'));
+    }
     if (!lsLine) return null;
 
     const pid = lsLine.trim().split(' ')[0];
@@ -65,11 +78,17 @@ async function discoverLS() {
 
     let ports: string[] = [];
     try {
-      const ss = execSync(`ss -tunlp 2>/dev/null | grep "pid=${pid}"`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+      const ss = execSync(`ss -lntp 2>/dev/null | grep "pid=${pid},"` , { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
       const matches = ss.match(/127\.0\.0\.1:(\d+)/g) || [];
       ports = [...new Set(matches.map(m => m.split(':')[1]))].filter(Boolean);
     } catch {
-      ports = ['34805', '45151', '40853'];
+      try {
+        const ss = execSync(`ss -tunlp 2>/dev/null | grep "pid=${pid}"`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+        const matches = ss.match(/127\.0\.0\.1:(\d+)/g) || [];
+        ports = [...new Set(matches.map(m => m.split(':')[1]))].filter(Boolean);
+      } catch {
+        ports = ['41833', '41107', '34805', '45151', '40853'];
+      }
     }
 
     return { pid, csrfToken, ports };
@@ -117,6 +136,48 @@ async function secureRPCRequest(url: string, options: any): Promise<{ ok: boolea
   });
 }
 
+interface WorkingLSEndpoint {
+  protocol: string;
+  port: string;
+}
+
+let cachedWorkingEndpoint: WorkingLSEndpoint | null = null;
+let cachedEndpointExpiry = 0;
+const ENDPOINT_TTL = 30 * 1000; // 30 seconds cache
+
+async function getWorkingLSEndpoint(ls: { ports: string[], csrfToken: string }): Promise<WorkingLSEndpoint | null> {
+  if (cachedWorkingEndpoint && Date.now() < cachedEndpointExpiry) {
+    return cachedWorkingEndpoint;
+  }
+
+  const metadata = { ideName: 'antigravity', extensionName: 'repoorbit', ideVersion: vscode.version, locale: 'en' };
+  const endpoint = '/exa.language_server_pb.LanguageServerService/GetUserStatus';
+
+  for (const port of ls.ports) {
+    for (const proto of ['https', 'http']) {
+      try {
+        const res = await secureRPCRequest(`${proto}://127.0.0.1:${port}${endpoint}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Connect-Protocol-Version': '1',
+            'x-codeium-csrf-token': ls.csrfToken
+          },
+          body: JSON.stringify({ metadata })
+        });
+        if (res.ok) {
+          cachedWorkingEndpoint = { protocol: proto, port };
+          cachedEndpointExpiry = Date.now() + ENDPOINT_TTL;
+          return cachedWorkingEndpoint;
+        }
+      } catch {
+        continue;
+      }
+    }
+  }
+  return null;
+}
+
 // ─── Hybrid Model Fetcher ──────────────────────────────────────────────────────
 
 async function fetchModelsHybrid(): Promise<Array<{ id: string; name: string; vendor?: string; quota?: string | number }>> {
@@ -144,50 +205,48 @@ async function fetchModelsHybrid(): Promise<Array<{ id: string; name: string; ve
   // 2. Fallback: Direct RPC to Antigravity LS
   const ls = await discoverLS();
   if (ls) {
-    const metadata = { ideName: 'antigravity', extensionName: 'repoorbit', ideVersion: vscode.version, locale: 'en' };
-    const endpoint = '/exa.language_server_pb.LanguageServerService/GetUserStatus';
+    const working = await getWorkingLSEndpoint(ls);
+    if (working) {
+      const metadata = { ideName: 'antigravity', extensionName: 'repoorbit', ideVersion: vscode.version, locale: 'en' };
+      const endpoint = '/exa.language_server_pb.LanguageServerService/GetUserStatus';
 
-    for (const port of ls.ports) {
       try {
-        // Try HTTPS first, then fallback to HTTP
-        for (const proto of ['https', 'http']) {
-          try {
-            const res = await secureRPCRequest(`${proto}://127.0.0.1:${port}${endpoint}`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Connect-Protocol-Version': '1',
-                'x-codeium-csrf-token': ls.csrfToken
-              },
-              body: JSON.stringify({ metadata })
-            });
+        const res = await secureRPCRequest(`${working.protocol}://127.0.0.1:${working.port}${endpoint}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Connect-Protocol-Version': '1',
+            'x-codeium-csrf-token': ls.csrfToken
+          },
+          body: JSON.stringify({ metadata })
+        });
 
-            if (res.ok) {
-              const data = await res.json();
-              const cfgs = data?.userStatus?.cascadeModelConfigData?.clientModelConfigs;
-              if (cfgs?.length) {
-                modelCache = cfgs.map((c: any) => {
-                  const lbl = c.label || c.modelOrAlias?.model || 'Unknown';
-                    const quota = c.quotaInfo?.remainingFraction ?? 'N/A';
-                    const resetTime = c.quotaInfo?.resetTime;
-                    return {
-                      id: c.modelOrAlias?.model || lbl,
-                      name: lbl,
-                      vendor: lbl.toLowerCase().includes('gemini') ? 'Google' : 
-                              lbl.toLowerCase().includes('claude') ? 'Anthropic' : 
-                              lbl.toLowerCase().includes('gpt') ? 'OpenAI' : 'Unknown',
-                      quota,
-                      resetTime
-                    };
-                }).filter((m: any) => !m.name.toLowerCase().includes('internal'));
-                cacheExpiry = Date.now() + CACHE_TTL;
-                console.log(`[RepoOrbit] Models fetched via Antigravity LS RPC (${proto})`);
-                return modelCache || [];
-              }
-            }
-          } catch { continue; }
+        if (res.ok) {
+          const data = await res.json();
+          const cfgs = data?.userStatus?.cascadeModelConfigData?.clientModelConfigs;
+          if (cfgs?.length) {
+            modelCache = cfgs.map((c: any) => {
+              const lbl = c.label || c.modelOrAlias?.model || 'Unknown';
+              const quota = c.quotaInfo?.remainingFraction ?? 'N/A';
+              const resetTime = c.quotaInfo?.resetTime;
+              return {
+                id: c.modelOrAlias?.model || lbl,
+                name: lbl,
+                vendor: lbl.toLowerCase().includes('gemini') ? 'Google' : 
+                        lbl.toLowerCase().includes('claude') ? 'Anthropic' : 
+                        lbl.toLowerCase().includes('gpt') ? 'OpenAI' : 'Unknown',
+                quota,
+                resetTime
+              };
+            }).filter((m: any) => !m.name.toLowerCase().includes('internal'));
+            cacheExpiry = Date.now() + CACHE_TTL;
+            console.log(`[RepoOrbit] Models fetched via Antigravity LS RPC (${working.protocol})`);
+            return modelCache || [];
+          }
         }
-      } catch { continue; }
+      } catch (err: any) {
+        console.warn('[RepoOrbit] fetchModelsHybrid direct RPC failed:', err.message);
+      }
     }
   }
 
@@ -209,13 +268,18 @@ async function sendAntigravityChatDirect(
   query: string, 
   modelId: string, 
   repoContext?: any, 
-  onUpdate?: (data: { text: string; steps?: any[] }) => void
+  onUpdate?: (data: { text: string; steps?: any[] }) => void,
+  useReviewSession?: boolean
 ): Promise<string> {
   const ls = await discoverLS();
   if (!ls) throw new Error('Language Server not discovered');
 
+  const working = await getWorkingLSEndpoint(ls);
+  if (!working) throw new Error('No working Language Server endpoint found');
+
   const metadata = { ideName: 'antigravity', extensionName: 'repoorbit', ideVersion: vscode.version, locale: 'en' };
-  const port = ls.ports[0] || '34805';
+  const port = working.port;
+  const protocol = working.protocol;
 
   // Get workspace URIs
   const workspaceUris = vscode.workspace.workspaceFolders?.map(f => f.uri.toString()) || [];
@@ -228,79 +292,93 @@ async function sendAntigravityChatDirect(
     } catch { return uri; }
   });
 
-  const startBody = { 
-    metadata, 
-    source: 1,
-    workspaceUris: sanitizedUris,
-    customMetadata: repoContext ? { ...repoContext } : undefined
+  let cascadeId = useReviewSession ? activeReviewCascadeId : activeCascadeId;
+  let isNewCascade = false;
+
+  const startNewCascade = async (): Promise<string> => {
+    const startBody = { 
+      metadata, 
+      source: 1,
+      workspaceUris: sanitizedUris,
+      customMetadata: repoContext ? { ...repoContext } : undefined
+    };
+
+    const startRes = await secureRPCRequest(`${protocol}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/StartCascade`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Connect-Protocol-Version': '1',
+        'x-codeium-csrf-token': ls.csrfToken
+      },
+      body: JSON.stringify(startBody)
+    });
+
+    if (!startRes.ok) {
+      const errorText = await startRes.text();
+      throw new Error(`StartCascade failed: ${startRes.status} - ${errorText}`);
+    }
+    const data = await startRes.json();
+    if (!data.cascadeId) throw new Error('No cascadeId returned');
+    return data.cascadeId;
   };
 
-  // Use HTTPS by default for modern LS, fallback to HTTP
-  let startRes: any;
-  let protocol = 'https';
-  
-  try {
-    startRes = await secureRPCRequest(`https://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/StartCascade`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Connect-Protocol-Version': '1',
-        'x-codeium-csrf-token': ls.csrfToken
-      },
-      body: JSON.stringify(startBody)
-    });
-    if (!startRes.ok && startRes.status === 400) {
-      // If it was the protocol error, we fallback
-      const text = await startRes.text();
-      if (text.includes('HTTP request to an HTTPS server')) protocol = 'https'; // Already used https
-      else if (text.includes('HTTPS request to an HTTP server')) protocol = 'http';
+  if (!cascadeId) {
+    cascadeId = await startNewCascade();
+    if (useReviewSession) {
+      activeReviewCascadeId = cascadeId;
+    } else {
+      activeCascadeId = cascadeId;
     }
-  } catch (err) {
-    protocol = 'http';
-    startRes = await secureRPCRequest(`http://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/StartCascade`, {
+    isNewCascade = true;
+  }
+
+  // Send Message function
+  const sendMessage = async (cid: string) => {
+    return await secureRPCRequest(`${protocol}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Connect-Protocol-Version': '1',
         'x-codeium-csrf-token': ls.csrfToken
       },
-      body: JSON.stringify(startBody)
-    });
-  }
-
-  if (!startRes.ok) {
-    const errorText = await startRes.text();
-    throw new Error(`StartCascade failed: ${startRes.status} - ${errorText}`);
-  }
-  const { cascadeId } = await startRes.json();
-  if (!cascadeId) throw new Error('No cascadeId returned');
-
-  // 2. Send Message
-  const sendRes = await secureRPCRequest(`${protocol}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Connect-Protocol-Version': '1',
-      'x-codeium-csrf-token': ls.csrfToken
-    },
-    body: JSON.stringify({
-      metadata,
-      cascadeId,
-      items: [{ text: query }],
-      clientType: 1,
-      messageOrigin: 1,
-      cascadeConfig: {
-        plannerConfig: {
-          conversational: { agenticMode: true }, 
-          requestedModel: { model: modelId },
-          toolConfig: {
-            allowAllTools: true,
-            autoRun: true
+      body: JSON.stringify({
+        metadata,
+        cascadeId: cid,
+        items: [{ text: query }],
+        clientType: 1,
+        messageOrigin: 1,
+        cascadeConfig: {
+          plannerConfig: {
+            conversational: { agenticMode: true }, 
+            requestedModel: { model: modelId },
+            toolConfig: {
+              allowAllTools: true,
+              autoRun: true
+            }
           }
         }
+      })
+    });
+  };
+
+  let sendRes = await sendMessage(cascadeId);
+  
+  if (!sendRes.ok && !isNewCascade) {
+    // Session might be dead/expired. Try starting a new cascade.
+    console.log(`[RepoOrbit] Previous cascade ${cascadeId} send failed. Starting new cascade session...`);
+    try {
+      cascadeId = await startNewCascade();
+      if (useReviewSession) {
+        activeReviewCascadeId = cascadeId;
+      } else {
+        activeCascadeId = cascadeId;
       }
-    })
-  });
+      sendRes = await sendMessage(cascadeId);
+    } catch (newCascadeErr: any) {
+      throw new Error(`Failed to restart cascade session: ${newCascadeErr.message}`);
+    }
+  }
+
   if (!sendRes.ok) {
     const errText = await sendRes.text();
     console.error(`[RepoOrbit] SendMessage failed with status ${sendRes.status}:`, errText);
@@ -331,47 +409,310 @@ async function sendAntigravityChatDirect(
         const steps = data.trajectory?.steps || [];
         const status = data.status; // Top level status
         
-        // ─── NUCLEAR AUTO-APPROVAL BYPASS ───
-        if (!(globalThis as any).approvedCallIds) {
-          (globalThis as any).approvedCallIds = new Set<string>();
-        }
-        const approvedIds = (globalThis as any).approvedCallIds;
+        // Write complete trajectory data to debug file
+        try {
+          const os = require('os');
+          const debugPath = path.join(os.tmpdir(), 'repoorbit-debug.json');
+          fs.writeFileSync(debugPath, JSON.stringify({
+            timestamp: new Date().toISOString(),
+            status,
+            trajectory: data.trajectory || data
+          }, null, 2), 'utf8');
+        } catch (writeErr) {}
 
-        // Aggressively handle ANY step requiring approval or input
+        // Clean up legacy workspace debug file if it exists to avoid git clutter
+        const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (wsFolder) {
+          try {
+            const legacyDebugPath = path.join(wsFolder, '.repoorbit-debug.json');
+            if (fs.existsSync(legacyDebugPath)) {
+              fs.unlinkSync(legacyDebugPath);
+            }
+          } catch (unlinkErr) {}
+        }
+        
+        console.log(`[RepoOrbit] Trajectory Polled. Status: ${status}, Steps count: ${steps.length}`);
+        if (steps.length > 0) {
+          console.log(`[RepoOrbit] Steps detail: ${JSON.stringify(steps.map((s: any) => ({ type: s.type, toolCall: s.toolCall, plannerResponse: s.plannerResponse })))}`);
+        }
+        
+        // ─── NUCLEAR AUTO-APPROVAL BYPASS ───
+        if (!(globalThis as any).approvedCallIdsMap) {
+          (globalThis as any).approvedCallIdsMap = new Map<string, { attempts: number, lastRunTime: number }>();
+        }
+        const approvedIdsMap = (globalThis as any).approvedCallIdsMap;
+
+        if (!(globalThis as any).approvedInteractionKeysMap) {
+          (globalThis as any).approvedInteractionKeysMap = new Map<string, { attempts: number, lastRunTime: number }>();
+        }
+        const approvedIntKeysMap = (globalThis as any).approvedInteractionKeysMap;
+
+        // 1. Handle tool calls requiring approval
         for (const s of steps) {
-          const callId = s.toolCall?.callId || s.plannerResponse?.callId;
-          if (callId && !approvedIds.has(callId) && !s.toolCall?.response && !s.plannerResponse?.response) {
-            console.log(`[RepoOrbit] AUTO-APPROVE: Advancing ${callId}`);
-            approvedIds.add(callId);
-            try {
-              await secureRPCRequest(`${protocol}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/RespondToToolCall`, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Connect-Protocol-Version': '1',
-                  'x-codeium-csrf-token': ls.csrfToken
-                },
-                body: JSON.stringify({
-                  metadata,
-                  cascadeId,
-                  callId: callId,
-                  response: { status: 1 } // 1 = APPROVED
-                })
-              });
-            } catch (approveErr) {
-              console.error('[RepoOrbit] Auto-approval failed:', approveErr);
+          const toolCalls = s.plannerResponse?.toolCalls || [];
+          for (const tc of toolCalls) {
+            const callId = tc.id;
+            if (callId) {
+              let approvedData = approvedIdsMap.get(callId);
+              let shouldBypass = false;
+
+              if (!approvedData) {
+                approvedData = { attempts: 1, lastRunTime: Date.now() };
+                approvedIdsMap.set(callId, approvedData);
+                shouldBypass = true;
+                console.log(`[RepoOrbit] AUTO-APPROVE: Advancing tool call ${callId} (${tc.name}) - Attempt 1`);
+              } else if (approvedData.attempts < 3 && Date.now() - approvedData.lastRunTime > 5000) {
+                approvedData.attempts++;
+                approvedData.lastRunTime = Date.now();
+                shouldBypass = true;
+                console.log(`[RepoOrbit] AUTO-APPROVE: Retrying tool call ${callId} (${tc.name}) - Attempt ${approvedData.attempts}`);
+              }
+
+              if (shouldBypass) {
+                if (tc.name === 'run_command') {
+                  try {
+                    const args = JSON.parse(tc.argumentsJson || '{}');
+                    const command = args.CommandLine;
+                    if (command) {
+                      console.log(`[RepoOrbit] Auto-approving command execution: ${command}`);
+                    }
+                  } catch (err) {
+                    console.error('[RepoOrbit] Failed to parse command arguments:', err);
+                  }
+                }
+
+                RepoOrbitExecutor.bypassConfirmation();
+              }
             }
           }
         }
+
+        // 2. Handle steps waiting for user interaction (explicit approval)
+        for (const s of steps) {
+          const info = s.metadata?.sourceTrajectoryStepInfo || s.metadata?.source_trajectory_step_info;
+          const trajectoryId = info?.trajectoryId || info?.trajectory_id;
+          const stepIndex = info?.stepIndex !== undefined ? info.stepIndex : info?.step_index;
+
+          if (trajectoryId && stepIndex !== undefined) {
+            const key = `${trajectoryId}_${stepIndex}`;
+            
+            const reqInt = s.requestedInteraction || s.requested_interaction;
+            const hasRequestedInt = reqInt && (reqInt.interaction || Object.keys(reqInt).length > 0);
+            const isWaiting = s.status === 3 || s.status === 'WAITING' || s.status === 'CASCADE_STEP_STATUS_WAITING' || hasRequestedInt;
+
+            const approvedData = approvedIntKeysMap.get(key);
+            const isFirstTime = !approvedData;
+            const isStuck = approvedData && approvedData.attempts < 3 && (Date.now() - approvedData.lastRunTime > 5000);
+
+            if (isWaiting && (isFirstTime || isStuck)) {
+              console.log(`[RepoOrbit] Found waiting step ${stepIndex} in trajectory ${trajectoryId}. Checking for interaction... (Attempt ${approvedData ? approvedData.attempts + 1 : 1})`);
+              console.log(`[RepoOrbit] DETAILED WAITING STEP:\n${JSON.stringify(s, null, 2)}`);
+
+              try {
+                const os = require('os');
+                const debugPath = path.join(os.tmpdir(), 'repoorbit-step-waiting.json');
+                fs.writeFileSync(debugPath, JSON.stringify({
+                  key,
+                  timestamp: new Date().toISOString(),
+                  step: s
+                }, null, 2), 'utf8');
+              } catch (writeErr) {
+                // ignore
+              }
+
+              let interactionValue: any = null;
+              let interactionCase: string | null = null;
+
+              // Find step case and value (plain JSON oneof representation vs helper class)
+              let stepCase = '';
+              let stepValue: any = null;
+              if (s.step) {
+                if (s.step.case && s.step.value) {
+                  stepCase = s.step.case;
+                  stepValue = s.step.value;
+                } else {
+                  const keys = Object.keys(s.step);
+                  if (keys.length > 0) {
+                    stepCase = keys[0];
+                    stepValue = s.step[keys[0]];
+                  }
+                }
+              }
+
+              // Find requested interaction case (plain JSON oneof representation vs helper class)
+              let intCase = '';
+              if (reqInt) {
+                const intObj = reqInt.interaction || reqInt;
+                if (intObj.case && intObj.value) {
+                  intCase = intObj.case;
+                } else {
+                  const keys = Object.keys(intObj);
+                  if (keys.length > 0) {
+                    intCase = keys[0];
+                  }
+                }
+              }
+
+              // Check for filePermissionRequest inside step/stepValue/step status
+              let filePermissionUri = '';
+              const filePermReq = s.step?.value?.filePermissionRequest || s.step?.value?.file_permission_request ||
+                                  stepValue?.filePermissionRequest || stepValue?.file_permission_request ||
+                                  s.filePermissionRequest || s.file_permission_request;
+              if (filePermReq) {
+                filePermissionUri = filePermReq.absolutePathUri || filePermReq.absolute_path_uri || '';
+              }
+
+              if (filePermissionUri) {
+                interactionCase = 'filePermission';
+                interactionValue = {
+                  allow: true,
+                  scope: 1, // ONCE
+                  absolutePathUri: filePermissionUri,
+                  absolute_path_uri: filePermissionUri
+                };
+              } else if (intCase) {
+                interactionCase = intCase;
+                switch (intCase) {
+                  case 'runCommand':
+                  case 'run_command':
+                    const cmd = stepCase === 'runCommand' || stepCase === 'run_command'
+                      ? (stepValue?.commandLine || stepValue?.command_line || '')
+                      : '';
+                    interactionValue = {
+                      confirm: true,
+                      proposedCommandLine: cmd,
+                      proposed_command_line: cmd,
+                      submittedCommandLine: cmd,
+                      submitted_command_line: cmd
+                    };
+                    break;
+                  case 'openBrowserUrl':
+                  case 'open_browser_url':
+                  case 'captureBrowserScreenshot':
+                  case 'capture_browser_screenshot':
+                  case 'executeBrowserJavascript':
+                  case 'execute_browser_javascript':
+                  case 'mcp':
+                  case 'readUrlContent':
+                  case 'read_url_content':
+                    interactionValue = {
+                      confirm: true
+                    };
+                    break;
+                  case 'permission':
+                    interactionValue = {
+                      allow: true,
+                      scope: 2 // PERSIST/WORKSPACE
+                    };
+                    break;
+                  default:
+                    console.warn(`[RepoOrbit] Unknown interaction case: ${intCase}`);
+                    break;
+                }
+              }
+
+              if (interactionCase && interactionValue) {
+                // Delete duplicate/internal keys to avoid unmarshaling / duplicate field errors in language server gRPC
+                delete interactionValue.cascadeId;
+                delete interactionValue.cascade_id;
+                delete interactionValue.trajectoryId;
+                delete interactionValue.trajectory_id;
+
+                console.log(`[RepoOrbit] AUTO-APPROVE: Sending interaction ${interactionCase} for step ${stepIndex}`);
+
+                RepoOrbitExecutor.bypassConfirmation();
+
+                let normalizedCase = interactionCase;
+                if (interactionCase === 'run_command') normalizedCase = 'runCommand';
+                else if (interactionCase === 'file_permission') normalizedCase = 'filePermission';
+                else if (interactionCase === 'open_browser_url') normalizedCase = 'openBrowserUrl';
+                else if (interactionCase === 'capture_browser_screenshot') normalizedCase = 'captureBrowserScreenshot';
+                else if (interactionCase === 'execute_browser_javascript') normalizedCase = 'executeBrowserJavascript';
+                else if (interactionCase === 'read_url_content') normalizedCase = 'readUrlContent';
+
+                let anySuccess = false;
+                let lastErrText = '';
+                
+                const indicesToSend: number[] = [];
+                if (stepIndex !== undefined) {
+                  indicesToSend.push(stepIndex);
+                  if (stepIndex > 0) indicesToSend.push(stepIndex - 1);
+                  indicesToSend.push(stepIndex + 1);
+                }
+                for (let i = 0; i < steps.length; i++) {
+                  if (!indicesToSend.includes(i)) {
+                    indicesToSend.push(i);
+                  }
+                }
+                if (!indicesToSend.includes(steps.length)) {
+                  indicesToSend.push(steps.length);
+                }
+
+                for (const idx of indicesToSend) {
+                  try {
+                    const res = await secureRPCRequest(`${protocol}://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/HandleCascadeUserInteraction`, {
+                      method: 'POST',
+                      headers: {
+                        'Content-Type': 'application/json',
+                        'Connect-Protocol-Version': '1',
+                        'x-codeium-csrf-token': ls.csrfToken
+                      },
+                      body: JSON.stringify({
+                        metadata,
+                        cascadeId,
+                        interaction: {
+                          trajectoryId,
+                          stepIndex: idx,
+                          [normalizedCase]: interactionValue
+                        }
+                      })
+                    });
+
+                    if (res.ok) {
+                      console.log(`[RepoOrbit] HandleCascadeUserInteraction succeeded for step ${idx}`);
+                      anySuccess = true;
+                      break;
+                    } else {
+                      lastErrText = await res.text();
+                      console.warn(`[RepoOrbit] HandleCascadeUserInteraction attempt failed for step ${idx}:`, lastErrText);
+                    }
+                  } catch (interactionErr: any) {
+                    lastErrText = interactionErr.message;
+                    console.warn(`[RepoOrbit] HandleCascadeUserInteraction attempt error for step ${idx}:`, lastErrText);
+                  }
+                }
+
+                if (anySuccess) {
+                  if (isFirstTime) {
+                    approvedIntKeysMap.set(key, { attempts: 1, lastRunTime: Date.now() });
+                  } else if (approvedData) {
+                    approvedData.attempts++;
+                    approvedData.lastRunTime = Date.now();
+                  }
+                } else {
+                  console.error(`[RepoOrbit] HandleCascadeUserInteraction failed for all candidate step indices. Last error: ${lastErrText}`);
+                }
+              } else {
+                console.log(`[RepoOrbit] Step ${stepIndex} is waiting but no programmatic interaction case identified. Bypassing UI confirmation...`);
+                RepoOrbitExecutor.bypassConfirmation();
+                if (isFirstTime) {
+                  approvedIntKeysMap.set(key, { attempts: 1, lastRunTime: Date.now() });
+                } else if (approvedData) {
+                  approvedData.attempts++;
+                  approvedData.lastRunTime = Date.now();
+                }
+              }
+            }
+          }
+        }
+
 
         const plannerStep = [...steps].reverse().find((s: any) => s.type === 'CORTEX_STEP_TYPE_PLANNER_RESPONSE');
         if (plannerStep) {
           const pr = plannerStep.plannerResponse;
           const text = pr?.modifiedResponse || pr?.response || pr?.content;
-          const thinking = pr?.thinking;
           
           let combinedText = '';
-          if (thinking) combinedText += `*Thinking...*\n\n${thinking}\n\n---\n\n`;
           if (text) combinedText += text;
 
           if (combinedText && combinedText !== lastText) {
@@ -404,12 +745,70 @@ async function sendAntigravityChatDirect(
     }
   }
 
-  return lastText || 'AI response timed out.';
 }
 
-// ─── Extension Activation ──────────────────────────────────────────────────────
+function parseQueries(content: string): any[] {
+  const parts = content.split(/^\s*---\s*$/m);
+  const queries: any[] = [];
 
+  let i = 0;
+  if (parts[0] !== undefined && parts[0].trim() === "") {
+    i = 1;
+  }
 
+  while (i < parts.length) {
+    const section = parts[i]?.trim() || "";
+    if (section.toLowerCase().includes("github-issue:")) {
+      const metadata: Record<string, string> = {};
+      const lines = section.split(/\r?\n/);
+      for (const line of lines) {
+        const colonIndex = line.indexOf(":");
+        if (colonIndex !== -1) {
+          const key = line.substring(0, colonIndex).trim().toLowerCase();
+          const value = line.substring(colonIndex + 1).trim();
+          metadata[key] = value;
+        }
+      }
+      const bodyPart = parts[i + 1] || "";
+      queries.push({
+        query: bodyPart.trim(),
+        "github-issue": metadata["github-issue"] || "",
+      });
+      i += 2;
+    } else {
+      if (section) {
+        queries.push({
+          query: section,
+          "github-issue": "",
+        });
+      }
+      i += 1;
+    }
+  }
+
+  return queries;
+}
+
+function appendReviewLog(workspaceFolder: string, logEntry: any) {
+  try {
+    const logFilePath = path.join(workspaceFolder, '.repoorbit-logs.json');
+    let logs: any[] = [];
+    if (fs.existsSync(logFilePath)) {
+      try {
+        logs = JSON.parse(fs.readFileSync(logFilePath, 'utf8'));
+        if (!Array.isArray(logs)) {
+          logs = [];
+        }
+      } catch {
+        logs = [];
+      }
+    }
+    logs.push(logEntry);
+    fs.writeFileSync(logFilePath, JSON.stringify(logs, null, 2), 'utf8');
+  } catch (err: any) {
+    console.error('[RepoOrbit] Failed to write review log:', err.message);
+  }
+}
 
 async function handleWebviewMessage(webview: vscode.Webview, message: any, context: vscode.ExtensionContext) {
   console.log('[RepoOrbit] Message Received:', message.command);
@@ -426,7 +825,7 @@ async function handleWebviewMessage(webview: vscode.Webview, message: any, conte
 
     case 'chat':
       try {
-        const { query, config, repoContext } = message;
+        const { query, config, repoContext, session } = message;
         const modelId = config.model;
         console.log(`[RepoOrbit] AI Chat Request [Model: ${modelId}]:`, query);
 
@@ -466,7 +865,8 @@ async function handleWebviewMessage(webview: vscode.Webview, message: any, conte
                 text: update.text,
                 steps: update.steps
               });
-            }
+            },
+            session === 'review'
           );
 
           // Update activeState on complete response
@@ -614,6 +1014,16 @@ async function handleWebviewMessage(webview: vscode.Webview, message: any, conte
           fs.mkdirSync(parentDir, { recursive: true });
         }
 
+        if (fs.existsSync(cloneDest)) {
+          const stats = fs.statSync(cloneDest);
+          if (stats.isDirectory()) {
+            const files = fs.readdirSync(cloneDest);
+            if (files.length > 0) {
+              throw new Error(`Destination path "${cloneDest}" is not empty.`);
+            }
+          }
+        }
+
         execSync(`git clone ${url} "${cloneDest}"`, { stdio: 'inherit' });
         
         // --- BOOTSTRAP INITIALIZATION ---
@@ -643,10 +1053,120 @@ async function handleWebviewMessage(webview: vscode.Webview, message: any, conte
         // ---------------------------------
 
         vscode.window.showInformationMessage(`RepoOrbit: Cloned ${url} successfully!`);
+        activeCascadeId = null;
         webview.postMessage({ command: 'cloneSuccess', path: cloneDest });
       } catch (err: any) {
         console.error('[RepoOrbit] Clone failed:', err);
         webview.postMessage({ command: 'setError', text: `Clone Failed: ${err.message}` });
+      }
+    case 'runReview':
+      try {
+        const { queryIndex, queryText, attempts } = message;
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!workspaceFolder) {
+          throw new Error('No workspace folder open');
+        }
+
+        // Request code review from LLM
+        console.log('[RepoOrbit] Requesting LLM code review via Chat 2...');
+        
+        // Find the github-issue link for the current query
+        const queriesPath = path.join(workspaceFolder, '.repoorbit', 'queries.md');
+        let githubIssue = '';
+        if (fs.existsSync(queriesPath)) {
+          try {
+            const content = fs.readFileSync(queriesPath, 'utf8');
+            const queries = parseQueries(content);
+            const q = queries[queryIndex];
+            if (q) {
+              githubIssue = q['github-issue'] || q.githubIssue || '';
+            }
+          } catch (err) {
+            console.error('[RepoOrbit] Failed to read github issue for reviewer:', err);
+          }
+        }
+
+        let combinedReviewPrompt = `${REVIEWER_SYSTEM_PROMPT}\n\nOriginal Query/Goal: ${queryText}`;
+        if (githubIssue) {
+          combinedReviewPrompt += `\nGitHub Issue Reference: Reference ${githubIssue}. Retrieve all linked issues, pull requests, and discussions using the GitHub CLI/API (\`gh issue view\` or \`gh api\`). Filter out conversational noise, duplicate comments, "+1" reactions, and meta-discussions to isolate core technical requirements, reproduction details, and error logs. You MUST implement and verify code fixes for the main issue and all linked/related issues.`;
+        }
+        const modelId = activeState.config.model || 'MODEL_PLACEHOLDER_M84';
+        let reviewJsonText = '';
+        let reviewRating = 3;
+        let reviewFeedback = 'Failed to generate review.';
+
+        try {
+          reviewJsonText = await sendAntigravityChatDirect(
+            combinedReviewPrompt,
+            modelId,
+            undefined,
+            undefined,
+            true // useReviewSession = true
+          );
+        } catch (lsErr: any) {
+          console.error('[RepoOrbit] Direct RPC review failed:', lsErr.message);
+          throw lsErr;
+        }
+
+        if (reviewJsonText) {
+          let cleaned = reviewJsonText.trim();
+          if (cleaned.startsWith('```')) {
+            cleaned = cleaned.replace(/^```[a-zA-Z]*\n/, '').replace(/\n```$/, '');
+          }
+          cleaned = cleaned.trim();
+          try {
+            const parsed = JSON.parse(cleaned);
+            reviewRating = Number(parsed.rating);
+            reviewFeedback = parsed.feedback || '';
+          } catch (parseErr) {
+            console.error('[RepoOrbit] Failed to parse review JSON:', cleaned, parseErr);
+            const ratingMatch = cleaned.match(/"rating"\s*:\s*(\d)/);
+            const feedbackMatch = cleaned.match(/"feedback"\s*:\s*"(.*)"/s);
+            if (ratingMatch) {
+              reviewRating = Number(ratingMatch[1]);
+            }
+            if (feedbackMatch) {
+              reviewFeedback = feedbackMatch[1];
+            }
+          }
+        }
+
+        console.log(`[RepoOrbit] Review rating received: ${reviewRating}/5`);
+
+        appendReviewLog(workspaceFolder, {
+          queryIndex,
+          queryText,
+          rating: reviewRating,
+          feedback: reviewFeedback,
+          attempts,
+          timestamp: new Date().toISOString()
+        });
+
+        if (reviewRating === 5 || attempts >= 3) {
+          try {
+            console.log('[RepoOrbit] Committing changes...');
+            execSync('git add -A', { cwd: workspaceFolder });
+            execSync(`git commit -m "fix: ${queryText.slice(0, 50).replace(/"/g, '\\"')}"`, { cwd: workspaceFolder });
+            console.log('[RepoOrbit] Commit successful!');
+          } catch (commitErr: any) {
+            console.error('[RepoOrbit] Git commit failed:', commitErr.message);
+          }
+        }
+
+        webview.postMessage({
+          command: 'reviewResponse',
+          rating: reviewRating,
+          feedback: reviewFeedback,
+          attempts
+        });
+
+      } catch (err: any) {
+        console.error('[RepoOrbit] runReview error:', err);
+        webview.postMessage({
+          command: 'reviewResponse',
+          error: err.message,
+          attempts: message.attempts || 1
+        });
       }
       return;
 
@@ -663,15 +1183,9 @@ async function handleWebviewMessage(webview: vscode.Webview, message: any, conte
           return;
         }
         const content = fs.readFileSync(filePath, 'utf8');
-        const lines = content
-          .split(/\r?\n/)
-          .map(line => line.trim())
-          .filter(line => line.length > 0)
-          .filter(line => !line.startsWith('#'))
-          .map(line => line.replace(/^[-*+]\s+/, '').replace(/^\d+\.\s+/, ''))
-          .filter(line => line.length > 0);
+        const queries = parseQueries(content);
 
-        webview.postMessage({ command: 'queriesFileResponse', exists: true, queries: lines });
+        webview.postMessage({ command: 'queriesFileResponse', exists: true, queries });
       } catch (err: any) {
         webview.postMessage({ command: 'queriesFileResponse', exists: false, queries: [] });
       }
@@ -691,14 +1205,8 @@ async function handleWebviewMessage(webview: vscode.Webview, message: any, conte
         }
         // Trigger readQueriesFile immediately after creation
         const content = fs.readFileSync(queriesPath, 'utf8');
-        const lines = content
-          .split(/\r?\n/)
-          .map(line => line.trim())
-          .filter(line => line.length > 0)
-          .filter(line => !line.startsWith('#'))
-          .map(line => line.replace(/^[-*+]\s+/, '').replace(/^\d+\.\s+/, ''))
-          .filter(line => line.length > 0);
-        webview.postMessage({ command: 'queriesFileResponse', exists: true, queries: lines });
+        const queries = parseQueries(content);
+        webview.postMessage({ command: 'queriesFileResponse', exists: true, queries });
       } catch (err: any) {
         console.error(err);
       }
@@ -737,6 +1245,7 @@ async function handleWebviewMessage(webview: vscode.Webview, message: any, conte
       return;
 
     case 'clearChat':
+      activeCascadeId = null;
       activeState = {
         messages: [],
         isPlaying: false,
@@ -749,7 +1258,8 @@ async function handleWebviewMessage(webview: vscode.Webview, message: any, conte
         upstreamRepo: '',
         branchName: '',
         defaultBranch: '',
-        config: activeState.config
+        config: activeState.config,
+        isCreatingPR: false
       };
       return;
   }
@@ -758,21 +1268,48 @@ async function handleWebviewMessage(webview: vscode.Webview, message: any, conte
 export async function activate(context: vscode.ExtensionContext) {
   console.log('[RepoOrbit] Extension activated');
 
-  // ─── Suppress IDE Errors ───
-  const isFileGitIgnoredCmd = vscode.commands.registerCommand('antigravity.isFileGitIgnored', async (uri: vscode.Uri) => {
+  vscode.commands.getCommands(true).then(cmds => {
     try {
-      const fsPath = uri.fsPath;
-      const repoPath = vscode.workspace.getWorkspaceFolder(uri)?.uri.fsPath;
-      if (!repoPath) return false;
-      const relativePath = path.relative(repoPath, fsPath);
-      const output = execSync(`git check-ignore "${relativePath}"`, { cwd: repoPath, encoding: 'utf8' }).trim();
-      return !!output;
-    } catch {
-      return false;
-    }
+      const os = require('os');
+      const cmdsPath = path.join(os.tmpdir(), 'vscode-commands.json');
+      fs.writeFileSync(cmdsPath, JSON.stringify(cmds, null, 2), 'utf8');
+      console.log('[RepoOrbit] Logged registered commands to', cmdsPath);
+    } catch (e) {}
   });
 
-  context.subscriptions.push(isFileGitIgnoredCmd);
+  // ─── Suppress IDE Errors ───
+  const appName = vscode.env.appName.toLowerCase();
+  const isAntigravityIDE = appName.includes('antigravity') || appName.includes('cider') || appName.includes('jetski');
+  const hasAntigravityExt = vscode.extensions.getExtension('google.antigravity') || 
+                            vscode.extensions.all.some(ext => ext.id.toLowerCase().includes('antigravity'));
+
+  if (!isAntigravityIDE && !hasAntigravityExt) {
+    try {
+      const registeredCommands = await vscode.commands.getCommands(true);
+      if (!registeredCommands.includes('antigravity.isFileGitIgnored')) {
+        try {
+          const isFileGitIgnoredCmd = vscode.commands.registerCommand('antigravity.isFileGitIgnored', async (uri: vscode.Uri) => {
+            try {
+              const fsPath = uri.fsPath;
+              const repoPath = vscode.workspace.getWorkspaceFolder(uri)?.uri.fsPath;
+              if (!repoPath) return false;
+              const relativePath = path.relative(repoPath, fsPath);
+              const output = execSync(`git check-ignore "${relativePath}"`, { cwd: repoPath, encoding: 'utf8' }).trim();
+              return !!output;
+            } catch {
+              return false;
+            }
+          });
+
+          context.subscriptions.push(isFileGitIgnoredCmd);
+        } catch (regErr: any) {
+          console.warn('[RepoOrbit] Failed to register command antigravity.isFileGitIgnored:', regErr.message);
+        }
+      }
+    } catch (err: any) {
+      console.warn('[RepoOrbit] Failed to retrieve registered commands for antigravity.isFileGitIgnored:', err.message);
+    }
+  }
 
   let token = context.globalState.get<string>('github_token');
   if (!token) {
@@ -812,7 +1349,6 @@ export async function activate(context: vscode.ExtensionContext) {
 
 class SidebarWebviewViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'repoorbit.sidebarView';
-  private _view?: vscode.WebviewView;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -822,10 +1358,9 @@ class SidebarWebviewViewProvider implements vscode.WebviewViewProvider {
 
   public resolveWebviewView(
     webviewView: vscode.WebviewView,
-    context: vscode.WebviewViewResolveContext,
+    _context: vscode.WebviewViewResolveContext,
     _token: vscode.CancellationToken
   ) {
-    this._view = webviewView;
 
     webviewView.webview.options = {
       enableScripts: true,

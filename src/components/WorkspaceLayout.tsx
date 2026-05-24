@@ -12,7 +12,6 @@ import {
   Pause,
   FileText,
   Trash2,
-  Terminal,
   Globe,
   Cpu,
   FolderOpen,
@@ -20,11 +19,27 @@ import {
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { CODER_SYSTEM_PROMPT, PR_CREATOR_SYSTEM_PROMPT } from "../lib/core/prompt";
 
 interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   steps?: any[];
+  review?: {
+    rating: number;
+    feedback: string;
+    attempts: number;
+    error?: string;
+  };
+  systemStatus?: string;
+  prResponse?: string;
+  prSteps?: any[];
+}
+
+interface QueryItem {
+  query: string;
+  "github-issue"?: string;
+  githubIssue?: string;
 }
 
 export interface WorkspaceLayoutProps {
@@ -32,22 +47,114 @@ export interface WorkspaceLayoutProps {
   error?: string | null;
 }
 
-function parseAndExpandQueries(queries: string[]): string[] {
-  const expanded: string[] = [];
-  for (const query of queries) {
-    const trimmed = query.trim();
+function parseAndExpandQueries(queries: any[]): QueryItem[] {
+  const expanded: QueryItem[] = [];
+  for (const q of queries) {
+    let queryText = "";
+    let githubIssue = "";
+    if (typeof q === "string") {
+      queryText = q;
+    } else if (q && typeof q === "object") {
+      queryText = q.query || "";
+      githubIssue = q["github-issue"] || q.githubIssue || "";
+    }
+
+    const trimmed = queryText.trim();
     const workflowMatch = trimmed.match(/^workflow:\s*\[(.*?)\](?:\s+(.*))?$/i);
     if (workflowMatch) {
       const question = workflowMatch[2]?.trim() || "";
       if (question) {
-        expanded.push(question);
+        expanded.push({ query: question, githubIssue });
       }
     } else {
-      expanded.push(query);
+      expanded.push({ query: queryText, githubIssue });
     }
   }
   return expanded;
 }
+
+const renderSteps = (steps?: any[]) => {
+  if (!steps || steps.length === 0) return null;
+
+  return (
+    <div className="mt-3 border border-zinc-800 bg-zinc-950 p-2.5 rounded text-[10px] font-mono flex flex-col gap-1.5 text-zinc-400">
+      <div className="text-[9px] font-bold text-zinc-500 uppercase tracking-wider border-b border-zinc-900 pb-1 flex items-center justify-between">
+        <span>Execution Trajectory</span>
+        <span className="text-[8px] text-zinc-500">{steps.length} Step{steps.length !== 1 ? 's' : ''}</span>
+      </div>
+      <div className="flex flex-col gap-1 max-h-48 overflow-y-auto custom-scrollbar">
+        {steps.map((s: any, idx: number) => {
+          const stepNum = idx + 1;
+          const isWaiting = s.status === 3 || s.status === 'WAITING' || s.status === 'CASCADE_STEP_STATUS_WAITING' || s.requestedInteraction;
+          const isDone = s.status === 2 || s.status === 'DONE' || s.status === 'CASCADE_STEP_STATUS_DONE';
+          const isError = s.type === 'CORTEX_STEP_TYPE_ERROR_MESSAGE' || s.status === 4 || s.status === 'ERROR' || s.status === 'CASCADE_STEP_STATUS_ERROR';
+          
+          let statusText = "Done";
+          let statusColor = "text-emerald-500";
+          if (isError) {
+            statusText = "Error";
+            statusColor = "text-red-500";
+          } else if (isWaiting) {
+            statusText = "Waiting";
+            statusColor = "text-amber-500";
+          } else if (s.status === 1 || s.status === 'RUNNING' || s.status === 'CASCADE_STEP_STATUS_RUNNING') {
+            statusText = "Running";
+            statusColor = "text-blue-500";
+          }
+
+          const toolCalls = s.plannerResponse?.toolCalls || (s.toolCall ? [s.toolCall] : []);
+          const toolNames = toolCalls.map((tc: any) => tc.name).join(', ');
+
+          let desc = s.plannerResponse?.thinking || "";
+          if (!desc && toolNames) {
+            desc = `Invoking tool: ${toolNames}`;
+          }
+          if (!desc && s.type === 'CORTEX_STEP_TYPE_ERROR_MESSAGE') {
+            desc = s.errorMessage?.message || "Execution error occurred";
+          }
+          if (!desc) {
+            if (s.type === 'CORTEX_STEP_TYPE_PLANNER_RESPONSE') desc = "Formulating plan...";
+            else if (s.type === 'CORTEX_STEP_TYPE_TOOL_CALL') desc = "Executing tool...";
+            else if (s.type === 'CORTEX_STEP_TYPE_TOOL_RESPONSE') desc = "Received tool output";
+            else desc = `Step ${stepNum}`;
+          }
+
+          return (
+            <div key={idx} className="flex flex-col gap-0.5 border-b border-zinc-900/60 pb-1.5 last:border-0 last:pb-0">
+              <div className="flex items-center gap-1.5">
+                <span className="text-zinc-600 font-bold shrink-0">#{stepNum}</span>
+                <span className={`text-[9px] uppercase font-bold shrink-0 ${statusColor}`}>{statusText}</span>
+                <span className="text-zinc-300 truncate flex-1">{desc}</span>
+              </div>
+              {toolCalls.length > 0 && (
+                <div className="pl-4 flex flex-col gap-0.5 mt-0.5">
+                  {toolCalls.map((tc: any, tcIdx: number) => {
+                    let args = "";
+                    try {
+                      const parsed = JSON.parse(tc.argumentsJson || '{}');
+                      if (parsed.CommandLine) args = parsed.CommandLine;
+                      else if (parsed.TargetFile) args = parsed.TargetFile;
+                      else if (parsed.AbsolutePath) args = parsed.AbsolutePath;
+                      else if (parsed.Query) args = parsed.Query;
+                      else args = JSON.stringify(parsed);
+                    } catch {
+                      args = tc.argumentsJson || "";
+                    }
+                    return (
+                      <div key={tcIdx} className="text-zinc-500 text-[9px] truncate">
+                        <span className="text-zinc-500 font-bold">tool:</span> <code className="bg-zinc-900 px-1 py-0.5 rounded text-[8.5px] border border-zinc-800 font-mono text-zinc-300">{tc.name}</code> {args && <span className="opacity-80">({args})</span>}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
 
 // Icons
 const ClaudeIcon = ({ className }: { className?: string }) => (
@@ -392,6 +499,16 @@ const MarkdownRenderer = ({ content }: { content: string }) => (
           {children}
         </ul>
       ),
+      a: ({ href, children }: any) => (
+        <a
+          href={href}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-[var(--color-antigravity-accent)] hover:text-white hover:underline cursor-pointer transition-colors duration-150"
+        >
+          {children}
+        </a>
+      ),
       code: ({ inline, className, children }: any) => {
         const match = /language-(\w+)/.exec(className || "");
         const lang = match ? match[1] : "text";
@@ -407,7 +524,7 @@ const MarkdownRenderer = ({ content }: { content: string }) => (
         }
 
         return (
-          <div className="my-4 group/code relative rounded-lg border border-[var(--color-antigravity-border)] bg-[var(--color-antigravity-code-bg)] overflow-hidden shadow-2xl">
+          <div className="my-4 group/code relative rounded-lg border border-[var(--color-antigravity-border)] bg-[var(--color-antigravity-code-bg)] overflow-hidden">
             <div className="flex items-center justify-between px-3 py-1.5 bg-white/5 border-b border-[var(--color-antigravity-border)] select-none">
               <span className="text-[9px] font-bold text-zinc-500 uppercase tracking-widest">
                 {lang}
@@ -464,21 +581,22 @@ export default function WorkspaceLayout({
       resetTime?: string;
     }[]
   >([]);
-  const [isRefreshing, setIsRefreshing] = useState(false);
-  const [isFallback, setIsFallback] = useState(false);
+  const [, setIsRefreshing] = useState(false);
+  const [, setIsFallback] = useState(false);
 
-  const [exhaustedModels, setExhaustedModels] = useState<Set<string>>(
+  const [, setExhaustedModels] = useState<Set<string>>(
     new Set(),
   );
   const [config, setConfig] = useState({
     model: "MODEL_PLACEHOLDER_M84",
   });
 
-  const [loadedQueries, setLoadedQueries] = useState<string[]>([]);
+  const [loadedQueries, setLoadedQueries] = useState<QueryItem[]>([]);
   const [currentQueryIndex, setCurrentQueryIndex] = useState<number>(-1);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [retryCount, setRetryCount] = useState<number>(0);
   const [queriesFileExists, setQueriesFileExists] = useState<boolean>(false);
+  const [isCreatingPR, setIsCreatingPR] = useState<boolean>(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -488,7 +606,6 @@ export default function WorkspaceLayout({
   const [clonePath, setClonePath] = useState("./");
   const [isCloning, setIsCloning] = useState(false);
   const [isWorkspaceEmpty, setIsWorkspaceEmpty] = useState(false);
-  const [textareaHeight, setTextareaHeight] = useState(28);
   const [error, setError] = useState<string | null>(initialError);
 
   const [forkOwner, setForkOwner] = useState<string>("");
@@ -508,6 +625,7 @@ export default function WorkspaceLayout({
     upstreamRepo,
     branchName,
     defaultBranch,
+    isCreatingPR,
   });
   useEffect(() => {
     latestData.current = {
@@ -521,6 +639,7 @@ export default function WorkspaceLayout({
       upstreamRepo,
       branchName,
       defaultBranch,
+      isCreatingPR,
     };
   }, [
     loadedQueries,
@@ -533,6 +652,7 @@ export default function WorkspaceLayout({
     upstreamRepo,
     branchName,
     defaultBranch,
+    isCreatingPR,
   ]);
 
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
@@ -596,6 +716,7 @@ export default function WorkspaceLayout({
           branchName,
           defaultBranch,
           config,
+          isCreatingPR,
         },
       });
     }
@@ -613,21 +734,32 @@ export default function WorkspaceLayout({
     branchName,
     defaultBranch,
     config,
+    isCreatingPR,
   ]);
 
   // Trigger query execution when currentQueryIndex changes or autoplay starts
   useEffect(() => {
-    if (!isPlaying || currentQueryIndex === -1 || isLoading) return;
+    if (!isPlaying || currentQueryIndex === -1 || isLoading || isCreatingPR) return;
 
     const { loadedQueries: queries, config: cfg } = latestData.current;
     if (currentQueryIndex < queries.length) {
       const timer = setTimeout(() => {
-        const query = queries[currentQueryIndex];
-        const combinedQuery = `System prompt: You are Antigravity, a coding assistant. Optimize and resolve the user request.\n\n${query}`;
+        const queryItem = queries[currentQueryIndex];
+        const queryText = queryItem?.query || "";
+        const githubIssue = queryItem?.githubIssue || queryItem?.["github-issue"] || "";
 
+        let combinedQuery = `${CODER_SYSTEM_PROMPT}\n\n${queryText}`;
+        if (githubIssue) {
+          combinedQuery += `\n\n**GitHub Issue Reference**: Fetch and read the main GitHub issue at ${githubIssue}, along with all linked/related issues, discussions, or referenced issue numbers using the GitHub CLI/API (\`gh issue view <number>\` or \`gh api\`).
+During your planning phase:
+1. Query and fetch all referenced/linked issues, pull requests, and related discussions mentioned in the main issue body or comments.
+2. Filter out all conversational noise, duplicate feedback, "+1" reactions, scheduling queries, emoji reactions, and meta-discussions.
+3. Isolate the core technical requirements, edge cases, stack traces/logs, environment details, reproduction steps, and suggested fixes or maintainer design agreements.
+4. Construct a dedicated, clean, noise-free "**GitHub Issue Requirements & Analysis**" section in your \`implementation_plan.md\` artifact listing the precise requirements and how they map to the proposed code modifications. Do NOT include raw transcript dumps or verbose conversational logs.`;
+        }
         setMessages((prev) => [
           ...prev,
-          { role: "user", content: query },
+          { role: "user", content: queryText },
           { role: "assistant", content: "" },
         ]);
         setIsLoading(true);
@@ -643,7 +775,7 @@ export default function WorkspaceLayout({
 
       return () => clearTimeout(timer);
     }
-  }, [isPlaying, currentQueryIndex]);
+  }, [isPlaying, currentQueryIndex, isCreatingPR]);
 
   const handleCreateQueriesFile = () => {
     if (vscode) {
@@ -660,6 +792,13 @@ export default function WorkspaceLayout({
       let startIndex = currentQueryIndex;
       if (startIndex >= loadedQueries.length || startIndex < 0) {
         startIndex = 0;
+        // Starting a new batch! Clear the chat messages and the cascade session.
+        setMessages([]);
+        setRetryCount(0);
+        setIsLoading(false);
+        if (vscode) {
+          vscode.postMessage({ command: "clearChat" });
+        }
       }
       setIsPlaying(true);
       setRetryCount(0);
@@ -685,19 +824,14 @@ export default function WorkspaceLayout({
     const query = input.trim();
     setInput("");
 
-    // Track as a single-item automated queue run to execute the self-healing and git push pipeline
-    setLoadedQueries([query]);
-    setCurrentQueryIndex(0);
-    setIsPlaying(true);
-    setRetryCount(0);
-
-    setMessages([
+    setMessages((prev) => [
+      ...prev,
       { role: "user", content: query },
       { role: "assistant", content: "" },
     ]);
     setIsLoading(true);
 
-    const combinedQuery = `System prompt: You are Antigravity, a coding assistant. Optimize and resolve the user request.\n\n${query}`;
+    const combinedQuery = `${CODER_SYSTEM_PROMPT}\n\n${query}`;
     if (vscode) {
       vscode.postMessage({
         command: "chat",
@@ -720,7 +854,6 @@ export default function WorkspaceLayout({
         ? 28
         : Math.max(Math.min(sh + borderHeight, 200), 28);
       textareaRef.current.style.height = `${targetHeight}px`;
-      setTextareaHeight(targetHeight);
     }
   }, [input]);
 
@@ -749,7 +882,7 @@ export default function WorkspaceLayout({
             vscode.postMessage({ command: "checkWorkspaceStatus" });
             vscode.postMessage({
               command: "alert",
-              text: `🚀 Success! Repository cloned & forked to ${message.forkOwner}/${message.upstreamRepo} on branch ${message.branchName}. Antigravity skills and rules have been initialized.`,
+              text: `Success: Repository cloned & forked to ${message.forkOwner}/${message.upstreamRepo} on branch ${message.branchName}. Antigravity skills and rules have been initialized.`,
             });
           }
           break;
@@ -763,6 +896,20 @@ export default function WorkspaceLayout({
         case "chatResponse":
         case "chatStream":
           setMessages((prev) => {
+            if (latestData.current.isCreatingPR) {
+              const next = [...prev];
+              for (let i = next.length - 1; i >= 0; i--) {
+                if (next[i].role === "assistant") {
+                  next[i] = {
+                    ...next[i],
+                    prResponse: message.text,
+                    prSteps: message.steps,
+                  };
+                  break;
+                }
+              }
+              return next;
+            }
             const lastMsg = prev[prev.length - 1];
             if (lastMsg && lastMsg.role === "assistant") {
               return [
@@ -786,29 +933,39 @@ export default function WorkspaceLayout({
           if (message.command === "chatResponse") {
             setIsLoading(false);
             if (latestData.current.isPlaying) {
-              if (vscode) {
-                vscode.postMessage({
-                  command: "runReview",
-                  queryIndex: latestData.current.currentQueryIndex,
-                  queryText:
-                    latestData.current.loadedQueries[
-                      latestData.current.currentQueryIndex
-                    ] || "RepoOrbit Auto-Fix",
-                  repoUrl: repoUrl,
-                  attempts: latestData.current.retryCount + 1,
-                  forkOwner: latestData.current.forkOwner,
-                  upstreamOwner: latestData.current.upstreamOwner,
-                  upstreamRepo: latestData.current.upstreamRepo,
-                  branchName: latestData.current.branchName,
-                  defaultBranch: latestData.current.defaultBranch,
-                });
+              if (latestData.current.isCreatingPR) {
+                setIsCreatingPR(false);
+                setRetryCount(0);
+                const nextIndex = latestData.current.currentQueryIndex + 1;
+                if (nextIndex < latestData.current.loadedQueries.length) {
+                  setCurrentQueryIndex(nextIndex);
+                } else {
+                  setIsPlaying(false);
+                }
+              } else {
+                if (vscode) {
+                  vscode.postMessage({
+                    command: "runReview",
+                    queryIndex: latestData.current.currentQueryIndex,
+                    queryText:
+                      latestData.current.loadedQueries[
+                        latestData.current.currentQueryIndex
+                      ]?.query || "RepoOrbit Auto-Fix",
+                    repoUrl: repoUrl,
+                    attempts: latestData.current.retryCount + 1,
+                    forkOwner: latestData.current.forkOwner,
+                    upstreamOwner: latestData.current.upstreamOwner,
+                    upstreamRepo: latestData.current.upstreamRepo,
+                    branchName: latestData.current.branchName,
+                    defaultBranch: latestData.current.defaultBranch,
+                  });
+                }
               }
             }
           }
           break;
         case "reviewResponse":
           const {
-            queryIndex,
             rating,
             feedback,
             error: reviewErr,
@@ -816,13 +973,24 @@ export default function WorkspaceLayout({
           } = message;
 
           if (reviewErr) {
-            setMessages((prev) => [
-              ...prev,
-              {
-                role: "assistant",
-                content: `⚠️ **Code Review Skipped:** ${reviewErr}`,
-              },
-            ]);
+            setMessages((prev) => {
+              const next = [...prev];
+              for (let i = next.length - 1; i >= 0; i--) {
+                if (next[i].role === "assistant") {
+                  next[i] = {
+                    ...next[i],
+                    review: {
+                      rating: 0,
+                      feedback: "",
+                      attempts: attempts || 1,
+                      error: reviewErr,
+                    },
+                  };
+                  break;
+                }
+              }
+              return next;
+            });
             setRetryCount(0);
             const nextIndex = latestData.current.currentQueryIndex + 1;
             if (nextIndex < latestData.current.loadedQueries.length) {
@@ -833,28 +1001,60 @@ export default function WorkspaceLayout({
             return;
           }
 
-          setMessages((prev) => [
-            ...prev,
-            {
-              role: "assistant",
-              content: `🔍 **Code Review (Rating: ${rating}/5, Attempt: ${attempts}/3)**\n\n${feedback}`,
-            },
-          ]);
+          setMessages((prev) => {
+            const next = [...prev];
+            for (let i = next.length - 1; i >= 0; i--) {
+              if (next[i].role === "assistant") {
+                next[i] = {
+                  ...next[i],
+                  review: {
+                    rating,
+                    feedback,
+                    attempts,
+                  },
+                };
+                break;
+              }
+            }
+            return next;
+          });
 
-          if (rating >= 4) {
-            setRetryCount(0);
-            const nextIndex = latestData.current.currentQueryIndex + 1;
-            if (nextIndex < latestData.current.loadedQueries.length) {
-              setCurrentQueryIndex(nextIndex);
+          if (rating === 5) {
+            const currentQueryItem = latestData.current.loadedQueries[latestData.current.currentQueryIndex];
+            const githubIssue = currentQueryItem?.githubIssue || currentQueryItem?.["github-issue"];
+
+            if (githubIssue) {
+              setIsCreatingPR(true);
+              setIsLoading(true);
+
+              const prQuery = `The code review is successful (5/5). Please visit the GitHub issue link: ${githubIssue}, read the issue and any other related discussions, then craft a carefully made commit message and description, amend/commit your changes, push the branch, and open a Pull Request (PR) for these changes.`;
+              const combinedQuery = `${PR_CREATOR_SYSTEM_PROMPT}\n\n${prQuery}`;
+
+
+
+              if (vscode) {
+                vscode.postMessage({
+                  command: "chat",
+                  query: combinedQuery,
+                  config: latestData.current.config,
+                  session: "review",
+                });
+              }
             } else {
-              setIsPlaying(false);
+              setRetryCount(0);
+              const nextIndex = latestData.current.currentQueryIndex + 1;
+              if (nextIndex < latestData.current.loadedQueries.length) {
+                setCurrentQueryIndex(nextIndex);
+              } else {
+                setIsPlaying(false);
+              }
             }
           } else {
             if (attempts < 3) {
               setRetryCount(attempts);
               setIsLoading(true);
               const repairQuery = `Code Review rated the changes as ${rating}/5.\n\nFeedback:\n${feedback}\n\nPlease update the codebase to fix these issues. Ensure all concerns are fully addressed.`;
-              const combinedQuery = `System prompt: You are Antigravity, a coding assistant. Optimize and resolve the user request.\n\n${repairQuery}`;
+              const combinedQuery = `${CODER_SYSTEM_PROMPT}\n\n${repairQuery}`;
 
               setMessages((prev) => [
                 ...prev,
@@ -870,13 +1070,19 @@ export default function WorkspaceLayout({
                 });
               }
             } else {
-              setMessages((prev) => [
-                ...prev,
-                {
-                  role: "assistant",
-                  content: `⚠️ **Code Review:** Maximum healing attempts (3) reached. Progressing to the next query.`,
-                },
-              ]);
+              setMessages((prev) => {
+                const next = [...prev];
+                for (let i = next.length - 1; i >= 0; i--) {
+                  if (next[i].role === "assistant") {
+                    next[i] = {
+                      ...next[i],
+                      systemStatus: `[Code Review] Maximum healing attempts (3) reached. Progressing to the next query.`,
+                    };
+                    break;
+                  }
+                }
+                return next;
+              });
               setRetryCount(0);
               const nextIndex = latestData.current.currentQueryIndex + 1;
               if (nextIndex < latestData.current.loadedQueries.length) {
@@ -971,6 +1177,8 @@ export default function WorkspaceLayout({
             if (restored.defaultBranch)
               setDefaultBranch(restored.defaultBranch);
             if (restored.config) setConfig(restored.config);
+            if (typeof restored.isCreatingPR === "boolean")
+              setIsCreatingPR(restored.isCreatingPR);
           }
           setIsRestored(true);
           break;
@@ -988,7 +1196,7 @@ export default function WorkspaceLayout({
       className="h-full w-full bg-[var(--color-antigravity-bg)] text-[var(--color-antigravity-text-primary)] flex overflow-hidden font-sans pt-1 relative"
     >
       <div
-        className="w-full flex flex-col bg-[var(--color-antigravity-bg)] h-full overflow-hidden neural-grid relative vendor-glow"
+        className="w-full flex flex-col bg-[var(--color-antigravity-bg)] h-full overflow-hidden relative"
         data-vendor={activeVendor}
       >
         {/* Top Part: Title, Repository search, and Model Selector */}
@@ -1008,7 +1216,6 @@ export default function WorkspaceLayout({
                   e.stopPropagation();
                   const val = repoUrl.trim();
                   if (val) {
-                    const parts = val.replace(/\/$/, "").split("/");
                     setShowCloneModal(true);
                   }
                 }
@@ -1044,7 +1251,7 @@ export default function WorkspaceLayout({
               </button>
 
               {isDropdownOpen && (
-                <div className="absolute left-0 right-0 mt-1.5 rounded-lg glass-dropdown p-1.5 z-50 flex flex-col gap-0.5 border border-white/[0.08] shadow-2xl">
+                <div className="absolute left-0 right-0 mt-1.5 rounded-lg glass-dropdown p-1.5 z-50 flex flex-col gap-0.5 border border-white/[0.08]">
                   <div className="max-h-56 overflow-y-auto custom-scrollbar flex flex-col gap-0.5">
                     {availableModels.map((model) => {
                       const vendor =
@@ -1146,7 +1353,7 @@ export default function WorkspaceLayout({
                       <div
                         className={`max-w-[92%] text-[11px] leading-[1.6] font-normal selection:bg-[var(--color-antigravity-accent)]/20 transition-all ${
                           isUser
-                            ? "bg-[var(--color-antigravity-highlight)] border border-[var(--color-antigravity-accent)]/20 px-4 py-3 rounded-2xl rounded-tr-sm text-[var(--color-antigravity-text-primary)] shadow-md shadow-black/10"
+                            ? "bg-[var(--color-antigravity-highlight)] border border-[var(--color-antigravity-accent)]/20 px-4 py-3 rounded-2xl rounded-tr-sm text-[var(--color-antigravity-text-primary)]"
                             : "w-full bg-[var(--color-antigravity-panel)]/30 border border-[var(--color-antigravity-border)] px-4 py-4 rounded-2xl rounded-tl-sm text-[var(--color-antigravity-text-primary)] hover:border-white/[0.06] transition-colors"
                         }`}
                       >
@@ -1162,24 +1369,89 @@ export default function WorkspaceLayout({
                           </div>
                         )}
 
-                        {msg.role === "assistant" &&
-                        (!msg.content ||
-                          (isLoading && i === messages.length - 1)) ? (
-                          <div className="py-2.5 px-3 bg-white/[0.02] border border-white/[0.04] rounded-lg relative overflow-hidden group/loading">
-                            <div className="flex flex-col gap-1.5 relative z-10">
-                              <div className="font-mono text-[9px] text-[var(--color-antigravity-text-secondary)]/70 flex items-center gap-2 overflow-hidden whitespace-nowrap">
-                                <span>
-                                  {msg.steps && msg.steps.length > 0
-                                    ? msg.steps[msg.steps.length - 1]
-                                        ?.plannerResponse?.thinking ||
-                                      "Executing logic flow..."
-                                    : "Thinking..."}
-                                </span>
-                              </div>
+                        {msg.role === "assistant" && !msg.content ? (
+                          <div className="flex flex-col gap-2 w-full">
+                            <div className="py-2 px-3 bg-zinc-900 border border-zinc-800 rounded text-zinc-400 font-mono text-[10px] flex items-center gap-2">
+                              <span className="w-1.5 h-1.5 rounded-full bg-blue-500 shrink-0" />
+                              <span>Thinking & Executing...</span>
                             </div>
+                            {renderSteps(msg.steps)}
                           </div>
                         ) : (
-                          <MarkdownRenderer content={msg.content} />
+                          <>
+                            <MarkdownRenderer content={msg.content} />
+                            {renderSteps(msg.steps)}
+                            
+                            {msg.review && (
+                              <div className="mt-4 pt-4 border-t border-white/[0.06] flex flex-col gap-2">
+                                {msg.review.error ? (
+                                  <div className="text-[10px] text-amber-500 font-medium flex items-center gap-1.5">
+                                    <span>Code Review Skipped: {msg.review.error}</span>
+                                  </div>
+                                ) : (
+                                  <>
+                                    <div className="flex items-center justify-between gap-2">
+                                      <div className="flex items-center gap-2">
+                                        <span className="text-[10px] font-bold tracking-wider uppercase text-zinc-400 font-sans">
+                                          Code Review
+                                        </span>
+                                        <span className="text-[9px] text-zinc-500 font-mono">
+                                          (Attempt {msg.review.attempts}/3)
+                                        </span>
+                                      </div>
+                                      <div className={`px-2 py-0.5 rounded text-[9px] font-bold font-mono border ${
+                                        msg.review.rating === 5
+                                          ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
+                                          : msg.review.rating >= 4
+                                            ? "bg-blue-500/10 border-blue-500/20 text-blue-400"
+                                            : "bg-red-500/10 border-red-500/20 text-red-400"
+                                      }`}>
+                                        Rating: {msg.review.rating}/5
+                                      </div>
+                                    </div>
+                                    <div className="text-zinc-300 text-[10.5px] leading-relaxed mt-1">
+                                      <MarkdownRenderer content={msg.review.feedback} />
+                                    </div>
+                                  </>
+                                )}
+                              </div>
+                            )}
+
+                            {/* Inline loader for Review */}
+                            {isLoading && i === messages.length - 1 && !msg.review && !isCreatingPR && (
+                              <div className="mt-4 pt-4 border-t border-white/[0.06] text-[10px] text-zinc-400 font-mono flex items-center gap-2">
+                                <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-pulse" />
+                                Analyzing changes and performing code review...
+                              </div>
+                            )}
+
+                            {msg.prResponse && (
+                              <div className="mt-4 pt-4 border-t border-white/[0.06] flex flex-col gap-2">
+                                <div className="flex items-center gap-2">
+                                  <span className="text-[10px] font-bold tracking-wider uppercase text-zinc-400 font-sans">
+                                    Pull Request
+                                  </span>
+                                </div>
+                                <div className="text-zinc-300 text-[10.5px] leading-relaxed mt-1">
+                                  <MarkdownRenderer content={msg.prResponse} />
+                                </div>
+                              </div>
+                            )}
+
+                            {/* Inline loader for PR creation */}
+                            {isLoading && i === messages.length - 1 && isCreatingPR && !msg.prResponse && (
+                              <div className="mt-4 pt-4 border-t border-white/[0.06] text-[10px] text-zinc-400 font-mono flex items-center gap-2">
+                                <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-pulse" />
+                                Processing git commands and creating Pull Request...
+                              </div>
+                            )}
+
+                            {msg.systemStatus && (
+                              <div className="mt-3 p-2 bg-amber-500/5 border border-amber-500/15 rounded-lg text-amber-500 text-[9.5px] font-mono leading-relaxed">
+                                {msg.systemStatus}
+                              </div>
+                            )}
+                          </>
                         )}
                       </div>
                     </div>
@@ -1191,7 +1463,7 @@ export default function WorkspaceLayout({
           )}
         </div>
 
-        <div className="w-full bg-[var(--color-antigravity-panel)]/40 backdrop-blur-xl border-t border-[var(--color-antigravity-border)] flex flex-col relative z-20 flex-none">
+        <div className="w-full bg-[var(--color-antigravity-panel)] border-t border-[var(--color-antigravity-border)] flex flex-col relative z-20 flex-none">
           {queriesFileExists && loadedQueries.length > 0 && (
             <div className="absolute top-0 left-0 right-0 h-[2px] bg-white/[0.03]">
               <div
@@ -1249,9 +1521,9 @@ export default function WorkspaceLayout({
                       </div>
 
                       <span className="text-[9px] font-mono max-w-[120px] truncate leading-none">
-                        {query.length > 25
-                          ? `${query.substring(0, 25)}...`
-                          : query}
+                        {query.query.length > 25
+                          ? `${query.query.substring(0, 25)}...`
+                          : query.query}
                       </span>
                     </div>
                   );
@@ -1281,8 +1553,7 @@ export default function WorkspaceLayout({
             <button
               type="submit"
               disabled={isLoading || !input.trim()}
-              style={{ height: `${textareaHeight}px` }}
-              className="w-[28px] rounded-md bg-[var(--color-antigravity-accent)] hover:opacity-90 disabled:opacity-30 disabled:cursor-not-allowed text-white flex items-center justify-center shrink-0 cursor-pointer transition-all"
+              className="w-[28px] h-[28px] rounded-md bg-[var(--color-antigravity-accent)] hover:opacity-90 disabled:opacity-30 disabled:cursor-not-allowed text-white flex items-center justify-center shrink-0 cursor-pointer transition-all"
               title="Send Message"
             >
               <Send size={12} className="stroke-[2]" />
@@ -1352,8 +1623,8 @@ export default function WorkspaceLayout({
 
       {/* Render Workspace Error overlay if error is present */}
       {error && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/85 z-50 backdrop-blur-xl">
-          <div className="border border-red-500/30 bg-red-500/5 rounded-xl p-8 max-w-md w-full shadow-2xl flex flex-col gap-6 text-center">
+        <div className="absolute inset-0 flex items-center justify-center bg-black/85 z-50">
+          <div className="border border-red-900 bg-zinc-950 rounded p-8 max-w-md w-full flex flex-col gap-6 text-center">
             <div className="flex flex-col gap-2">
               <h3 className="text-red-400 font-bold text-lg">
                 Error Encountered
@@ -1374,61 +1645,33 @@ export default function WorkspaceLayout({
 
       {/* Clone Modal Overlay */}
       {showCloneModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-md animate-in fade-in duration-300">
-          <div className="relative bg-[var(--color-antigravity-panel)]/95 border border-white/[0.08] p-5 rounded-2xl shadow-[0_8px_32px_rgba(0,0,0,0.4)] w-[calc(100%-32px)] max-w-[320px] mx-4 animate-in zoom-in-95 duration-200 overflow-hidden flex flex-col gap-4">
-            {/* Ambient Background Glows */}
-            <div className="absolute -top-10 -right-10 w-24 h-24 bg-[var(--color-antigravity-accent)]/10 rounded-full blur-2xl pointer-events-none" />
-            <div className="absolute -bottom-10 -left-10 w-24 h-24 bg-violet-600/10 rounded-full blur-2xl pointer-events-none" />
-
-            <div className="flex items-center gap-3 relative z-10">
-              <div className="relative flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-tr from-[var(--color-antigravity-accent)]/20 to-violet-500/10 border border-[var(--color-antigravity-accent)]/30 text-[var(--color-antigravity-accent)] shadow-[0_0_15px_rgba(49,134,255,0.15)]">
-                <Cpu size={18} className="stroke-[1.5]" />
-              </div>
-              <div>
-                <h3 className="text-xs font-bold uppercase tracking-[0.15em] bg-gradient-to-r from-[var(--color-antigravity-text-primary)] via-white to-zinc-400 bg-clip-text text-transparent">
-                  Bootstrap Project
-                </h3>
-                <p className="text-[8px] text-zinc-500 uppercase tracking-widest font-mono mt-0.5">
-                  Action Required
-                </p>
-              </div>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85">
+          <div className="relative bg-[var(--color-antigravity-panel)] border border-zinc-800 p-5 rounded w-[calc(100%-32px)] max-w-[320px] mx-4 flex flex-col gap-4">
+            <div>
+              <h3 className="text-xs font-bold uppercase tracking-wider text-[var(--color-antigravity-text-primary)]">
+                Git Clone Destination
+              </h3>
+              <p className="text-[10px] text-zinc-400 mt-1 font-sans">
+                Specify the exact path on your machine where this repository should be cloned:
+              </p>
             </div>
 
-            <p className="text-[10px] text-zinc-400 leading-relaxed font-sans relative z-10">
-              Would you like to{" "}
-              <span className="text-[var(--color-antigravity-accent)] font-semibold">
-                clone and bootstrap
-              </span>{" "}
-              this repository with the Antigravity system, workspace rules, and
-              fallback query pipelines?
-            </p>
-
-            <div className="space-y-4 relative z-10">
-              <div>
-                <div className="flex justify-between items-center mb-1.5 px-1">
-                  <label className="text-[8px] text-zinc-500 uppercase tracking-widest font-mono">
-                    Clone Destination Path
-                  </label>
-                  <span className="text-[8px] text-zinc-600 font-mono">
-                    Local Path
-                  </span>
-                </div>
-                <div className="flex items-center gap-2 bg-black/45 border border-white/[0.06] rounded-lg px-2.5 py-1.5 focus-within:border-[var(--color-antigravity-accent)]/60 focus-within:shadow-[0_0_10px_rgba(49,134,255,0.08)] transition-all">
-                  <FolderOpen size={12} className="text-zinc-500 shrink-0" />
-                  <input
-                    type="text"
-                    value={clonePath}
-                    onChange={(e) => setClonePath(e.target.value)}
-                    className="flex-grow bg-transparent text-[11px] text-[var(--color-antigravity-text-primary)] placeholder:text-zinc-600 outline-none font-mono"
-                    placeholder="./"
-                  />
-                </div>
+            <div className="space-y-4">
+              <div className="flex items-center gap-2 bg-black/45 border border-zinc-800 rounded px-2.5 py-1.5 focus-within:border-[var(--color-antigravity-accent)]/60 transition-all">
+                <FolderOpen size={12} className="text-zinc-500 shrink-0" />
+                <input
+                  type="text"
+                  value={clonePath}
+                  onChange={(e) => setClonePath(e.target.value)}
+                  className="flex-grow bg-transparent text-[11px] text-[var(--color-antigravity-text-primary)] outline-none font-mono"
+                  placeholder="./destination-folder"
+                />
               </div>
 
-              <div className="flex gap-2 pt-1.5">
+              <div className="flex gap-2">
                 <button
                   onClick={() => setShowCloneModal(false)}
-                  className="flex-1 h-7.5 rounded-lg bg-white/[0.02] hover:bg-white/[0.06] border border-white/[0.06] hover:border-white/[0.12] text-[9px] text-zinc-400 hover:text-white uppercase tracking-widest transition-all font-semibold cursor-pointer active:scale-98"
+                  className="flex-1 h-7.5 rounded bg-white/[0.02] hover:bg-white/[0.06] border border-zinc-800 text-[9px] text-zinc-400 hover:text-white uppercase tracking-widest transition-all font-semibold cursor-pointer"
                 >
                   Cancel
                 </button>
@@ -1448,7 +1691,7 @@ export default function WorkspaceLayout({
                     }
                   }}
                   disabled={isCloning}
-                  className="flex-1 h-7.5 rounded-lg bg-gradient-to-r from-[var(--color-antigravity-accent)] to-violet-600 hover:brightness-110 text-[9px] text-white font-bold uppercase tracking-widest transition-all shadow-[0_4px_15px_rgba(49,134,255,0.2)] disabled:opacity-50 active:scale-98 cursor-pointer flex items-center justify-center"
+                  className="flex-1 h-7.5 flex items-center justify-center rounded bg-antigravity-accent text-antigravity-text-primary text-[9px] font-bold uppercase tracking-widest transition-all hover:opacity-90 disabled:opacity-50 cursor-pointer"
                 >
                   {isCloning ? (
                     <span className="flex items-center gap-1.5">
@@ -1456,7 +1699,7 @@ export default function WorkspaceLayout({
                       Cloning...
                     </span>
                   ) : (
-                    "Bootstrap"
+                    "Clone"
                   )}
                 </button>
               </div>

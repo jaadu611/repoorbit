@@ -6,7 +6,7 @@
   --color-antigravity-surface: var(--vscode-editor-background, rgb(34, 34, 34));
   --color-antigravity-border: var(--vscode-panel-border, var(--vscode-sideBar-border, rgba(255, 255, 255, 0.08)));
   --color-antigravity-accent: var(--vscode-button-background, var(--vscode-activityBarBadge-background, #3b82f6));
-  --color-antigravity-accent-gradient: linear-gradient(135deg, var(--color-antigravity-accent), var(--vscode-activityBarBadge-background, #06b6d4));
+  --color-antigravity-accent-gradient: var(--color-antigravity-accent);
   --color-antigravity-glow: rgba(59, 130, 246, 0.05);
   --color-antigravity-highlight: var(--vscode-list-hoverBackground, rgba(255, 255, 255, 0.04));
   --color-antigravity-text-primary: var(--vscode-sideBar-foreground, var(--vscode-editor-foreground, #f8fafc));
@@ -17,25 +17,25 @@
 /* Vendor Theme Overrides */
 [data-vendor="google"] {
   --color-antigravity-accent: #2563eb;
-  --color-antigravity-accent-gradient: linear-gradient(135deg, #2563eb, #06b6d4);
+  --color-antigravity-accent-gradient: #2563eb;
   --color-antigravity-glow: rgba(37, 99, 235, 0.15);
   --color-antigravity-highlight: rgba(37, 99, 235, 0.08);
 }
 [data-vendor="anthropic"] {
   --color-antigravity-accent: #d97706;
-  --color-antigravity-accent-gradient: linear-gradient(135deg, #d97706, #f97316);
+  --color-antigravity-accent-gradient: #d97706;
   --color-antigravity-glow: rgba(217, 119, 6, 0.15);
   --color-antigravity-highlight: rgba(217, 119, 6, 0.08);
 }
 [data-vendor="openai"] {
   --color-antigravity-accent: #0d9488;
-  --color-antigravity-accent-gradient: linear-gradient(135deg, #0d9488, #10b981);
+  --color-antigravity-accent-gradient: #0d9488;
   --color-antigravity-glow: rgba(13, 148, 136, 0.15);
   --color-antigravity-highlight: rgba(13, 148, 136, 0.08);
 }
 [data-vendor="unknown"] {
   --color-antigravity-accent: #6366f1;
-  --color-antigravity-accent-gradient: linear-gradient(135deg, #6366f1, #a855f7);
+  --color-antigravity-accent-gradient: #6366f1;
   --color-antigravity-glow: rgba(99, 102, 241, 0.15);
   --color-antigravity-highlight: rgba(99, 102, 241, 0.08);
 }
@@ -69,24 +69,20 @@ body {
   scrollbar-color: rgba(255, 255, 255, 0.05) transparent;
 }
 
-/* Glassmorphism Classes */
+/* Glassmorphism Classes - Simplified to solid flat panels */
 .glass-panel {
-  background: var(--vscode-sideBar-background, rgba(30, 30, 30, 0.65));
-  backdrop-filter: blur(14px);
+  background: var(--vscode-sideBar-background, rgb(30, 30, 30));
   border: 1px solid var(--color-antigravity-border);
 }
 
 .glass-card {
-  background: var(--vscode-editor-background, rgba(34, 34, 34, 0.45));
-  backdrop-filter: blur(12px);
+  background: var(--vscode-editor-background, rgb(34, 34, 34));
   border: 1px solid var(--color-antigravity-border);
 }
 
 .glass-dropdown {
-  background: var(--vscode-menu-background, var(--vscode-sideBar-background, rgba(24, 24, 24, 0.95)));
-  backdrop-filter: blur(24px);
+  background: var(--vscode-menu-background, var(--vscode-sideBar-background, rgb(24, 24, 24)));
   border: 1px solid var(--color-antigravity-border);
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
 }
 
 .edge-to-edge {
@@ -94,9 +90,9 @@ body {
   height: 100%;
 }
 
-/* Dynamic glowing shadows */
+/* Dynamic glowing shadows - Removed */
 .vendor-glow {
-  box-shadow: 0 0 40px -15px var(--color-antigravity-glow);
+  box-shadow: none;
 }
 
 .accent-border-hover:hover {

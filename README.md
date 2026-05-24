@@ -1,66 +1,68 @@
 # RepoOrbit
 
-RepoOrbit is a VS Code Extension and React Webview-based orchestration interface designed for running automated, self-healing query pipelines directly against local workspaces. It integrates code execution channels with automated, closed-loop git diff reviews powered by a configurable code review backend.
+RepoOrbit is a VS Code extension and unified React Webview-based orchestration interface designed for running automated, self-healing code contribution and query pipelines directly within local workspaces.
+
+It automates the lifecycle of open-source contribution and issue resolution, executing query queues, auto-evaluating resulting code diffs, programmatically bypassing agent confirmation prompts, and committing success states.
 
 ---
 
-## Key Features
+## Core Features
 
-* **Activity Bar Integration** - Fully consolidated sidebar panel for a distraction-free, space-efficient interface.
-* **Self-Healing Loop** - Listens to query outputs, evaluates rating thresholds, and generates iterative repair prompts automatically.
-* **Persistent Sessions** - Retains active chat history, queue execution indexes, and model selections across panel toggles and window reloads.
-* **Code Review Pipeline** - Captures raw uncommitted diffs (`git diff HEAD`), queries a configurable evaluator backend, and commits changes when thresholds are reached.
-* **Model Selector** - Custom vendor selector displaying Gemini, Claude, and GPT models along with dynamically updated quota progress bars.
+### 1. Automated Query & Contribution Queue
+- **Batch Processing**: Parses and processes a queue of contribution goals or tasks defined in `.repoorbit/queries.md`.
+- **Persistent Progress**: Tracks the active execution index and execution states across session reloads, workspace changes, and sidebar toggles.
+- **Dynamic Context Building**: Automatically builds query prompts containing custom coding guidelines and environment rules.
+
+### 2. Closed-Loop Self-Healing
+- **Automated Code Review**: Captures uncommitted diffs (`git diff HEAD`) and requests an evaluator backend to rate the changes (1 to 5) and provide feedback.
+- **Healing Iteration**: If the review rating is below `4`, RepoOrbit automatically formulates a detailed repair query with the feedback and invokes the model again.
+- **Autonomous Resolution**: Attempts up to 3 repair cycles. Upon reaching a score of `4+` (or exhausting the attempts limit), changes are staged and committed (`git add -A && git commit`) before progressing to the next task in the queue.
+
+### 3. Programmatic Auto-Approval & Bypass
+- **Hands-Free Execution**: Automatically clicks, bypasses, and confirms agent steps, terminal executions, tool calls, and workspace edits.
+- **Command Broadcast**: Dispatches programmatic acceptance commands such as `antigravity.acceptAgentStep`, `chatEditing.acceptAllFiles`, and `inlineChat.acceptChanges`.
+- **Fault-Tolerant Retry Loop**: Uses Map-based tracking and a 3-attempt backoff (at 5-second intervals) to ensure approval actions succeed even if the UI/agent panel is temporarily unfocused or busy.
+
+### 4. GitHub Issue & Discussion Synthesis
+- **Deep Referencing**: Resolves issue references (e.g. `github-issue: owner/repo#issue`) using the GitHub CLI (`gh issue view`) or GitHub API.
+- **Smart Noise Filtering**: Automatically filters out conversational noise, duplicate complaints, meta-chatter, emojis, and "+1" reactions from comments.
+- **Requirement Mapping**: Isolates exact reproduction steps, error logs, and technical design agreements, compelling the agent to write a structured, clean `implementation_plan.md` mapping issue requirements to code changes.
+
+### 5. Workspace Safety & Diagnostics
+- **Target Empty-Check**: Verifies directory emptiness before cloning repositories to prevent file conflicts and git errors.
+- **Static Code Inspector**: Recursively maps codebase trees, analyzes file sizes, calculates comment/code lines, extracts import dependencies, and builds dynamic visual graphs of package stacks (Node.js, Next.js, Vite, etc.).
+- **Automatic Rule Bootstrapping**: Generates default `.repoorbit/queries.md` files and `.agents/rules/MASTER.md` constitution rules when cloning to guarantee compliance with agentic protocols.
+
+### 6. Premium Flat UI/UX
+- **Solid Aesthetic**: Clean, distraction-free visual theme with zero gradients, glowing elements, or unnecessary animations.
+- **Real-Time Trajectory Viewer**: Displays current agent thinking logs, active tool names, execution parameters, and live status states (Done, Running, Waiting, Error) step-by-step.
+- **Model Vendor Controls**: Easy selection of Gemini, Claude, and GPT models coupled with live usage indicators.
 
 ---
 
-## Architectural Components
+## Architectural Layout
 
-The extension is organized into a clean client-host model:
-
-* **VS Code Extension Host** - Serves as the host layer executing privileged operations on the local file system and git, including workspace discovery, repository management, query file subscriptions, and code review management.
-* **Consolidated Webview Viewport** - A React Webview viewport rendering visual panels, chat flows, timeline visualizer, and model controls.
+The application is structured into a clean host-client model:
+- **Extension Host (`src/extension.ts`)**: Manages file system operations, local workspace analysis, Git operations, webview communication, and LLM code review pipelines.
+- **Client Frontend (`src/components/WorkspaceLayout.tsx`)**: React UI that coordinates user options, displays visual progress, renders trajectory steps, and feeds query flows back to the extension host.
 
 ---
 
-## Execution and Self-Healing Data Flow
+## Getting Started
 
-The flow below describes the cycle from query loading to validation, review, and repository commit:
-
-```mermaid
-sequenceDiagram
-    participant UI as WorkspaceLayout (Webview)
-    participant Host as extension.ts (VS Code Host)
-    participant LLM as Model Inference Provider
-    participant Reviewer as Code Review Backend
-
-    Note over UI,Host: Initialization Phase
-    UI->>Host: checkWorkspaceStatus / readQueriesFile
-    Host-->>UI: queriesFileResponse (.repoorbit/queries.md list)
-    
-    Note over UI,Host: Query Queue Execution
-    loop For each loaded query
-        UI->>Host: chat (with query payload)
-        Host->>LLM: Stream inference query
-        LLM-->>Host: chatResponse / chatStream
-        Host-->>UI: chatResponse (Inference complete)
-        
-        Note over UI,Host: Review & Healing Phase
-        UI->>Host: runReview (attempts count)
-        Host->>Host: git diff HEAD & branch lookup
-        Host->>Reviewer: Review request (diff + repo info)
-        Reviewer-->>Host: Review result (rating 1-5 + feedback)
-        Host->>Host: Append to .repoorbit-logs.json
-        Host-->>UI: reviewResponse
-        
-        alt Rating >= 4 OR Attempts == 3
-            Note over Host: Commit changes
-            Host->>Host: git add -A && git commit
-            UI->>UI: Increment query index (Progress next)
-        else Rating < 4 AND Attempts < 3
-            Note over UI: Trigger automated healing
-            UI->>UI: Append healing prompt to chat input
-            UI->>Host: chat (Request fix based on feedback)
-        end
-    end
+### 1. Installation
+Install the VSIX package directly inside VS Code:
+```bash
+code --install-extension repoorbit-1.0.0.vsix
 ```
+
+### 2. Configuration
+Define your task queue in the root directory under `.repoorbit/queries.md`:
+```markdown
+github-issue: owner/repo#12
+---
+Fix the layout rendering bug on the dashboard panel. Ensure it handles window resizes.
+```
+
+### 3. Execution
+Open the RepoOrbit Activity Bar icon, choose your model, and press **Play** to start the fully automated self-healing pipeline.
